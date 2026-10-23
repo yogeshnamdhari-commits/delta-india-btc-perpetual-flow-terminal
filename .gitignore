@@ -1,0 +1,42 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+secrets.toml
+*.pem
+*.key
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime logs, feed captures, and decision records — do not commit these
+*.log
+*.log.*
+*.jsonl
+signal_decisions*
+delta_feed_events*
+
+# Market data / replay outputs are excluded by default; add sanitized OOS data deliberately
+*.csv
+*.parquet
+*.feather
+*.db
+*.sqlite
+
+# Backups and editor files
+*.bak
+*.backup
+*.swp
+.DS_Store
+.idea/
+.vscode/
+output/
+outputs/
+artifacts/
