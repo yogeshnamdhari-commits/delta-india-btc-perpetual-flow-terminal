@@ -100,12 +100,45 @@ class TestExhaustionLabels(unittest.TestCase):
         self.assertEqual(labels, [])
 
     def test_gap_in_comparison_window_suppresses_label(self):
-        bars = prior_bars("up")
+        bars = [
+            candle(BASE + i * 60, open_=100, high=102, low=98, close=101)
+            for i in range(12)
+        ]
         bars.pop(4)
-        ts = BASE + 10 * 60
+        ts = BASE + 12 * 60
         bars.append(candle(ts, open_=103, high=110, low=102, close=104))
         labels = orderflow.detect_exhaustion_labels(bars, tape(ts))
         self.assertEqual(labels, [])
+
+    def test_aware_iso_timestamps_are_accepted_for_trade_dicts(self):
+        ts = BASE + 10 * 60
+        candles = prior_bars("up") + [
+            candle(ts, open_=103, high=110, low=102, close=104)
+        ]
+        trades = [
+            {"ts_utc": f"2026-10-12T04:{51 + i:02d}:05Z", "price": 104.0,
+             "size": 2.0, "side_aggressor": "BUY_TAKER"}
+            for i in range(4)
+        ] + [
+            {"ts_utc": "2026-10-12T05:01:20Z", "price": 104.0,
+             "size": 1.0, "side_aggressor": "SELL_TAKER"}
+        ]
+        # This fixture intentionally uses real ISO strings to exercise parsing;
+        # the timestamps must land in the target candle's UTC bucket.
+        minute = datetime.fromtimestamp(ts, timezone.utc)
+        trade_base = minute.replace(second=0, microsecond=0)
+        trades = [
+            {"ts_utc": (trade_base.replace(second=5 + i)).isoformat(),
+             "price": 104.0, "size": 2.0, "side_aggressor": "BUY_TAKER"}
+            for i in range(4)
+        ] + [
+            {"ts_utc": trade_base.replace(second=20).isoformat(),
+             "price": 104.0, "size": 1.0, "side_aggressor": "SELL_TAKER"}
+        ]
+        self.assertEqual(
+            [x["kind"] for x in orderflow.detect_exhaustion_labels(candles, trades)],
+            ["buy_exhaust"],
+        )
 
     def test_unrecognized_side_and_nonpositive_size_are_ignored(self):
         ts = BASE + 10 * 60
