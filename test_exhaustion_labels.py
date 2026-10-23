@@ -1,5 +1,6 @@
 """Tests for conservative, tape-confirmed exhaustion labels."""
 import unittest
+from datetime import datetime, timezone
 
 import orderflow
 
@@ -114,14 +115,6 @@ class TestExhaustionLabels(unittest.TestCase):
         ts = BASE + 10 * 60
         candles = prior_bars("up") + [
             candle(ts, open_=103, high=110, low=102, close=104)
-        ]
-        trades = [
-            {"ts_utc": f"2026-10-12T04:{51 + i:02d}:05Z", "price": 104.0,
-             "size": 2.0, "side_aggressor": "BUY_TAKER"}
-            for i in range(4)
-        ] + [
-            {"ts_utc": "2026-10-12T05:01:20Z", "price": 104.0,
-             "size": 1.0, "side_aggressor": "SELL_TAKER"}
         ]
         # This fixture intentionally uses real ISO strings to exercise parsing;
         # the timestamps must land in the target candle's UTC bucket.
