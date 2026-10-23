@@ -15,10 +15,13 @@ A PASS does **not** prove strategy profitability and does not authorize order ex
 
 ## 1. Start a clean, isolated diagnostic capture on the Mac
 
-From the repository folder:
+Use the **actual application working copy**, not the separate Git-sync mirror. For the configured setup, that is normally `~/Downloads/delta-india-btc-perpetual-flow-terminal`; set `APP_DIR` below if yours differs:
 
 ```bash
-cd "$HOME/Library/Application Support/DeltaTerminalGitSync/repo"
+APP_DIR="${APP_DIR:-$HOME/Downloads/delta-india-btc-perpetual-flow-terminal}"
+cd "$APP_DIR"
+test -f app.py && test -x .venv/bin/python || { echo "App working copy or .venv not found: $APP_DIR"; exit 1; }
+test -f audit_live_recovery.py || { echo "Recovery auditor is not synced into this app working copy yet"; exit 1; }
 mkdir -p "$HOME/Downloads/delta-live-recovery"
 
 export DELTA_ENABLE_DIAGNOSTIC_RECONNECT=1
@@ -42,7 +45,8 @@ In the terminal's sidebar, use **Trigger reconnect test** once. Do not press it 
 Open a second terminal window and run:
 
 ```bash
-cd "$HOME/Library/Application Support/DeltaTerminalGitSync/repo"
+APP_DIR="${APP_DIR:-$HOME/Downloads/delta-india-btc-perpetual-flow-terminal}"
+cd "$APP_DIR"
 
 .venv/bin/python audit_live_recovery.py \
   --events "$HOME/Downloads/delta-live-recovery/events.jsonl" \
