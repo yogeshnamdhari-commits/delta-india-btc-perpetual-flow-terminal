@@ -84,6 +84,26 @@ class TestExhaustionLabels(unittest.TestCase):
         self.assertEqual(label["sell_contracts"], 4.0)
         self.assertGreaterEqual(label["wick_ratio"], 0.35)
 
+    def test_minute_aggregates_preserve_print_count_and_aggressor_volume(self):
+        ts = BASE + 10 * 60
+        candles = prior_bars("up") + [
+            candle(ts, open_=103, high=110, low=102, close=104)
+        ]
+        # The app aggregates raw tape by minute to avoid losing a completed
+        # 15-minute candle when the rolling individual-trade buffer fills.
+        aggregated_flow = [
+            {"ts": ts + 30, "size": 8.0, "side": "buy", "trade_count": 4},
+            {"ts": ts + 30, "size": 1.0, "side": "sell", "trade_count": 1},
+        ]
+
+        labels = orderflow.detect_exhaustion_labels(candles, aggregated_flow)
+
+        self.assertEqual(len(labels), 1)
+        self.assertEqual(labels[0]["kind"], "buy_exhaust")
+        self.assertEqual(labels[0]["trade_count"], 5)
+        self.assertEqual(labels[0]["buy_contracts"], 8.0)
+        self.assertEqual(labels[0]["sell_contracts"], 1.0)
+
     def test_no_label_when_trade_sample_is_too_small(self):
         ts = BASE + 10 * 60
         candles = prior_bars("up") + [
