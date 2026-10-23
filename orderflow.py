@@ -598,8 +598,10 @@ def detect_exhaustion_labels(
 
     Candles must be completed and in ascending time order. Trades accepts
     dictionaries or tuples of (timestamp, price, size, side), including the
-    app's in-memory trade_log format. These are heuristic context labels, not
-    guaranteed reversals or entry signals.
+    app's in-memory trade_log format. Dictionary rows may also contain a
+    trade_count field to represent aggregate classified prints in a time bucket;
+    size then represents that side's summed contract quantity, not one print.
+    These are heuristic context labels, not guaranteed reversals or entry signals.
     """
     if timeframe_seconds < 1 or lookback < 1 or min_trades < 1:
         raise ValueError("timeframe_seconds, lookback, and min_trades must be positive")
@@ -639,11 +641,14 @@ def detect_exhaustion_labels(
                 raw_ts = trade.get("ts", trade.get("timestamp", trade.get("ts_utc")))
                 size = float(trade.get("size", 0.0))
                 side = trade.get("side", trade.get("side_aggressor", ""))
+                print_count = float(trade.get("trade_count", 1.0))
             else:
                 raw_ts, _price, raw_size, side = trade[:4]
                 size = float(raw_size)
+                print_count = 1.0
             ts = _epoch_seconds_for_flow(raw_ts)
-            if ts is None or not math.isfinite(size) or size <= 0:
+            if (ts is None or not math.isfinite(size) or size <= 0
+                    or not math.isfinite(print_count) or print_count <= 0):
                 continue
             normalized_side = str(side).strip().lower().replace("_", " ")
             if normalized_side in ("buy", "buy taker"):
@@ -655,7 +660,7 @@ def detect_exhaustion_labels(
             bucket = int(ts // timeframe_seconds) * timeframe_seconds
             totals = flow_by_bucket.setdefault(bucket, {"buy": 0.0, "sell": 0.0, "count": 0.0})
             totals[normalized_side] += size
-            totals["count"] += 1.0
+            totals["count"] += print_count
         except (KeyError, TypeError, ValueError, OverflowError, IndexError):
             continue
 
