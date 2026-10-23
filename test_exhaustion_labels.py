@@ -32,7 +32,7 @@ def prior_bars(direction="up"):
     ]
 
 
-def tape(ts, side, *, buy_count=4, sell_count=1):
+def tape(ts, *, buy_count=4, sell_count=1):
     rows = []
     for i in range(buy_count):
         rows.append((ts + 5 + i, 104.0, 2.0, "buy"))
