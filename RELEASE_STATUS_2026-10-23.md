@@ -9,16 +9,19 @@ The current repository baseline has a passing automated-test milestone. Automate
 ## Verified automated tests
 
 The end-to-end test branch run is available at:
-https://github.com/yogeshnamdhari-commits/delta-india-btc-perpetual-flow-terminal/actions/runs/39999318850
+https://github.com/yogeshnamdhari-commits/delta-india-btc-perpetual-flow-terminal/actions/runs/40001060408
 
 | Area | Verified result | Scope limitation |
 |---|---:|---|
-| GitHub Actions — Python 3.11 | 120 passed, 1 skipped, 2 subtests passed | Deterministic unit/integration tests |
-| GitHub Actions — Python 3.12 | 120 passed, 1 skipped, 2 subtests passed | Deterministic unit/integration tests |
+| GitHub Actions — Python 3.11 | 131 passed, 1 skipped, 2 subtests passed | Deterministic unit/integration tests |
+| GitHub Actions — Python 3.12 | 131 passed, 1 skipped, 2 subtests passed | Deterministic unit/integration tests |
 | Decision-log audit | 921 records passed (operator-reported historical result) | Internal consistency only; cannot prove feed truth or live application behavior |
 | End-to-end source-path regression | Passed in both CI jobs | Actual `DeltaFeed` and `_render_signal_panel` source plus bridge/engine are exercised with controlled socket and Streamlit stubs; no live WebSocket or full running Streamlit process |
 
 The new `test_e2e_signal_panel_failure_injection.py` verifies that disconnect, checksum-unavailable, sequence-gap, and CRC-mismatch states fail closed, recovery requires a checksum-verified snapshot, the same `SignalEngine` instance is retained, and the displayed decision matches the last persisted decision record. These are synthetic, deterministic software tests, not proof of live-feed reliability.
+
+
+The read-only `audit_live_recovery.py` utility and `LIVE_RECOVERY_RUNBOOK.md` were added to evaluate a local diagnostic reconnect capture. They are intended to require the observed trigger/disconnect/reconnect sequence, a BLOCKED decision during failure, a checksum-bearing CRC-verified book update, fresh required channels, and a healthy post-recovery decision. **This audit has not yet been run against the user's actual Mac logs**, so live-runtime recovery remains pending.
 
 ## Required release gates still open
 
