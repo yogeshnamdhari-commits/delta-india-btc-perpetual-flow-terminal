@@ -343,6 +343,10 @@ class DeltaFeed:
             # --- order-flow tracking (added 2026-10-13 upgrade) ---
             "book_version": 0,            # bumped on every applied book message (render cache key)
             "trade_log": deque(maxlen=20000),     # (exchange_ts, price, contracts, buy/sell)
+            # Per-minute aggressor aggregates retain candle-level flow after individual
+            # prints roll out of trade_log. Kept in memory for 48 hours; never persisted.
+            "trade_flow_minutes": {},              # minute epoch -> side counts + summed contracts
+            "trade_flow_latest_minute": None,
             "trade_sizes": deque(maxlen=3000),    # rolling sizes for the percentile threshold
             "large_trades": deque(maxlen=300),    # executed trades above the adaptive threshold
             "trade_clusters": deque(maxlen=100),  # finalized aggressive clusters (+ price response)
@@ -390,6 +394,10 @@ class DeltaFeed:
             copy["bids"] = dict(self.data["bids"])
             copy["channel_last_seen"] = dict(self.data["channel_last_seen"])
             copy["trade_log"] = list(self.data["trade_log"])
+            copy["trade_flow_minutes"] = {
+                int(minute): dict(flow)
+                for minute, flow in self.data["trade_flow_minutes"].items()
+            }
             copy["large_trades"] = [dict(t) for t in self.data["large_trades"]]
             copy["trade_clusters"] = [dict(c) for c in self.data["trade_clusters"]]
             copy["open_clusters"] = [dict(c) for c in self.data["open_clusters"].values()]
@@ -940,6 +948,29 @@ class DeltaFeed:
                     side_norm = "buy" if side == "BUY TAKER" else "sell" if side == "SELL TAKER" else "unknown"
                     self.data["trade_log"].append((trade_ts, price, size, side_norm))
                     self.data["trade_sizes"].append(size)
+                    # Preserve classified side-volume and actual print counts per minute.
+                    # The raw 20k-print deque can otherwise roll past a completed 15m
+                    # candle before its flow is evaluated. Keep 48 hours of compact
+                    # in-memory aggregates; do not relax the exhaustion criteria.
+                    if side_norm in ("buy", "sell") and size > 0:
+                        minute_bucket = int(trade_ts // 60) * 60
+                        latest_minute = self.data.get("trade_flow_latest_minute")
+                        if latest_minute is None or minute_bucket > latest_minute:
+                            self.data["trade_flow_latest_minute"] = minute_bucket
+                            cutoff = minute_bucket - 48 * 60 * 60
+                            flow_minutes = self.data["trade_flow_minutes"]
+                            for old_minute in list(flow_minutes):
+                                if old_minute < cutoff:
+                                    del flow_minutes[old_minute]
+                            latest_minute = minute_bucket
+                        if minute_bucket >= latest_minute - 48 * 60 * 60:
+                            flow = self.data["trade_flow_minutes"].setdefault(
+                                minute_bucket,
+                                {"buy_count": 0, "sell_count": 0,
+                                 "buy_contracts": 0.0, "sell_contracts": 0.0},
+                            )
+                            flow[f"{side_norm}_count"] += 1
+                            flow[f"{side_norm}_contracts"] += size
                     if side_norm != "unknown":
                         threshold = self.data.get("large_trade_threshold")
                         if threshold is not None and size >= threshold:
@@ -1616,9 +1647,9 @@ def _add_orderflow_overlays(fig: go.Figure, d: dict[str, Any], pa: dict[str, Any
                 name=name,
                 text=[label] * len(points),
                 textposition=textposition,
-                textfont=dict(size=9, color=color),
+                textfont=dict(size=12, color=color),
                 marker=dict(
-                    symbol=symbol, color=color, size=13,
+                    symbol=symbol, color=color, size=16,
                     line=dict(width=0.8, color="white"), opacity=0.95,
                 ),
                 customdata=customdata,
@@ -1633,7 +1664,10 @@ def _add_orderflow_overlays(fig: go.Figure, d: dict[str, Any], pa: dict[str, Any
         fig.update_layout(annotations=annotations)
 
 
-_FIG_CACHE: dict[str, Any] = {"sig": None, "param_sig": None, "fig": None, "y_range": None, "last_build": 0.0}
+_FIG_CACHE: dict[str, Any] = {
+    "sig": None, "param_sig": None, "fig": None, "y_range": None,
+    "last_build": 0.0, "exhaustion_status": {},
+}
 _FIG_FLOOR_S = 30.0      # refresh the cached figure at least this often even if data is unchanged
 _FIG_REBUILD_S = 3.0     # max chart rebuild rate: a full Plotly re-render more often than
                          # this makes the chart element visibly blink/blank in the browser
@@ -1762,9 +1796,25 @@ def _build_price_figure(d: dict[str, Any], timeframe: str, pa: dict[str, Any] | 
                 "close": float(row["close"]),
                 "volume": float(row["volume"]),
             })
+        # Feed the detector compact side-specific minute totals with true print counts.
+        # This keeps 15m/5m labels viable even after raw events roll out of trade_log.
+        aggregate_flow_rows = []
+        flow_minutes = d.get("trade_flow_minutes", {})
+        for minute_start, flow in flow_minutes.items():
+            flow_ts = int(minute_start) + 1  # place the aggregate safely inside its minute
+            if flow.get("buy_count", 0) > 0 and flow.get("buy_contracts", 0.0) > 0:
+                aggregate_flow_rows.append({
+                    "ts": flow_ts, "size": flow["buy_contracts"],
+                    "side": "buy", "trade_count": flow["buy_count"],
+                })
+            if flow.get("sell_count", 0) > 0 and flow.get("sell_contracts", 0.0) > 0:
+                aggregate_flow_rows.append({
+                    "ts": flow_ts, "size": flow["sell_contracts"],
+                    "side": "sell", "trade_count": flow["sell_count"],
+                })
         pa_overlay["exhaustion"] = orderflow.detect_exhaustion_labels(
             completed_chart_candles,
-            d.get("trade_log", []),
+            aggregate_flow_rows,
             timeframe_seconds=tf_seconds,
             lookback=10,
             min_trades=5,
@@ -1772,6 +1822,16 @@ def _build_price_figure(d: dict[str, Any], timeframe: str, pa: dict[str, Any] | 
             min_wick_ratio=0.35,
             close_position_limit=0.65,
         )[-8:]
+
+    flow_minutes = d.get("trade_flow_minutes", {})
+    flow_keys = [int(k) for k in flow_minutes]
+    flow_span_minutes = ((max(flow_keys) - min(flow_keys)) // 60 + 1) if flow_keys else 0
+    _FIG_CACHE["exhaustion_status"] = {
+        "count": len(pa_overlay.get("exhaustion", [])) if toggles.get("exhaust") else 0,
+        "minute_buckets": len(flow_minutes),
+        "flow_span_minutes": flow_span_minutes,
+        "timeframe": timeframe,
+    }
 
     _add_orderflow_overlays(fig, d, pa_overlay, liq, toggles, now, y_range, x_span)
     fig.update_layout(
@@ -2234,6 +2294,24 @@ def _emit_price_chart(height: int) -> None:
         st.plotly_chart(fig, use_container_width=True, key="btcusd_price_chart",
                         config={"displayModeBar": True, "displaylogo": False,
                                 "scrollZoom": True, "responsive": True})
+        if show_exhaustion_labels:
+            exhaustion_status = _FIG_CACHE.get("exhaustion_status", {})
+            detected = int(exhaustion_status.get("count", 0))
+            bucket_count = int(exhaustion_status.get("minute_buckets", 0))
+            flow_span = int(exhaustion_status.get("flow_span_minutes", 0))
+            if detected:
+                st.caption(
+                    f"Exhaustion detector: {detected} label(s) found in the current chart/tape window. "
+                    "Hover a marker for the candle's aggressor volume and rejection details; labels are context warnings, not entries."
+                )
+            else:
+                st.caption(
+                    f"Exhaustion detector: 0 labels currently qualify on the {timeframe} chart. "
+                    "A label requires a completed candle that breaks the prior 10-bar extreme, a rejection wick "
+                    "of at least 35%, at least 5 classified trade prints, and at least 1.25:1 same-side aggressor imbalance. "
+                    f"The in-memory flow summary currently has {bucket_count} minute bucket(s) spanning about {flow_span} minute(s). "
+                    "After restarting, allow at least one full chart-timeframe candle to close. No rules have been loosened."
+                )
         _CHART_STATE["emitted_sig"] = _FIG_CACHE["sig"]
     basis = (d["last_price"] - d["index_price"]) if d["last_price"] is not None and d["index_price"] is not None else None
     t1, t2, t3, t4 = st.columns(4)
