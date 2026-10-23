@@ -552,6 +552,15 @@ def _epoch_seconds_for_flow(value: Any) -> float | None:
     try:
         if hasattr(value, "timestamp") and callable(value.timestamp):
             number = float(value.timestamp())
+        elif isinstance(value, str):
+            text = value.strip()
+            try:
+                number = float(text)
+            except ValueError:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+                    return None
+                number = float(dt.timestamp())
         else:
             number = float(value)
         if not math.isfinite(number) or number <= 0:
