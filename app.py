@@ -1581,6 +1581,51 @@ def _add_orderflow_overlays(fig: go.Figure, d: dict[str, Any], pa: dict[str, Any
                       for t in pts],
                 hovertemplate="%{text}<extra></extra>", showlegend=True))
 
+    # --- potential buy/sell exhaustion (confirmed candle + tape flow) ---
+    if toggles.get("exhaust"):
+        exhaustion = pa.get("exhaustion", [])
+        for kind, name, color, symbol, textposition, label in (
+            ("buy_exhaust", "Buy exhaustion (bearish risk)", "#ef5350", "triangle-down", "top center", "BUY EXHAUST"),
+            ("sell_exhaust", "Sell exhaustion (bullish risk)", "#26a69a", "triangle-up", "bottom center", "SELL EXHAUST"),
+        ):
+            points = [x for x in exhaustion if x.get("kind") == kind and _drawable(x.get("price"))]
+            if not points:
+                continue
+            customdata = [
+                [
+                    x["buy_contracts"], x["sell_contracts"], x["trade_count"],
+                    x["wick_ratio"] * 100.0, x["close_position"] * 100.0,
+                    x.get("aggressor_ratio"),
+                ]
+                for x in points
+            ]
+            hover = (
+                f"{label} · potential exhaustion, not an entry signal<br>"
+                "Time: %{x}<br>Price: %{y:,.1f}<br>"
+                "Buy-aggressor contracts: %{customdata[0]:,.1f}<br>"
+                "Sell-aggressor contracts: %{customdata[1]:,.1f}<br>"
+                "Classified trade prints in candle: %{customdata[2]}<br>"
+                "Rejection wick: %{customdata[3]:.1f}% of range<br>"
+                "Close position: %{customdata[4]:.1f}% of range"
+                "<extra></extra>"
+            )
+            fig.add_trace(go.Scatter(
+                x=[_ist_dt(x["time"]) for x in points],
+                y=[x["price"] for x in points],
+                mode="markers+text",
+                name=name,
+                text=[label] * len(points),
+                textposition=textposition,
+                textfont=dict(size=9, color=color),
+                marker=dict(
+                    symbol=symbol, color=color, size=13,
+                    line=dict(width=0.8, color="white"), opacity=0.95,
+                ),
+                customdata=customdata,
+                hovertemplate=hover,
+                showlegend=True,
+            ))
+
     # apply every shape/annotation in ONE validated pass (see docstring)
     if shapes:
         fig.update_layout(shapes=shapes)
@@ -1611,8 +1656,10 @@ def _price_figure_signature(d: dict[str, Any], timeframe: str, height: int,
         timeframe, height,
         bool(toggles.get("bull_ob")), bool(toggles.get("bear_ob")),
         bool(toggles.get("book_liq")), bool(toggles.get("pa_pools")),
-        bool(toggles.get("large_trades")),
+        bool(toggles.get("large_trades")), bool(toggles.get("exhaust")),
     )
+    trade_log = d.get("trade_log", [])
+    trade_flow_digest = (len(trade_log), tuple(trade_log[-1]) if trade_log else ())
     zones_digest = ((len(pa["zones"]), pa["zones"][-1]["confirmed_time"]) if pa and pa["zones"] else (0, 0))
     pools_digest = ((len(pa["swings"]), len(pa["eq"]), len(pa["swept"])) if pa else (0, 0, 0))
     bands_digest = ((tuple((b["price"], round(b["size"], 1)) for b in liq["sig_bid"][:10]),
@@ -1624,6 +1671,7 @@ def _price_figure_signature(d: dict[str, Any], timeframe: str, height: int,
         n_candles, str(last_candle), last_candle_ohlc,
         zones_digest, pools_digest, bands_digest, removed_digest,
         len(d["large_trades"]), (d["large_trades"][-1]["ts"] if d["large_trades"] else 0),
+        trade_flow_digest,
         d.get("book_synced"),
         int(time.time() // _FIG_FLOOR_S),
     )
@@ -1693,9 +1741,39 @@ def _build_price_figure(d: dict[str, Any], timeframe: str, pa: dict[str, Any] | 
     if y_range:
         fig.update_yaxes(range=[y_range[0], y_range[1]], autorange=False)
     x_span = (candles["time"].iloc[0], last_candle)
-    _add_orderflow_overlays(
-        fig, d, pa or {"zones": [], "swings": [], "eq": [], "session": {}, "swept": []},
-        liq, toggles, now, y_range, x_span)
+
+    # Exhaustion labels are computed from completed chart-timeframe candles only.
+    # The current in-progress bucket is never eligible for a label.
+    pa_overlay = dict(pa or {"zones": [], "swings": [], "eq": [], "session": {}, "swept": []})
+    pa_overlay["exhaustion"] = []
+    if toggles.get("exhaust"):
+        tf_seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900}[timeframe]
+        current_closed_epoch = int(now // tf_seconds) * tf_seconds
+        completed_chart_candles = []
+        for row in candles.to_dict("records"):
+            candle_epoch = int(pd.Timestamp(row["time"]).timestamp())
+            if candle_epoch + tf_seconds > current_closed_epoch:
+                continue
+            completed_chart_candles.append({
+                "time": candle_epoch,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row["volume"]),
+            })
+        pa_overlay["exhaustion"] = orderflow.detect_exhaustion_labels(
+            completed_chart_candles,
+            d.get("trade_log", []),
+            timeframe_seconds=tf_seconds,
+            lookback=10,
+            min_trades=5,
+            imbalance_ratio=1.25,
+            min_wick_ratio=0.35,
+            close_position_limit=0.65,
+        )[-8:]
+
+    _add_orderflow_overlays(fig, d, pa_overlay, liq, toggles, now, y_range, x_span)
     fig.update_layout(
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1,
@@ -1769,6 +1847,11 @@ with st.sidebar:
     show_book_liq = st.checkbox("Order-book liquidity levels", value=True)
     show_pa_pools = st.checkbox("Swing / equal-high-low pools", value=True)
     show_large_trades = st.checkbox("Large executed trades", value=True)
+    show_exhaustion_labels = st.checkbox(
+        "Buy / sell exhaustion labels",
+        value=True,
+        help="Marks potential exhaustion only when a completed candle rejects a new local extreme and same-candle aggressor flow confirms the pressure. Context labels, not entry signals.",
+    )
     show_flow_panel = st.checkbox("Order-flow & liquidity panel", value=True)
     show_depth_heat = st.checkbox("Depth heatmap (captured only)", value=False)
     ob_lookback = st.slider("Order-block lookback (candles)", 30, 400, 150, 10)
@@ -1830,7 +1913,8 @@ feed.large_percentile = float(trade_percentile)
 
 def _overlay_toggles() -> dict[str, bool]:
     return {"bull_ob": show_bull_ob, "bear_ob": show_bear_ob, "book_liq": show_book_liq,
-            "pa_pools": show_pa_pools, "large_trades": show_large_trades}
+            "pa_pools": show_pa_pools, "large_trades": show_large_trades,
+            "exhaust": show_exhaustion_labels}
 
 
 @st.fragment(run_every=1.0)

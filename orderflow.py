@@ -542,3 +542,181 @@ def rolling_aggressor_metrics(trades, window_s, now_ts=None):
             cvd -= t["size"]
     return {"buy_contracts": buy, "sell_contracts": sell,
             "net_contracts": buy - sell, "cvd_contracts": cvd, "count": count}
+
+# --------------------------------------------------------------------------
+# Exhaustion labels (price rejection + aggressor-flow confirmation)
+# --------------------------------------------------------------------------
+
+def _epoch_seconds_for_flow(value: Any) -> float | None:
+    """Normalize epoch timestamps and datetime-like values to seconds."""
+    try:
+        if hasattr(value, "timestamp") and callable(value.timestamp):
+            number = float(value.timestamp())
+        elif isinstance(value, str):
+            text = value.strip()
+            try:
+                number = float(text)
+            except ValueError:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+                    return None
+                number = float(dt.timestamp())
+        else:
+            number = float(value)
+        if not math.isfinite(number) or number <= 0:
+            return None
+        if number > 1e17:       # nanoseconds
+            number /= 1e9
+        elif number > 1e14:     # microseconds
+            number /= 1e6
+        elif number > 1e11:     # milliseconds
+            number /= 1e3
+        return number
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def detect_exhaustion_labels(
+    candles: list[dict[str, Any]],
+    trades: list[Any],
+    *,
+    timeframe_seconds: int = 60,
+    lookback: int = 10,
+    min_trades: int = 5,
+    imbalance_ratio: float = 1.25,
+    min_wick_ratio: float = 0.35,
+    close_position_limit: float = 0.65,
+) -> list[dict[str, Any]]:
+    """Identify potential buy/sell exhaustion from completed candles and tape.
+
+    BUY EXHAUST: a candle makes a strict high above the preceding lookback bars,
+    rejects that high with a material upper wick and weak close location, while
+    buy-aggressor contracts dominate sell-aggressor contracts.
+
+    SELL EXHAUST: the symmetric case at a strict new low, with a material lower
+    wick, a stronger close location and sell-aggressor contracts dominating.
+
+    Candles must be completed and in ascending time order. Trades accepts
+    dictionaries or tuples of (timestamp, price, size, side), including the
+    app's in-memory trade_log format. These are heuristic context labels, not
+    guaranteed reversals or entry signals.
+    """
+    if timeframe_seconds < 1 or lookback < 1 or min_trades < 1:
+        raise ValueError("timeframe_seconds, lookback, and min_trades must be positive")
+    if not math.isfinite(imbalance_ratio) or imbalance_ratio < 1.0:
+        raise ValueError("imbalance_ratio must be finite and >= 1")
+    if not 0.0 < min_wick_ratio <= 1.0:
+        raise ValueError("min_wick_ratio must be in (0, 1]")
+    if not 0.0 < close_position_limit < 1.0:
+        raise ValueError("close_position_limit must be in (0, 1)")
+
+    def candle_epoch(candle: dict[str, Any]) -> int | None:
+        ts = _epoch_seconds_for_flow(candle.get("time"))
+        return int(ts) if ts is not None else None
+
+    normalized_candles = []
+    for candle in candles:
+        ts = candle_epoch(candle)
+        if ts is None:
+            continue
+        try:
+            o, h, low, close = (float(candle[k]) for k in ("open", "high", "low", "close"))
+            if not all(math.isfinite(v) for v in (o, h, low, close)):
+                continue
+            if low <= 0 or h < max(o, close) or low > min(o, close) or h <= low:
+                continue
+            normalized_candles.append({
+                "time": ts, "open": o, "high": h, "low": low, "close": close,
+            })
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    normalized_candles.sort(key=lambda c: c["time"])
+
+    flow_by_bucket: dict[int, dict[str, float]] = {}
+    for trade in trades:
+        try:
+            if isinstance(trade, dict):
+                raw_ts = trade.get("ts", trade.get("timestamp", trade.get("ts_utc")))
+                size = float(trade.get("size", 0.0))
+                side = trade.get("side", trade.get("side_aggressor", ""))
+            else:
+                raw_ts, _price, raw_size, side = trade[:4]
+                size = float(raw_size)
+            ts = _epoch_seconds_for_flow(raw_ts)
+            if ts is None or not math.isfinite(size) or size <= 0:
+                continue
+            normalized_side = str(side).strip().lower().replace("_", " ")
+            if normalized_side in ("buy", "buy taker"):
+                normalized_side = "buy"
+            elif normalized_side in ("sell", "sell taker"):
+                normalized_side = "sell"
+            else:
+                continue
+            bucket = int(ts // timeframe_seconds) * timeframe_seconds
+            totals = flow_by_bucket.setdefault(bucket, {"buy": 0.0, "sell": 0.0, "count": 0.0})
+            totals[normalized_side] += size
+            totals["count"] += 1.0
+        except (KeyError, TypeError, ValueError, OverflowError, IndexError):
+            continue
+
+    labels: list[dict[str, Any]] = []
+    for i in range(lookback, len(normalized_candles)):
+        candle = normalized_candles[i]
+        previous = normalized_candles[i - lookback:i]
+        # Gaps invalidate the local comparison window.
+        if any(
+            (normalized_candles[j]["time"] - normalized_candles[j - 1]["time"]) != timeframe_seconds
+            for j in range(i - lookback + 1, i + 1)
+        ):
+            continue
+
+        flow = flow_by_bucket.get(candle["time"])
+        if not flow or flow["count"] < min_trades:
+            continue
+        buy_qty, sell_qty = flow["buy"], flow["sell"]
+        if buy_qty <= 0 and sell_qty <= 0:
+            continue
+
+        o, h, low, close = candle["open"], candle["high"], candle["low"], candle["close"]
+        candle_range = h - low
+        upper_wick_ratio = (h - max(o, close)) / candle_range
+        lower_wick_ratio = (min(o, close) - low) / candle_range
+        close_position = (close - low) / candle_range
+        prior_high = max(bar["high"] for bar in previous)
+        prior_low = min(bar["low"] for bar in previous)
+
+        if (h > prior_high
+                and upper_wick_ratio >= min_wick_ratio
+                and close_position <= close_position_limit
+                and buy_qty > 0
+                and buy_qty >= imbalance_ratio * sell_qty):
+            labels.append({
+                "kind": "buy_exhaust",
+                "time": candle["time"],
+                "price": h,
+                "buy_contracts": buy_qty,
+                "sell_contracts": sell_qty,
+                "trade_count": int(flow["count"]),
+                "wick_ratio": upper_wick_ratio,
+                "close_position": close_position,
+                "aggressor_ratio": buy_qty / sell_qty if sell_qty > 0 else None,
+            })
+        elif (low < prior_low
+                and lower_wick_ratio >= min_wick_ratio
+                and close_position >= 1.0 - close_position_limit
+                and sell_qty > 0
+                and sell_qty >= imbalance_ratio * buy_qty):
+            labels.append({
+                "kind": "sell_exhaust",
+                "time": candle["time"],
+                "price": low,
+                "buy_contracts": buy_qty,
+                "sell_contracts": sell_qty,
+                "trade_count": int(flow["count"]),
+                "wick_ratio": lower_wick_ratio,
+                "close_position": close_position,
+                "aggressor_ratio": sell_qty / buy_qty if buy_qty > 0 else None,
+            })
+
+    return labels
+
