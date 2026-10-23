@@ -924,10 +924,16 @@ class DeltaFeed:
                     self.data["cvd"].append({"time": datetime.fromtimestamp(trade_ts, timezone.utc), "cvd": self.data["cvd_value"]})
                     _log_event({
                         "event": "trade",
+                        "symbol": msg.get("sy"),
                         "price": price,
                         "size": size,
                         "side": side,
                         "buyer_role": buyer_role,
+                        # Preserve raw exchange timestamps before normalizing the
+                        # legacy `ts` field to whole seconds. The logger adds
+                        # `ts_utc` separately as local capture/write time.
+                        "exchange_trade_ts_us": msg.get("t"),
+                        "server_publish_ts_us": msg.get("ts"),
                         "ts": trade_ts
                     })
                     # --- order-flow tracking (upgrade 2026-10-13) ---

@@ -318,5 +318,32 @@ class TestEndToEndSignalPanelFailureRecovery(unittest.TestCase):
         self.assertTrue(final_record["orderbook_integrity_ok"])
 
 
+    def test_trade_event_preserves_raw_exchange_timestamps(self):
+        trade_ts_us = 1791780701123456
+        server_ts_us = 1791780701987654
+        self.feed._on_message(None, json.dumps({
+            "type": "trades",
+            "sy": "BTCUSD",
+            "p": "80218.5",
+            "s": 1.0,
+            "r": "t",
+            "t": trade_ts_us,
+            "ts": server_ts_us,
+        }))
+
+        event_path = Path(_NS["EVENT_LOG_FILE"])
+        records = [
+            json.loads(line)
+            for line in event_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        trade = next(record for record in reversed(records) if record.get("event") == "trade")
+        self.assertEqual(trade["symbol"], "BTCUSD")
+        self.assertEqual(trade["exchange_trade_ts_us"], trade_ts_us)
+        self.assertEqual(trade["server_publish_ts_us"], server_ts_us)
+        self.assertEqual(trade["ts"], trade_ts_us // 1_000_000)
+        self.assertTrue(trade.get("ts_utc"), "local capture timestamp should remain present")
+
+
 if __name__ == "__main__":
     unittest.main()
