@@ -40,3 +40,12 @@ delta_feed_events*
 output/
 outputs/
 artifacts/
+
+# Local/private OOS data, runtime logs, tests caches and patch backups
+oos_report/
+bars_1m.csv
+trades.csv
+delta_feed_events*.jsonl
+signal_decisions.jsonl
+delta_feed_events_full.jsonl
+.completion_patch_backups/

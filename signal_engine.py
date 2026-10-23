@@ -123,6 +123,8 @@ class LiquidityLevel:
         if not math.isfinite(self.contracts) or self.contracts < 0:
             raise ValueError("Invalid liquidity quantity")
 
+BookLevel = LiquidityLevel
+
 
 @dataclass(frozen=True)
 class Candle:

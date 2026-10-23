@@ -23,7 +23,7 @@ from __future__ import annotations
 import csv
 import json
 import math
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -273,18 +273,31 @@ def to_candles(bars: Iterable[AggregatedBar], drop_incomplete: bool = True) -> L
 class CostModel:
     taker_fee_bps: float
     slippage_bps: float
+    spread_bps: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name, value in (("taker_fee_bps", self.taker_fee_bps),
+                            ("slippage_bps", self.slippage_bps),
+                            ("spread_bps", self.spread_bps)):
+            if not math.isfinite(value) or value < 0:
+                raise ReplayDataError(f"{name} must be finite and >= 0")
+
+    def _adverse_fraction(self) -> float:
+        # OHLC bars are trade-price references: cross half-spread plus slippage
+        # on entry and again on exit.
+        return (self.spread_bps / 2.0 + self.slippage_bps) / 10000.0
 
     def entry_price(self, reference: float, direction: str) -> float:
-        """Simulated fill reference (adverse slippage applied)."""
-        adj = reference * self.slippage_bps / 10000.0
+        adj = reference * self._adverse_fraction()
         return reference + adj if direction == "BUY" else reference - adj
 
     def exit_price(self, level: float, direction: str) -> float:
-        adj = level * self.slippage_bps / 10000.0
+        adj = level * self._adverse_fraction()
         return level - adj if direction == "BUY" else level + adj
 
     def fees(self, notional: float) -> float:
         return notional * self.taker_fee_bps / 10000.0
+
 
 
 @dataclass
@@ -317,6 +330,8 @@ class ReplayRunner:
         for key in ("spread_bps", "taker_fee_bps", "slippage_bps"):
             if _num(cfg[key], key) < 0:
                 raise ReplayDataError(f"{key} must be >= 0")
+        if cfg["intrabar_convention"] not in ("stop_first", "target_first"):
+            raise ReplayDataError("intrabar_convention must be 'stop_first' or 'target_first'")
         if "min_history_1m" in cfg and int(cfg["min_history_1m"]) < 1:
             raise ReplayDataError("min_history_1m must be >= 1")
         for key in ("flow_window_minutes", "max_1m_candle_age_minutes",
@@ -348,8 +363,13 @@ class ReplayRunner:
         """Build a snapshot that only uses data available at `now`."""
         if not self.bars or now < self.first_decision_ts:
             return None
-        hi = bisect_right(self._ts, now)
-        visible = self.bars[:hi]
+        # Each bar timestamp is its open. Exclude the bar beginning at now; its
+        # eventual high/low/close are not knowable at the decision timestamp.
+        last_closed_open = now - timedelta(minutes=1)
+        hi = bisect_right(self._ts, last_closed_open)
+        # Bound the rolling calculation window to avoid O(N^2) multi-month replays.
+        lookback = max(int(self.cfg["min_history_1m"]), 960)
+        visible = self.bars[max(0, hi - lookback):hi]
         if not visible:
             return None
         c1 = [se.Candle(ts_utc=b.ts_utc, open=b.open, high=b.high, low=b.low,
@@ -361,11 +381,13 @@ class ReplayRunner:
         last = visible[-1]
         price = last.close
         half = self.cfg["spread_bps"] / 2.0 / 10000.0
-        trade_hi = bisect_right(self._trade_ts, now)
+        # Prints stamped exactly at decision time are not visible until after it.
+        trade_hi = bisect_left(self._trade_ts, now)
         window_start = now - timedelta(minutes=self.cfg["flow_window_minutes"])
+        trade_lo = bisect_left(self._trade_ts, window_start)
         trades = [se.Trade(ts_utc=t.ts_utc, price=t.price, size=t.size,
                            side_aggressor=t.side_aggressor)
-                  for t in self.trades[:trade_hi] if t.ts_utc >= window_start]
+                  for t in self.trades[trade_lo:trade_hi]]
         return se.MarketSnapshot(
             ts_utc=now,
             last_price=price,
@@ -390,49 +412,64 @@ class ReplayRunner:
         )
 
     def iter_snapshots(self) -> Iterable[Tuple[datetime, se.MarketSnapshot]]:
+        min_history = int(self.cfg["min_history_1m"])
         for i, bar in enumerate(self.bars):
+            # Decision time is this bar's open, after the previous bar has closed.
             now = bar.ts_utc
             if now < self.first_decision_ts:
                 continue
-            # fail closed on a missing 1m bar inside the required history window
-            window_start = now - timedelta(minutes=self.cfg["min_history_1m"])
-            lo = bisect_right(self._ts, window_start)
-            expected = int((now - self._ts[lo]).total_seconds() // 60) + 1
-            if (i - lo + 1) != expected:
+            window = self.bars[max(0, i - min_history):i]
+            if len(window) != min_history or any(
+                (window[j].ts_utc - window[j - 1].ts_utc).total_seconds() != 60
+                for j in range(1, len(window))
+            ):
                 self.stats.skipped_gap_windows += 1
                 continue
             snap = self.snapshot_at(now)
-            if snap is None:
+            if snap is None or len(snap.candles_1m) < min_history:
                 continue
             self.stats.decision_points += 1
             yield now, snap
 
+
     # -- signal simulation ----------------------------------------------------
     def simulate(self, result: se.SignalResult,
                  entry_bar: Optional[Bar1m]) -> Optional[Dict[str, Any]]:
-        """Resolve a confirmed signal against later bars. No fill is assumed."""
-        if entry_bar is None or result.proposed_entry is None:
+        """Resolve a signal from the specified next-bar open; censor incomplete paths."""
+        if entry_bar is None or result.proposed_entry is None or result.expires_at_utc is None:
             return None
         direction = "BUY" if result.signal is se.Signal.BUY else "SELL"
-        cost = CostModel(self.cfg["taker_fee_bps"], self.cfg["slippage_bps"])
-        start = bisect_right(self._ts, entry_bar.ts_utc)
-        risk = result.risk_distance or 0.0
-        if risk <= 0:
+        cost = CostModel(self.cfg["taker_fee_bps"], self.cfg["slippage_bps"], self.cfg["spread_bps"])
+        start = bisect_left(self._ts, entry_bar.ts_utc)
+        if start >= len(self.bars) or self.bars[start].ts_utc != entry_bar.ts_utc:
             return None
-        ref_open = self.bars[start].open if start < len(self.bars) else None
-        if ref_open is None:
-            return None
-        entry_fill = cost.entry_price(ref_open, direction)
+        entry_fill = cost.entry_price(entry_bar.open, direction)
         entry_fee = cost.fees(entry_fill)
+        if result.stop_loss is None or result.take_profit is None:
+            return None
+        risk = abs(entry_fill - result.stop_loss)
+        if not math.isfinite(risk) or risk <= 0:
+            return None
+        # If the market gaps past a planned stop or target before entry, the setup is
+        # no longer valid at the first fill reference; do not invent a favorable fill.
+        if direction == "BUY" and not (result.stop_loss < entry_fill < result.take_profit):
+            return None
+        if direction == "SELL" and not (result.take_profit < entry_fill < result.stop_loss):
+            return None
         expiry_ts = result.expires_at_utc
-        outcome, exit_fill, exit_fee, exit_bar_ts = "timeout", None, None, None
+        outcome, exit_fill, exit_bar_ts = None, None, None
+        last_observed_bar = None
+        previous_bar = None
         for bar in self.bars[start:]:
-            if bar.ts_utc > expiry_ts:
+            # Bar timestamps represent opens; no bar that starts at expiry is usable.
+            if bar.ts_utc >= expiry_ts:
                 break
-            hit_stop = bar.low <= result.stop_loss if direction == "BUY" \
-                else bar.high >= result.stop_loss
-            hit_target = bar.high >= result.take_profit if direction == "BUY" \
-                else bar.low <= result.take_profit
+            if previous_bar is not None and (bar.ts_utc - previous_bar.ts_utc).total_seconds() != 60:
+                return None  # gaps make intrabar stop/target sequencing unknown
+            previous_bar = bar
+            last_observed_bar = bar
+            hit_stop = bar.low <= result.stop_loss if direction == "BUY" else bar.high >= result.stop_loss
+            hit_target = bar.high >= result.take_profit if direction == "BUY" else bar.low <= result.take_profit
             if self.cfg["intrabar_convention"] == "stop_first":
                 if hit_stop:
                     outcome, exit_fill, exit_bar_ts = "stop", result.stop_loss, bar.ts_utc
@@ -448,24 +485,20 @@ class ReplayRunner:
                     outcome, exit_fill, exit_bar_ts = "stop", result.stop_loss, bar.ts_utc
                     break
         if exit_fill is None:
-            last = self.bars[min(start, len(self.bars) - 1)]
-            for bar in reversed(self.bars[:min(start, len(self.bars))]):
-                if bar.ts_utc <= expiry_ts:
-                    last = bar
-                    break
-            outcome, exit_fill, exit_bar_ts = "timeout", last.close, last.ts_utc
+            # Do not label a truncated end-of-file path as a completed timeout.
+            if last_observed_bar is None or last_observed_bar.ts_utc + timedelta(minutes=1) < expiry_ts:
+                return None
+            outcome, exit_fill, exit_bar_ts = "timeout", last_observed_bar.close, last_observed_bar.ts_utc
         exit_fill = cost.exit_price(exit_fill, direction)
         exit_fee = cost.fees(exit_fill)
-        pnl_per_unit = (exit_fill - entry_fill) if direction == "BUY" \
-            else (entry_fill - exit_fill)
-        gross_r = (pnl_per_unit) / risk
-        costs_r = (entry_fee + exit_fee) / (risk * (1.0 if direction == "BUY" else 1.0))
-        net_r = gross_r - costs_r
+        pnl_per_unit = (exit_fill - entry_fill) if direction == "BUY" else (entry_fill - exit_fill)
+        gross_r = pnl_per_unit / risk
+        costs_r = (entry_fee + exit_fee) / risk
         return {
             "signal_id": result.signal_id,
+            "decision_ts_utc": result.generated_at_utc.isoformat() if result.generated_at_utc else None,
             "direction": direction,
-            "trigger_ts_utc": (result.expires_at_utc - timedelta(
-                minutes=self.engine_cfg["expiry_1m_candles"])).isoformat(),
+            "trigger_ts_utc": (result.expires_at_utc - timedelta(minutes=self.engine_cfg["expiry_1m_candles"])).isoformat(),
             "planned_entry": result.proposed_entry,
             "simulated_entry": entry_fill,
             "stop_loss": result.stop_loss,
@@ -476,9 +509,13 @@ class ReplayRunner:
             "outcome": outcome,
             "gross_r": gross_r,
             "costs_r": costs_r,
-            "net_r": net_r,
+            "net_r": gross_r - costs_r,
             "fees_currency_equiv": entry_fee + exit_fee,
+            "spread_bps_assumption": self.cfg["spread_bps"],
+            "slippage_bps_per_fill": self.cfg["slippage_bps"],
+            "taker_fee_bps_per_side": self.cfg["taker_fee_bps"],
         }
+
 
 
 def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -546,8 +583,9 @@ def run_replay(bars: List[Bar1m], trades: List[Print1m],
         else:
             runner.stats.signals_sell += 1
         entry_bar = None
-        start = bisect_right(runner._ts, now)
-        if start < len(runner.bars):
+        # The current bar opens at `now`; its open is the next-bar fill reference.
+        start = bisect_left(runner._ts, now)
+        if start < len(runner.bars) and runner.bars[start].ts_utc == now:
             entry_bar = runner.bars[start]
         rec = {
             "signal_id": result.signal_id,

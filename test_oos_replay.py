@@ -218,14 +218,15 @@ class TestSimulationAndCosts(unittest.TestCase):
 
     def test_costs_reduce_net_r(self):
         bars = synth_1m(1200)
+        entry_bar = bars[1000]
+        entry = entry_bar.open
         result = se.SignalResult(
             signal=se.Signal.BUY, state=se.SignalState.BUY_CONFIRMED,
-            signal_id="x", proposed_entry=100.0, stop_loss=90.0, take_profit=130.0,
-            invalidation_price=95.0, risk_distance=10.0, reward_distance=30.0,
+            signal_id="x", proposed_entry=entry, stop_loss=entry - 10.0, take_profit=entry + 30.0,
+            invalidation_price=entry - 5.0, risk_distance=10.0, reward_distance=30.0,
             risk_reward_ratio=3.0, setup_timeframe="5m",
             setup_candle_timestamp=T0, expires_at_utc=T0 + timedelta(minutes=1005))
         runner = oos.ReplayRunner(bars, [], config={"min_history_1m": 900})
-        entry_bar = bar(ts_of(1000), 100.0, 101.0, 99.0, 100.5)
         sim = runner.simulate(result, entry_bar)
         self.assertIsNotNone(sim)
         self.assertGreater(sim["gross_r"], sim["net_r"])

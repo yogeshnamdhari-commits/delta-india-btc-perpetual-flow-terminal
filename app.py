@@ -19,53 +19,44 @@ import streamlit as st
 import websocket
 
 import orderflow
-from signal_integration_bridge import build_market_snapshot, evaluate_live_signal, _result_to_dict
+from signal_integration_bridge import evaluate_feed_snapshot
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
-EVENT_LOG_FILE_FULL = "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl"
-DECISION_LOG_FILE = "/Users/targetmobile/Downloads/signal_decisions.jsonl"
+EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
+DECISION_LOG_FILE = os.environ.get("DELTA_DECISION_LOG_FILE", "/Users/targetmobile/Downloads/signal_decisions.jsonl")
 _event_lock = threading.Lock()
 _diagnostic_reconnect_triggered = False
 
-def _log_event(event: dict, to_full_log: bool = False, is_decision: bool = False) -> None:
-    """Thread-safe JSONL event logging with UTC timestamp.
-    
-    Args:
-        event: Event dictionary to log
-        to_full_log: If True, also write to the full channel log
-        is_decision: If True, write to decision log for signal audits
-    """
-    event["ts_utc"] = datetime.now(timezone.utc).isoformat()
-    event_str = json.dumps(event)
-    
-    # Log to main file (for core events)
-    with _event_lock:
-        try:
-            with open(EVENT_LOG_FILE, "a") as f:
-                f.write(event_str + "\n")
-                f.flush()
-        except Exception as e:
-            pass
-    
-    # Log to full file (for all channel events)
+def _log_event(event: dict, to_full_log: bool = False, is_decision: bool = False) -> bool:
+    """Append JSONL events and return whether every required write succeeded."""
+    import sys
+    record = dict(event)
+    record.setdefault("ts_utc", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    try:
+        event_str = json.dumps(record, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        print(f"delta-feed ERROR: refusing non-JSON event ({type(exc).__name__})", file=sys.stderr)
+        return False
+    paths = [EVENT_LOG_FILE]
     if to_full_log:
-        with _event_lock:
-            try:
-                with open(EVENT_LOG_FILE_FULL, "a") as f:
-                    f.write(event_str + "\n")
-                    f.flush()
-            except Exception as e:
-                pass
-    
-    # Log to decision file (for signal-safety audits)
+        paths.append(EVENT_LOG_FILE_FULL)
     if is_decision:
-        with _event_lock:
+        paths.append(DECISION_LOG_FILE)
+    all_ok = True
+    with _event_lock:
+        for target in paths:
             try:
-                with open(DECISION_LOG_FILE, "a") as f:
-                    f.write(event_str + "\n")
-                    f.flush()
-            except Exception as e:
-                pass
+                os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+                with open(target, "a", encoding="utf-8") as handle:
+                    handle.write(event_str + "\n")
+                    handle.flush()
+                    if is_decision:
+                        os.fsync(handle.fileno())
+            except OSError as exc:
+                all_ok = False
+                print(f"delta-feed ERROR: failed to persist {target!r}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return all_ok
+
 
 
 def _evaluate_signal_decision(
@@ -256,9 +247,9 @@ def _ts_seconds(value: Any) -> int | None:
 
 @st.cache_data(ttl=240, show_spinner="Loading recent BTCUSD candles…")
 def load_initial_candles() -> list[dict[str, float | int]]:
-    """Fetch up to 480 recent one-minute candles as chart history; live data is WebSocket-fed."""
+    """Fetch up to 2000 recent one-minute candles for chart and signal warm-up."""
     end = int(time.time())
-    start = end - 480 * 60
+    start = end - 2000 * 60
     try:
         response = requests.get(
             REST_URL,
@@ -286,7 +277,7 @@ def load_initial_candles() -> list[dict[str, float | int]]:
                 "close": float(c),
                 "volume": float(_f(row.get("volume"), 0.0) or 0.0),
             })
-        return candles[-480:]
+        return candles[-2000:]
     except Exception:
         # The websocket chart can still populate live when historical REST data is unavailable.
         return []
@@ -327,6 +318,7 @@ class DeltaFeed:
             "bids": {},
             "book_seq": None,
             "book_synced": False,
+            "sequence_gap_unresolved": True,
             "checksum_ok": None,
             "checksum_msg": "Awaiting first book snapshot",
             "ob_snapshots": 0,
@@ -422,6 +414,7 @@ class DeltaFeed:
             return {
                 "connection": self.data.get("connection", "unknown"),
                 "book_synced": self.data.get("book_synced", False),
+                "sequence_gap_unresolved": self.data.get("sequence_gap_unresolved", True),
                 "checksum_ok": self.data.get("checksum_ok"),
                 "checksum_msg": self.data.get("checksum_msg", ""),
                 "book_seq": self.data.get("book_seq"),
@@ -483,6 +476,8 @@ class DeltaFeed:
                 _logger.error("run_forever exception (attempt %d): %s", attempts, exc)
             with self.lock:
                 self.data["book_synced"] = False
+                self.data["sequence_gap_unresolved"] = True
+                self.data["checksum_ok"] = None
                 self.data["book_seq"] = None
                 self._checksum_logged = False
             self._set_status(f"reconnecting in {delay:.0f}s")
@@ -523,7 +518,9 @@ class DeltaFeed:
             _logger.info("Outgoing subscription payload: %s", json.dumps(payload))
             with self.lock:
                 self.data["book_synced"] = False
+                self.data["sequence_gap_unresolved"] = True
                 self.data["book_seq"] = None
+                self.data["checksum_ok"] = None
                 self.data["checksum_msg"] = "Waiting for order-book snapshot"
                 self._checksum_logged = False
                 self.data["total_reconnects"] = self.data.get("total_reconnects", 0) + 1
@@ -535,15 +532,24 @@ class DeltaFeed:
 
     def _on_error(self, ws: websocket.WebSocketApp, error: Any) -> None:
         self._set_status("socket error", str(error))
+        with self.lock:
+            self.data["book_synced"] = False
+            self.data["sequence_gap_unresolved"] = True
+            self.data["checksum_ok"] = None
         _logger.error("WebSocket socket error: %s", error)
         _log_event({"event": "ws_error", "error": str(error)})
+
 
     def _on_close(self, ws: websocket.WebSocketApp, code: Any, message: Any) -> None:
         self._set_status("disconnected", f"close={code}; {message or ''}")
         _logger.warning("WebSocket disconnected at %s (code=%s)", datetime.now(timezone.utc).isoformat(), code)
         with self.lock:
             self.data["total_disconnects"] = self.data.get("total_disconnects", 0) + 1
+            self.data["book_synced"] = False
+            self.data["sequence_gap_unresolved"] = True
+            self.data["checksum_ok"] = None
         _log_event({"event": "ws_disconnected", "code": code, "message": str(message or '')})
+
 
     def trigger_diagnostic_reconnect(self) -> bool:
         """Explicitly triggered reconnect for testing. Only works if DELTA_ENABLE_DIAGNOSTIC_RECONNECT=1."""
@@ -577,6 +583,8 @@ class DeltaFeed:
             ws = self.ws
             with self.lock:
                 self.data["book_synced"] = False
+                self.data["sequence_gap_unresolved"] = True
+                self.data["checksum_ok"] = None
                 self.data["checksum_msg"] = reason
                 self.data["asks"] = {}
                 self.data["bids"] = {}
@@ -639,8 +647,12 @@ class DeltaFeed:
                 except (TypeError, ValueError):
                     self.data["book_seq"] = None
                     self.data["book_synced"] = False
+                    self.data["sequence_gap_unresolved"] = True
+                    do_resub = True
+                    resync_reason = "Order-book snapshot has missing/invalid sequence; reloading book"
                 else:
                     self.data["book_synced"] = True
+                    self.data["sequence_gap_unresolved"] = False
                 self.data["ob_snapshots"] += 1
                 self.data["book_version"] = self.data.get("book_version", 0) + 1
                 _logger.info("Order-book snapshot received: seq=%s cs=%s asks=%d bids=%d",
@@ -653,12 +665,14 @@ class DeltaFeed:
                     incoming_seq = None
                 if not self.data["book_synced"] or prior_seq is None:
                     resync_reason = "Update received before snapshot; reloading book"
+                    self.data["sequence_gap_unresolved"] = True
                     self.data["sequence_gaps"] += 1
                     _logger.warning("ob_updates received before snapshot (seq=%s); resubscribing", msg.get("seq"))
                     _log_event({"event": "ob_sequence_gap", "seq": msg.get("seq"), "reason": "snapshot_missing"})
                     do_resub = True
                 elif incoming_seq != prior_seq + 1:
                     resync_reason = f"Sequence gap: expected {prior_seq + 1}, got {incoming_seq}; reloading book"
+                    self.data["sequence_gap_unresolved"] = True
                     self.data["sequence_gaps"] += 1
                     _logger.warning("Order-book sequence gap: expected %s got %s; resubscribing", prior_seq + 1, incoming_seq)
                     _log_event({"event": "ob_sequence_gap", "expected": prior_seq + 1, "received": incoming_seq, "seq": msg.get("seq")})
@@ -676,10 +690,15 @@ class DeltaFeed:
             else:
                 expected = msg.get("cs")
                 calculated = self._book_checksum(self.data["asks"], self.data["bids"])
-                if expected is not None and calculated != int(expected):
+                try:
+                    expected_int = int(expected) if expected is not None else None
+                except (TypeError, ValueError, OverflowError):
+                    expected_int = None
+                if expected is not None and (expected_int is None or calculated != expected_int):
                     self.data["checksum_ok"] = False
                     self.data["checksum_failures"] += 1
                     self.data["book_synced"] = False
+                    self.data["sequence_gap_unresolved"] = True
                     self.data["checksum_msg"] = f"CRC mismatch (expected {expected}, calculated {calculated}); reloading book"
                     resync_reason = self.data["checksum_msg"]
                     do_resub = True
@@ -694,6 +713,7 @@ class DeltaFeed:
                 else:
                     self.data["checksum_ok"] = True if expected is not None else None
                     self.data["checksum_msg"] = "CRC32 verified" if expected is not None else "Exchange did not include checksum"
+                    self.data["sequence_gap_unresolved"] = False
                     self.data["book_updates"] += 1
                     self.data["ob_updates"] += 1
                     self.data["book_synced"] = True
@@ -706,7 +726,7 @@ class DeltaFeed:
                         "action": "update" if action == "update" else "snapshot",
                         "seq": msg.get("seq"),
                         "cs": msg.get("cs"),
-                        "crc_ok": expected is None or calculated == int(expected),
+                        "crc_ok": expected is None or (expected_int is not None and calculated == expected_int),
                         "checksummed": expected is not None
                     })
                     self.data["last_market_message_at"] = time.time()
@@ -1006,13 +1026,15 @@ class DeltaFeed:
                         "open": float(o), "high": float(h), "low": float(low), "close": float(c),
                         "volume": float(_f(msg.get("v"), 0.0) or 0.0),
                     }
-                    if len(self.data["candles"]) > 1200:
-                        for old_key in sorted(self.data["candles"])[:-1200]:
+                    if len(self.data["candles"]) > 3000:
+                        for old_key in sorted(self.data["candles"])[:-3000]:
                             self.data["candles"].pop(old_key, None)
                     _log_event({
                         "event": "channel_message",
                         "channel": kind,
                         "resolution": resolution,
+                        "candle_ts": bucket,
+                        "candle_ts_utc": datetime.fromtimestamp(bucket, timezone.utc).isoformat(),
                         "open": float(o), "high": float(h), "low": float(low), "close": float(c),
                         "volume": float(_f(msg.get("v"), 0.0) or 0.0),
                     }, to_full_log=True)
@@ -2453,130 +2475,58 @@ def _log_signal_gate_diagnostic(
 
 
 def _render_signal_panel() -> None:
-    """Evaluate live feed through the confirmed-entry engine and display decision."""
-    d = feed.snapshot()
-    signal_state = feed.get_signal_state()
-    if not signal_state:
-        _log_signal_gate_diagnostic(
-            "BLOCKED",
-            "SIGNAL_STATE_UNAVAILABLE",
-            feed_state=signal_state,
-            details={"branch": "empty_signal_state"},
-        )
-        st.warning("Signal evaluation blocked: feed state unavailable.")
-        return
+    """Render and persist the exact record returned by the canonical live pipeline."""
     try:
-        snapshot = build_market_snapshot(d)
+        data = feed.snapshot()
+        feed_state = feed.get_signal_state()
     except Exception as exc:
-        _log_signal_gate_diagnostic(
-            "BLOCKED",
-            "SNAPSHOT_BUILD_FAILED",
-            feed_state=signal_state,
-            details={"error_type": type(exc).__name__},
-        )
-        st.error("Signal evaluation blocked: market snapshot could not be built.")
-        return
-    if snapshot is None:
-        _log_signal_gate_diagnostic(
-            "BLOCKED",
-            "SNAPSHOT_UNAVAILABLE",
-            feed_state=signal_state,
-        )
-        st.warning("Signal evaluation blocked: snapshot unavailable.")
-        return
-    MIN_15M_WARMUP = 55
-    MIN_5M_WARMUP = 55
-    count_15m = len(snapshot.candles_15m)
-    count_5m = len(snapshot.candles_5m)
-    if count_5m < 55 or count_15m < 55:
-        _log_signal_gate_diagnostic(
-            "WAIT",
-            "WARMUP_INSUFFICIENT_CANDLES",
-            feed_state=signal_state,
-            details={
-                "candles_5m": count_5m,
-                "candles_15m": count_15m,
-                "required_5m": 55,
-                "required_15m": 55,
-            },
-        )
-        st.info(
-            "Signal engine warming up: "
-            f"5m candles {count_5m}/55; "
-            f"15m candles {count_15m}/55."
-        )
-        return
+        data, feed_state = {}, {}
+        st.warning(f"Feed snapshot unavailable ({type(exc).__name__}); entry is blocked.")
     from signal_engine import SignalEngine
-    import datetime as dt
-    engine = SignalEngine()
-    result = engine.evaluate(snapshot)
-    feed_state = signal_state
-    result_dict = {
-        "signal": result.signal.value,
-        "state": result.state.name,
-        "signal_id": getattr(result, 'signal_id', None),
-        "reason_codes": list(getattr(result, 'reason_codes', [])),
-        "human_readable_explanation": getattr(result, 'human_readable_explanation', ''),
-        "data_quality_gate_results": dict(getattr(result, 'data_quality_gate_results', {})),
-    }
-    decision_record = {
-        "decision": result.signal.value,
-        "signal_type": result.signal.value if result.signal.value in ("BUY", "SELL") else None,
-        "score": None,
-        "confidence": 1.0,
-        "blocking_reason": "; ".join(result.reason_codes) if result.reason_codes else None,
-        "feed_fresh": all(result.data_quality_gate_results.get(k, False) for k in [
-            "candles_fresh", "trades_fresh", "time_consistent"]),
-        "book_synced": result.data_quality_gate_results.get("book_synced", False),
-        "no_unresolved_sequence_gap": result.data_quality_gate_results.get("no_unresolved_sequence_gap", None),
-        "sequence_valid": result.data_quality_gate_results.get("no_unresolved_sequence_gap"),
-        "crc_valid": result.data_quality_gate_results.get("checksum_ok", False),
-        "orderbook_integrity_ok": bool(
-            result.data_quality_gate_results.get("book_synced", False)
-            and result.data_quality_gate_results.get("no_unresolved_sequence_gap", False)
-            and result.data_quality_gate_results.get("checksum_ok", False)
-        ),
-        "feed_age_seconds": signal_state.get("feed_age_seconds"),
-        "book_seq": d.get("book_seq"),
-        "total_disconnects": feed_state.get("total_disconnects", 0),
-        "total_reconnects": feed_state.get("total_reconnects", 0),
-        "feed_state": feed_state,
-        "engine_result": result_dict,
-        "metadata": {"runtime_context": "live_signal", "source": "delta_feed"},
-    }
-    _log_event(decision_record, is_decision=True)
-    decision = decision_record["decision"]
+    engine = st.session_state.get("_delta_signal_engine")
+    if engine is None:
+        engine = SignalEngine()
+        st.session_state["_delta_signal_engine"] = engine
+    decision_record = evaluate_feed_snapshot(data, feed_state=feed_state, engine=engine,
+                                              history_path=EVENT_LOG_FILE)
+    log_ok = _log_event(decision_record, is_decision=True)
+    decision = decision_record.get("decision", "BLOCKED")
+    result = decision_record.get("engine_result") or {}
     if decision == "BUY":
-        st.success("LIVE ENTRY SIGNAL · CONFIRMED BUY")
+        st.success("CONFIRMED BUY · Analysis only — no order has been placed")
     elif decision == "SELL":
-        st.success("LIVE ENTRY SIGNAL · CONFIRMED SELL")
+        st.success("CONFIRMED SELL · Analysis only — no order has been placed")
+    elif decision == "WAIT":
+        st.info("WAIT · No confirmed entry signal")
     else:
-        st.error("LIVE ENTRY SIGNAL · BLOCKED")
+        st.warning("BLOCKED · Feed integrity, data quality, or snapshot requirements failed")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Decision", decision)
-    c2.metric("Book synced", str(decision_record.get("book_synced", "unknown")))
-    c3.metric("CRC verified", str(decision_record.get("crc_valid", "unknown")))
+    c2.metric("Book synced", str(decision_record.get("book_synced", False)))
+    c3.metric("CRC verified", str(decision_record.get("crc_valid", False)))
     age = decision_record.get("feed_age_seconds")
     c4.metric("Last market message age", "—" if age is None else f"{float(age):.2f}s")
     if decision in ("BUY", "SELL"):
-        levels = (
-            ("Proposed entry", "entry_reference_price"),
-            ("Stop-loss", "stop_loss"),
-            ("Take-profit", "take_profit"),
-            ("Risk/reward", "risk_reward_ratio"),
-        )
-        level_cols = st.columns(4)
-        for col, (label, key) in zip(level_cols, levels):
-            value = result_dict.get(key)
-            col.metric(label, "—" if value is None else f"{value:.2f}" if key != "risk_reward_ratio" else f"{value:.2f}:1")
+        fields = (("Proposed entry", "proposed_entry"), ("Stop-loss", "stop_loss"),
+                  ("Take-profit", "take_profit"), ("Risk/reward", "risk_reward_ratio"))
+        cols = st.columns(4)
+        for col, (label, key) in zip(cols, fields):
+            value = result.get(key)
+            col.metric(label, "—" if value is None else (f"{value:.2f}" if key != "risk_reward_ratio" else f"{value:.2f}:1"))
         st.caption("Proposed analysis levels only; no order has been placed.")
-    reasons = result_dict.get("reason_codes")
+    reasons = result.get("reason_codes") or []
+    if decision_record.get("blocking_reason") and not reasons:
+        reasons = [decision_record["blocking_reason"]]
     if reasons:
-        st.caption("Reason codes: " + "; ".join(str(x) for x in reasons))
-    explanation = result_dict.get("human_readable_explanation")
+        st.caption("Reason codes: " + "; ".join(str(code) for code in reasons))
+    explanation = result.get("human_readable_explanation")
     if explanation:
         st.write(explanation)
-    st.caption(f"Decision ID: {decision_record.get('signal_id', '—')} · Logged: yes · Context: live_signal")
+    if log_ok:
+        st.caption(f"Decision ID: {decision_record.get('signal_id') or '—'} · Persisted to decision log · read-only analysis")
+    else:
+        st.error("Decision evaluated but logging failed. Check DELTA_DECISION_LOG_FILE and DELTA_EVENT_LOG_FILE permissions.")
+
 
 
 show_signal_panel = st.checkbox("Live entry signal panel", value=True)
