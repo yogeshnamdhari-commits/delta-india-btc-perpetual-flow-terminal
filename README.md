@@ -1,27 +1,66 @@
 # Delta India BTC Perpetual Flow Terminal
 
-Read-only BTC perpetual market-data dashboard and signal-engine research project.
+A read-only local Streamlit dashboard that consumes Delta Exchange India's public WebSocket feed directly. It does **not** place, amend, or cancel orders and does not need API keys.
 
-## Main files
+## Live channels used
 
-- `app.py` — Streamlit terminal and application integration.
-- `signal_integration_bridge.py` — Converts the existing feed snapshot into signal-engine input and aggregates completed one-minute candles into higher timeframes.
-- `signal_engine.py` — Read-only signal evaluation, quality gates, setup criteria, risk checks, and result reason codes.
-- `test_signal_engine.py`, `test_signal_timeframes.py`, `test_synchronized_logging.py` — unit and regression tests.
-- `oos_replay.py` and related tests are included if present in the source directory.
+- `ob_updates`: incremental L2 order book, sequence continuity and CRC32 checks
+- `trades`: public executed trades and a session-only CVD proxy
+- `ticker`: periodic market fields including mark price, best bid/ask and open interest
+- `mark_price`: liquidation mark price
+- `spot_price`: Delta BTCUSD underlying index (`.DEXBTUSD`)
+- `funding_rate`: perpetual funding data
+- `candlestick_1m`: live candle updates
+- `system_status`: public status events
 
-## Run tests
+WebSocket: `wss://public-socket.india.delta.exchange`
 
-Install the dependencies required by the project, then run:
+The app fetches a small set of recent historical candles over the public REST API to populate the chart on startup. Market prices/depth/trades then update from WebSocket messages.
+
+## Run on macOS
+
+### Option A — Terminal commands
 
 ```bash
-python3 -m pytest -v
+cd delta_india_btc_terminal
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m streamlit run app.py --server.port 8502
 ```
 
-## Safety and release status
+Open `http://localhost:8502` in your browser if it does not open automatically.
 
-**Not approved for live order execution.** This repository is for read-only research and validation. Unit tests, synthetic failure tests, and log consistency audits do not alone certify the live `DeltaFeed -> app -> bridge -> engine -> persisted decision` path or establish profitability.
+### Option B — Double-click launcher
 
-Before any deployment, run end-to-end failure-injection and recovery tests against the actual application, then conduct chronological out-of-sample evaluation with frozen strategy parameters and realistic fees, spread, slippage, and funding costs. Report net expectancy, profit factor, maximum drawdown, and trade count.
+Double-click `start_mac.command`. macOS may ask you to confirm that you want to run a downloaded command file. The launcher creates a local virtual environment, installs the listed Python packages, and launches the app.
 
-Runtime feed logs, decision JSONL files, credentials, and raw market-data captures are intentionally excluded from Git by `.gitignore`. Add only sanitized, intentionally selected datasets to a separate location if needed for research.
+## What you should see
+
+- BTCUSD last-trade price, mark price and index price
+- Bid/ask, spread and spread in basis points
+- Live candlesticks (1m, 3m, 5m or 15m views; larger views are aggregated from 1m candles)
+- Incremental order book with sequence and CRC32 status
+- Recent trade tape
+- Session-only signed-volume/CVD proxy
+- Open interest and funding rate, when delivered by the feed
+- Feed age, sequence gaps, checksum failures and reconnect status
+
+## Safety / interpretation notes
+
+- Public market data should not need Delta API credentials. **Do not paste API keys or secrets into this app.**
+- The app is read-only. It contains no order-entry controls.
+- The local CVD proxy begins at app startup, is not an exchange-calculated historical CVD, and resets when the app is restarted.
+- The order book can change or be cancelled rapidly; visible depth is not a promise of execution.
+- A fresh WebSocket feed does not guarantee zero latency. On-screen receive age is not a proof of network latency because this build does not calibrate against an independently synchronized clock.
+- The book is marked unsynchronized after a sequence gap or CRC32 mismatch, and the client requests a new snapshot.
+- This terminal is for monitoring and research, not a guarantee of profitable trades or absence of market manipulation.
+
+## Troubleshooting
+
+1. Confirm the internet connection and that the machine clock is automatically synchronized.
+2. Wait several seconds after startup for the first order-book snapshot and market updates.
+3. If the feed remains disconnected, verify Delta India's current API/WebSocket status and the official docs: https://docs.delta.exchange/ .
+4. If the historical chart is blank but live price/tape is updating, the public historical REST request may have failed; the candle chart should gradually populate from new live candles.
+5. Stop the app with `Ctrl+C` in the terminal.
