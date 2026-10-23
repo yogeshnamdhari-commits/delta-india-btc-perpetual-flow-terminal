@@ -6,8 +6,7 @@ confirmed-entry engine, enabling genuine signal generation for production use.
 """
 from __future__ import annotations
 
-import math
-import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,30 +35,24 @@ except ImportError:
 
 
 def _to_utc(ts_val: Any) -> datetime:
-    """Convert ISO, seconds, milliseconds, microseconds, or nanoseconds to UTC."""
+    """Convert various timestamp formats to timezone-aware UTC datetime."""
     if isinstance(ts_val, datetime):
-        if ts_val.tzinfo is None or ts_val.utcoffset() is None:
+        if ts_val.tzinfo is None:
             return ts_val.replace(tzinfo=UTC)
         return ts_val.astimezone(UTC)
     if isinstance(ts_val, (int, float)):
-        value = float(ts_val)
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"Invalid epoch timestamp: {ts_val!r}")
-        if value >= 1e17:
-            value /= 1e9
-        elif value >= 1e14:
-            value /= 1e6
-        elif value >= 1e11:
-            value /= 1e3
-        return datetime.fromtimestamp(value, UTC)
+        if ts_val > 1e12:
+            ts_val = ts_val / 1_000_000  # microseconds
+        elif ts_val > 1e9:
+            pass  # seconds
+        elif ts_val > 1e6:
+            ts_val = ts_val * 1000  # milliseconds
+        return datetime.fromtimestamp(ts_val, UTC)
     if isinstance(ts_val, str):
-        value = ts_val.strip()
-        if value.endswith("Z"):
-            value = value[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(value)
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC)
+        ts_val = ts_val.replace("Z", "+00:00")
+        if "+" not in ts_val and "-" not in ts_val[-6:]:
+            ts_val = ts_val + "+00:00"
+        return datetime.fromisoformat(ts_val)
     raise ValueError(f"Unsupported timestamp type: {type(ts_val)}")
 
 
@@ -67,93 +60,72 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
     if val is None:
         return default
     try:
-        number = float(val)
-        return number if math.isfinite(number) else default
-    except (TypeError, ValueError, OverflowError):
+        f = float(val)
+        if f != f:  # NaN check
+            return default
+        return f
+    except (TypeError, ValueError):
         return default
 
 
-_REQUIRED_CHANNEL_MAX_AGE_SECONDS = {"ticker": 8.0, "ob_updates": 3.0, "trades": 20.0}
-
-
-def _feed_health(feed_data: dict[str, Any], now: datetime) -> dict[str, Any]:
-    """Derive health from explicit feed state; absent or unknown state fails closed."""
-    connection_healthy = str(feed_data.get("connection", "")).lower() == "connected"
-    book_synced = feed_data.get("book_synced") is True
-    raw_gap = feed_data.get("sequence_gap_unresolved")
-    sequence_gap_unresolved = True if raw_gap is None else bool(raw_gap)
-    channel_times = feed_data.get("channel_last_seen", {}) or {}
-    channel_age_seconds: dict[str, float | None] = {}
-    channel_freshness: dict[str, bool] = {}
-    for channel, max_age in _REQUIRED_CHANNEL_MAX_AGE_SECONDS.items():
-        try:
-            seen = channel_times.get(channel)
-            age = (now - _to_utc(seen)).total_seconds() if seen is not None else None
-        except (TypeError, ValueError, OverflowError, OSError):
-            age = None
-        channel_age_seconds[channel] = age
-        channel_freshness[channel] = age is not None and 0.0 <= age <= max_age
-    market_fresh = connection_healthy and all(channel_freshness.values())
-    checksum_verified = feed_data.get("checksum_ok") is True
-    try:
-        last_market = feed_data.get("last_market_message_at")
-        market_age = (now - _to_utc(last_market)).total_seconds() if last_market is not None else None
-    except (TypeError, ValueError, OverflowError, OSError):
-        market_age = None
-    return {
-        "connection_healthy": connection_healthy,
-        "market_fresh": market_fresh,
-        "channel_age_seconds": channel_age_seconds,
-        "channel_freshness": channel_freshness,
-        "book_synced": book_synced,
-        "sequence_gap_unresolved": sequence_gap_unresolved,
-        "checksum_verified": checksum_verified,
-        "feed_age_seconds": market_age,
-    }
-
-
-
 def _seed_candle_history(history_path: str, now: datetime, max_candles: int = 10000) -> list[Candle]:
-    """Load closed candles only when an exchange candle timestamp is explicit.
-
-    Older logs used ts_utc for receive time, not the candle bucket, so they are
-    intentionally ignored rather than misaligned into fabricated historical bars.
+    """Load historical candles from delta_feed_events.jsonl for warm-up.
+    
+    Args:
+        history_path: Path to delta_feed_events.jsonl (or similar event log)
+        now: Current timestamp to align candles to
+        max_candles: Maximum number of 1m candles to load
+    
+    Returns:
+        List of Candle objects, newest first, fully completed candles only
     """
     import json
     from pathlib import Path
-
-    path = Path(history_path).expanduser()
-    if not path.is_file() or max_candles <= 0:
+    
+    if not Path(history_path).exists():
         return []
-    latest_by_minute: dict[int, Candle] = {}
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+    
+    now_epoch = now.timestamp()
+    one_min_ago = now_epoch - 60
+    candles = []
+    seen_minutes = set()
+    
+    with open(history_path, 'r') as f:
+        for line in f:
             try:
-                event = json.loads(line)
-                if event.get("channel") != "candlestick_1m":
+                event = json.loads(line.strip())
+                if event.get('channel') != 'candlestick_1m':
                     continue
-                raw_ts = event.get("candle_ts_utc", event.get("candle_ts"))
-                if raw_ts is None:
+                ts_str = event.get('ts_utc')
+                if not ts_str:
                     continue
-                epoch = _to_utc(raw_ts).timestamp()
-                bucket = int(epoch // 60) * 60
-                if bucket + 60 > now.timestamp():
+                ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                if ts.tzinfo is None:
                     continue
-                o = _safe_float(event.get("open"), 0.0)
-                h = _safe_float(event.get("high"), 0.0)
-                low = _safe_float(event.get("low"), 0.0)
-                close = _safe_float(event.get("close"), 0.0)
-                volume = _safe_float(event.get("volume"), 0.0)
-                if min(o, h, low, close) <= 0:
+                ts_epoch = ts.timestamp()
+                minute_bucket = int(ts_epoch // 60) * 60
+                
+                if minute_bucket in seen_minutes:
                     continue
-                latest_by_minute[bucket] = Candle(
-                    ts_utc=datetime.fromtimestamp(bucket, tz=UTC),
-                    open=o, high=h, low=low, close=close, volume=volume,
-                )
-            except (json.JSONDecodeError, ValueError, KeyError, TypeError, OverflowError, OSError):
+                seen_minutes.add(minute_bucket)
+                
+                if minute_bucket < one_min_ago:
+                    o = float(event.get('open', 0))
+                    h = float(event.get('high', 0))
+                    l = float(event.get('low', 0))
+                    cl = float(event.get('close', 0))
+                    v = float(event.get('volume', 0))
+                    if o > 0 and h > 0 and l > 0 and cl > 0:
+                        aligned_ts = datetime.fromtimestamp(minute_bucket, tz=timezone.utc)
+                        candles.append(Candle(
+                            ts_utc=aligned_ts,
+                            open=o, high=h, low=l, close=cl, volume=v
+                        ))
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError):
                 continue
-    return [latest_by_minute[k] for k in sorted(latest_by_minute)[-max_candles:]]
-
+    
+    candles.sort(key=lambda c: c.ts_utc)
+    return candles
 
 
 def _aggregate_completed_candles(candles_1m, minutes, *, now=None):
@@ -208,97 +180,122 @@ def _aggregate_completed_candles(candles_1m, minutes, *, now=None):
     return aggregated
 
 
-def build_market_snapshot(
-    feed_data: dict[str, Any],
-    now: datetime | None = None,
-    *,
-    history_path: str | None = None,
-) -> MarketSnapshot | None:
-    """Convert raw DeltaFeed data into an engine snapshot with fail-closed health."""
+def build_market_snapshot(feed_data: dict[str, Any], now: datetime | None = None) -> MarketSnapshot | None:
+    """Convert DeltaFeed.snapshot() output to signal_engine.MarketSnapshot.
+
+    Args:
+        feed_data: Output from DeltaFeed.snapshot()
+        now: Current timestamp (defaults to now)
+
+    Returns:
+        MarketSnapshot ready for SignalEngine.evaluate(), or None if required data missing
+    """
     if not SIGNAL_ENGINE_AVAILABLE:
         return None
 
     now = now or datetime.now(UTC)
-    health = _feed_health(feed_data, now)
+    
     last_price = _safe_float(feed_data.get("last_price"), 0.0)
     bid = _safe_float(feed_data.get("bid"), 0.0)
     ask = _safe_float(feed_data.get("ask"), 0.0)
+    
     if last_price <= 0 or bid <= 0 or ask < bid:
         return None
-    spread_bps = ((ask - bid) / ((bid + ask) / 2) * 10000) if (bid + ask) > 0 else float("inf")
-
+    
+    spread_bps = ((ask - bid) / ((bid + ask) / 2) * 10000) if (bid + ask) > 0 else float('inf')
+    
+    trades_data = feed_data.get("trades", []) or []
     recent_trades: list[Trade] = []
-    for row in (feed_data.get("trades", []) or [])[-1000:]:
+    for t in trades_data[-1000:]:
         try:
-            ts_val = row.get("timestamp") or row.get("ts") or row.get("time_utc") or row.get("time")
+            ts_val = t.get("timestamp") or t.get("ts") or t.get("time_utc") or t.get("time")
             if ts_val is None:
                 continue
             trade_ts = _to_utc(ts_val)
-            price = _safe_float(row.get("price") or row.get("p"), 0.0)
-            size = _safe_float(row.get("size") or row.get("s"), 0.0)
-            role = str(row.get("buyer_role") or row.get("r", "")).strip().lower()
+            price = _safe_float(t.get("price") or t.get("p"), 0.0)
+            size = _safe_float(t.get("size") or t.get("s"), 0.0)
             if price <= 0 or size <= 0:
                 continue
+            role = str(t.get("buyer_role") or t.get("r", "")).strip().lower()
             if role == "t":
-                aggressor = AGGRESSOR_BUY
+                aggr = AGGRESSOR_BUY
             elif role == "m":
-                aggressor = AGGRESSOR_SELL
+                aggr = AGGRESSOR_SELL
             else:
                 continue
-            recent_trades.append(Trade(trade_ts, price, size, aggressor))
-        except (TypeError, ValueError, OverflowError, OSError):
+            recent_trades.append(Trade(trade_ts, price, size, aggr))
+        except Exception:
             continue
-    recent_trades.sort(key=lambda trade: trade.ts_utc)
-
+    recent_trades.sort(key=lambda t: t.ts_utc)
+    
+    candles_1m_raw = feed_data.get("candles", []) or []
     candles_1m: list[Candle] = []
-    for row in (feed_data.get("candles", []) or []):
-        if not isinstance(row, dict):
+    for c in candles_1m_raw:
+        if not isinstance(c, dict):
             continue
         try:
-            ts_val = row.get("timestamp") or row.get("time") or row.get("ts") or row.get("t")
+            ts_val = c.get("timestamp") or c.get("time") or c.get("ts") or c.get("t")
             if ts_val is None:
                 continue
-            candle_ts = _to_utc(ts_val)
-            open_price = _safe_float(row.get("open") or row.get("o"), 0.0)
-            high_price = _safe_float(row.get("high") or row.get("h"), 0.0)
-            low_price = _safe_float(row.get("low") or row.get("l"), 0.0)
-            close_price = _safe_float(row.get("close") or row.get("c"), 0.0)
-            volume_raw = row.get("volume") if row.get("volume") is not None else row.get("v")
-            volume = _safe_float(volume_raw, 0.0)
-            if min(open_price, high_price, low_price, close_price) <= 0:
+            c_ts = _to_utc(ts_val)
+            o = _safe_float(c.get("open") or c.get("o"), 0.0)
+            h = _safe_float(c.get("high") or c.get("h"), 0.0)
+            l = _safe_float(c.get("low") or c.get("l"), 0.0)
+            cl = _safe_float(c.get("close") or c.get("c"), 0.0)
+            v = _safe_float(c.get("volume") or c.get("v"), 0.0)
+            if o <= 0 or h <= 0 or l <= 0 or cl <= 0:
                 continue
-            if high_price < max(open_price, close_price) or low_price > min(open_price, close_price):
+            if h < max(o, cl) or l > min(o, cl):
                 continue
-            candles_1m.append(Candle(
-                ts_utc=candle_ts, open=open_price, high=high_price,
-                low=low_price, close=close_price, volume=volume,
-            ))
-        except (TypeError, ValueError, OverflowError, OSError):
+            candles_1m.append(Candle(ts_utc=c_ts, open=o, high=h, low=l, close=cl, volume=v))
+        except Exception:
             continue
-    candles_1m.sort(key=lambda candle: candle.ts_utc)
-    candles_5m = _aggregate_completed_candles(candles_1m, 5, now=now)
-    candles_15m = _aggregate_completed_candles(candles_1m, 15, now=now)
+    candles_1m.sort(key=lambda c: c.ts_utc)
+    
+    channel_times = feed_data.get("channel_last_seen", {}) or {}
+    last_trade_ts = now
+    quote_ts = now
+    for ch, ts in channel_times.items():
+        try:
+            utc_ts = _to_utc(ts)
+            if ch == "trades" and utc_ts < last_trade_ts:
+                last_trade_ts = utc_ts
+            if ch in ("ticker", "mark_price", "ob_updates") and utc_ts < quote_ts:
+                quote_ts = utc_ts
+        except Exception:
+            pass
+    
+    book_synced = bool(feed_data.get("book_synced", False))
+    checksum_val = feed_data.get("checksum_ok")
+    if checksum_val is True:
+        checksum_state = ChecksumState.VERIFIED
+    elif checksum_val is False:
+        checksum_state = ChecksumState.FAILED
+    else:
+        checksum_state = ChecksumState.UNAVAILABLE
+    
+    aggregation_now = now
+    candles_5m = _aggregate_completed_candles(candles_1m, 5, now=aggregation_now)
+    candles_15m = _aggregate_completed_candles(candles_1m, 15, now=aggregation_now)
+    
     if len(candles_15m) < 55:
-        seed_path = history_path or os.environ.get(
-            "DELTA_EVENT_LOG_FILE",
-            "/Users/targetmobile/Downloads/delta_feed_events.jsonl",
-        )
-        seeded_1m = _seed_candle_history(seed_path, now, max_candles=10000)
+        history_path = "/Users/targetmobile/Downloads/delta_feed_events.jsonl"
+        seeded_1m = _seed_candle_history(history_path, now, max_candles=10000)
         if seeded_1m:
-            existing = {candle.ts_utc for candle in candles_1m}
-            candles_1m = sorted(
-                candles_1m + [candle for candle in seeded_1m if candle.ts_utc not in existing],
-                key=lambda candle: candle.ts_utc,
-            )
-            candles_5m = _aggregate_completed_candles(candles_1m, 5, now=now)
-            candles_15m = _aggregate_completed_candles(candles_1m, 15, now=now)
-
-    checksum_value = feed_data.get("checksum_ok")
-    checksum_state = (
-        ChecksumState.VERIFIED if checksum_value is True else
-        ChecksumState.FAILED if checksum_value is False else
-        ChecksumState.UNAVAILABLE
-    )
+            combined_1m = list(candles_1m)
+            for seed_c in seeded_1m:
+                is_dup = False
+                for live_c in candles_1m:
+                    if live_c.ts_utc == seed_c.ts_utc:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    combined_1m.append(seed_c)
+            combined_1m.sort(key=lambda c: c.ts_utc)
+            candles_1m = combined_1m
+            candles_5m = _aggregate_completed_candles(candles_1m, 5, now=aggregation_now)
+            candles_15m = _aggregate_completed_candles(candles_1m, 15, now=aggregation_now)
+    
     return MarketSnapshot(
         ts_utc=now,
         last_price=last_price,
@@ -307,11 +304,11 @@ def build_market_snapshot(
         candles_1m=candles_1m,
         candles_5m=candles_5m,
         candles_15m=candles_15m,
-        book_synced=health["book_synced"],
-        connection_healthy=health["connection_healthy"],
-        sequence_gap_unresolved=health["sequence_gap_unresolved"],
+        book_synced=book_synced,
+        connection_healthy=book_synced,
+        sequence_gap_unresolved=not book_synced,
         checksum_state=checksum_state,
-        market_fresh=health["market_fresh"],
+        market_fresh=True,
         spread_bps=spread_bps,
         recent_trades=recent_trades,
         completed_candle_timestamps={},
@@ -324,216 +321,83 @@ def build_market_snapshot(
     )
 
 
-
 def _result_to_dict(result) -> dict[str, Any]:
-    """Return a JSON-safe representation of a SignalResult."""
-    def iso(value: Any) -> Any:
-        return value.isoformat() if isinstance(value, datetime) else value
-
+    """Convert SignalResult to dict for logging (current signal_engine doesn't have to_dict)."""
     return {
-        "signal": result.signal.value if hasattr(result.signal, "value") else str(result.signal),
-        "state": result.state.name if hasattr(result.state, "name") else str(result.state),
-        "signal_id": getattr(result, "signal_id", None),
-        "generated_at_utc": iso(getattr(result, "generated_at_utc", None)),
-        "expires_at_utc": iso(getattr(result, "expires_at_utc", None)),
-        "setup_candle_timestamp": iso(getattr(result, "setup_candle_timestamp", None)),
-        "proposed_entry": getattr(result, "proposed_entry", None),
-        "stop_loss": getattr(result, "stop_loss", None),
-        "take_profit": getattr(result, "take_profit", None),
-        "invalidation_price": getattr(result, "invalidation_price", None),
-        "risk_distance": getattr(result, "risk_distance", None),
-        "reward_distance": getattr(result, "reward_distance", None),
-        "risk_reward_ratio": getattr(result, "risk_reward_ratio", None),
-        "reason_codes": list(getattr(result, "reason_codes", [])),
-        "human_readable_explanation": getattr(result, "human_readable_explanation", ""),
-        "confirmation_conditions_passed": list(getattr(result, "confirmation_conditions_passed", [])),
-        "confirmation_conditions_failed": list(getattr(result, "confirmation_conditions_failed", [])),
-        "data_quality_gate_results": dict(getattr(result, "data_quality_gate_results", {})),
-        "duplicate_suppressed": bool(getattr(result, "duplicate_suppressed", False)),
-        "lifecycle_transitions": list(getattr(result, "lifecycle_transitions", [])),
+        "signal": result.signal.value if hasattr(result.signal, 'value') else str(result.signal),
+        "state": result.state.name if hasattr(result.state, 'name') else str(result.state),
+        "signal_id": getattr(result, 'signal_id', None),
+        "generated_at_utc": getattr(result, 'generated_at_utc', None),
+        "expires_at_utc": getattr(result, 'expires_at_utc', None),
+        "proposed_entry": getattr(result, 'proposed_entry', None),
+        "stop_loss": getattr(result, 'stop_loss', None),
+        "take_profit": getattr(result, 'take_profit', None),
+        "invalidation_price": getattr(result, 'invalidation_price', None),
+        "risk_distance": getattr(result, 'risk_distance', None),
+        "reward_distance": getattr(result, 'reward_distance', None),
+        "risk_reward_ratio": getattr(result, 'risk_reward_ratio', None),
+        "reason_codes": list(getattr(result, 'reason_codes', [])),
+        "human_readable_explanation": getattr(result, 'human_readable_explanation', ''),
+        "confirmation_conditions_passed": list(getattr(result, 'confirmation_conditions_passed', [])),
+        "confirmation_conditions_failed": list(getattr(result, 'confirmation_conditions_failed', [])),
+        "data_quality_gate_results": dict(getattr(result, 'data_quality_gate_results', {})),
     }
 
 
-def _blocked_record(
-    feed_data: dict[str, Any],
-    feed_state: dict[str, Any],
-    now: datetime,
-    reason: str,
-    *,
-    decision: str = "BLOCKED",
-    details: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build a consistent no-entry record when no snapshot can be evaluated."""
-    health = _feed_health(feed_data, now)
-    merged_state = dict(feed_state or {})
-    for key in ("connection", "book_synced", "checksum_ok", "book_seq",
-                "sequence_gap_unresolved", "channel_last_seen", "channel_message_counts",
-                "total_disconnects", "total_reconnects"):
-        if key in feed_data:
-            merged_state[key] = feed_data[key]
-    merged_state["derived_health"] = health
-    checksum_verified = health["checksum_verified"]
-    return {
-        "ts_utc": now.isoformat(),
-        "decision": decision,
-        "signal_type": None,
-        "score": None,
-        "confidence": None,
-        "blocking_reason": reason,
-        "feed_fresh": bool(health["market_fresh"]),
-        "book_synced": bool(health["book_synced"]),
-        "no_unresolved_sequence_gap": not bool(health["sequence_gap_unresolved"]),
-        "sequence_valid": not bool(health["sequence_gap_unresolved"]),
-        "crc_valid": checksum_verified,
-        "orderbook_integrity_ok": bool(
-            health["book_synced"] and not health["sequence_gap_unresolved"] and checksum_verified
-        ),
-        "feed_age_seconds": health["feed_age_seconds"],
-        "book_seq": feed_data.get("book_seq"),
-        "total_disconnects": feed_data.get("total_disconnects", 0),
-        "total_reconnects": feed_data.get("total_reconnects", 0),
-        "feed_state": merged_state,
-        "engine_result": None,
-        "data_quality_gate_results": {},
-        "metadata": {
-            "runtime_context": "live_signal",
-            "source": "delta_feed",
-            "engine_evaluated": False,
-            "details": details or {},
-        },
-    }
+def evaluate_live_signal(feed, log_path: str | None = None, min_interval: float = 1.0) -> dict[str, Any] | None:
+    """Evaluate live feed data through the confirmed-entry engine.
 
+    This is the main entry point for production signal generation.
+    It converts the live feed snapshot, evaluates through the engine,
+    and returns the decision record.
 
-def evaluate_feed_snapshot(
-    feed_data: dict[str, Any],
-    *,
-    feed_state: dict[str, Any] | None = None,
-    engine: SignalEngine | None = None,
-    now: datetime | None = None,
-    history_path: str | None = None,
-    min_5m_candles: int = 55,
-    min_15m_candles: int = 55,
-) -> dict[str, Any]:
-    """Canonical feed-to-engine path used by the dashboard and integration tests.
+    Args:
+        feed: The DeltaFeed instance
+        log_path: Optional override for decision log path
+        min_interval: Minimum seconds between evaluations (throttling)
 
-    It returns the same record for UI display and JSONL persistence. Bad data becomes
-    BLOCKED, a valid but unconfirmed setup remains WAIT, and no orders are run.
+    Returns:
+        Decision record dict with signal, blocking_reason, and feed state,
+        or None if insufficient data for a valid snapshot
     """
-    now = now or datetime.now(UTC)
-    state = feed_state or {}
     if not SIGNAL_ENGINE_AVAILABLE:
-        return _blocked_record(feed_data, state, now, "SIGNAL_ENGINE_UNAVAILABLE")
-    try:
-        snapshot = build_market_snapshot(feed_data, now=now, history_path=history_path)
-    except Exception as exc:
-        return _blocked_record(feed_data, state, now, "SNAPSHOT_BUILD_FAILED",
-                               details={"error_type": type(exc).__name__})
+        return None
+    
+    feed_data = feed.snapshot()
+    snapshot = build_market_snapshot(feed_data)
+    
     if snapshot is None:
-        return _blocked_record(feed_data, state, now, "SNAPSHOT_UNAVAILABLE",
-                               details={"required_fields": ["last_price", "bid", "ask"]})
-
-    active_engine = engine if engine is not None else SignalEngine()
-    try:
-        result = active_engine.evaluate(snapshot, now_utc=now)
-    except Exception as exc:
-        return _blocked_record(feed_data, state, now, "SIGNAL_ENGINE_EVALUATION_FAILED",
-                               details={"error_type": type(exc).__name__})
-
-    gates = dict(result.data_quality_gate_results or {})
-    failed_gates = sorted(key for key, passed in gates.items() if passed is False)
-    count_5m = len(snapshot.candles_5m)
-    count_15m = len(snapshot.candles_15m)
-    warmup_failed = count_5m < min_5m_candles or count_15m < min_15m_candles
-    if failed_gates:
-        decision = "BLOCKED"
-    elif warmup_failed:
-        decision = "WAIT"
-    elif result.signal.value in ("BUY", "SELL") and result.duplicate_suppressed:
-        decision = "WAIT"
-    else:
-        decision = result.signal.value
-
-    if failed_gates:
-        blocking_reason = "; ".join(result.reason_codes) or "DATA_QUALITY_GATE_FAILED"
-    elif warmup_failed:
-        blocking_reason = "WARMUP_INSUFFICIENT_CANDLES"
-    elif result.duplicate_suppressed:
-        blocking_reason = "DUPLICATE_SIGNAL_SUPPRESSED"
-    else:
-        blocking_reason = "; ".join(result.reason_codes) if result.reason_codes else None
-
-    health = _feed_health(feed_data, now)
-    merged_state = dict(state)
-    for key in ("connection", "book_synced", "checksum_ok", "book_seq",
-                "sequence_gap_unresolved", "channel_last_seen", "channel_message_counts",
-                "total_disconnects", "total_reconnects"):
-        if key in feed_data:
-            merged_state[key] = feed_data[key]
-    merged_state["derived_health"] = health
-    checksum_ok = gates.get("checksum_ok", False) is True
-    no_gap = gates.get("no_unresolved_sequence_gap", False) is True
-    engine_result = _result_to_dict(result)
-    if warmup_failed and not failed_gates:
-        engine_result["reason_codes"] = ["WARMUP_INSUFFICIENT_CANDLES"]
-        engine_result["human_readable_explanation"] = (
-            f"Signal engine warming up: 5m candles {count_5m}/{min_5m_candles}; "
-            f"15m candles {count_15m}/{min_15m_candles}."
-        )
-
-    return {
-        "ts_utc": now.isoformat(),
-        "decision": decision,
-        "signal_type": decision if decision in ("BUY", "SELL") else None,
+        return None
+    
+    engine = SignalEngine()
+    result = engine.evaluate(snapshot)
+    
+    feed_state = feed.get_signal_state() if hasattr(feed, 'get_signal_state') else {}
+    
+    decision_record = {
+        "decision": result.signal.value,
+        "signal_type": result.signal.value if result.signal.value in ("BUY", "SELL") else None,
         "score": None,
-        "confidence": None,
-        "blocking_reason": blocking_reason,
-        "feed_fresh": bool(
-            gates.get("connection_healthy", False) and gates.get("market_fresh", False)
-            and gates.get("candles_fresh", False) and gates.get("trades_fresh", False)
-            and gates.get("time_consistent", False)
-        ),
-        "book_synced": gates.get("book_synced", False),
-        "no_unresolved_sequence_gap": no_gap,
-        "sequence_valid": no_gap,
-        "crc_valid": checksum_ok,
-        "orderbook_integrity_ok": bool(gates.get("book_synced", False) and no_gap and checksum_ok),
-        "feed_age_seconds": health["feed_age_seconds"],
+        "confidence": 1.0,
+        "blocking_reason": "; ".join(result.reason_codes) if result.reason_codes else None,
+        "feed_fresh": all(result.data_quality_gate_results.get(k, False) for k in [
+            "channel_fresh:ticker", "channel_fresh:ob_updates", "channel_fresh:trades"
+        ]),
+        "book_synced": result.data_quality_gate_results.get("book_synced", False),
+        "sequence_valid": result.data_quality_gate_results.get("sequence_valid", False),
+        "crc_valid": result.data_quality_gate_results.get("checksum_verified", False),
+        "feed_age_seconds": None,
         "book_seq": feed_data.get("book_seq"),
-        "total_disconnects": feed_data.get("total_disconnects", 0),
-        "total_reconnects": feed_data.get("total_reconnects", 0),
-        "feed_state": merged_state,
-        "engine_result": engine_result,
-        "data_quality_gate_results": gates,
-        "signal_id": getattr(result, "signal_id", None),
-        "metadata": {
-            "runtime_context": "live_signal",
-            "source": "delta_feed",
-            "engine_evaluated": True,
-            "failed_data_quality_gates": failed_gates,
-            "warmup_failed": warmup_failed,
-            "candles_5m": count_5m,
-            "candles_15m": count_15m,
-        },
+        "total_disconnects": feed_state.get("total_disconnects", 0),
+        "total_reconnects": feed_state.get("total_reconnects", 0),
+        "feed_state": feed_state,
+        "engine_result": _result_to_dict(result),
+        "metadata": {"runtime_context": "live_signal_integration", "source": "delta_feed"},
     }
+    
+    return decision_record
 
 
-def evaluate_live_signal(
-    feed,
-    log_path: str | None = None,
-    min_interval: float = 1.0,
-    *,
-    engine: SignalEngine | None = None,
-    now: datetime | None = None,
-) -> dict[str, Any]:
-    """Compatibility wrapper around the canonical live decision function."""
-    try:
-        feed_data = feed.snapshot()
-        feed_state = feed.get_signal_state() if hasattr(feed, "get_signal_state") else {}
-    except Exception as exc:
-        timestamp = now or datetime.now(UTC)
-        return _blocked_record({}, {}, timestamp, "FEED_SNAPSHOT_FAILED",
-                               details={"error_type": type(exc).__name__})
-    return evaluate_feed_snapshot(feed_data, feed_state=feed_state, engine=engine,
-                                  now=now, history_path=log_path)
-
-
+if __name__ == "__main__":
+    print("This module provides: build_market_snapshot(), evaluate_live_signal()")
+    print("Usage: Import from your dashboard and call evaluate_live_signal(feed)")

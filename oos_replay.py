@@ -23,7 +23,7 @@ from __future__ import annotations
 import csv
 import json
 import math
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -273,28 +273,14 @@ def to_candles(bars: Iterable[AggregatedBar], drop_incomplete: bool = True) -> L
 class CostModel:
     taker_fee_bps: float
     slippage_bps: float
-    spread_bps: float = 0.0
-
-    def __post_init__(self) -> None:
-        for name, value in (("taker_fee_bps", self.taker_fee_bps),
-                            ("slippage_bps", self.slippage_bps),
-                            ("spread_bps", self.spread_bps)):
-            if not math.isfinite(value) or value < 0:
-                raise ReplayDataError(f"{name} must be finite and >= 0")
-
-    def _adverse_fraction(self) -> float:
-        # OHLC bars are trade-price references; cross half the quoted spread plus
-        # slippage on each fill. This applies once on entry and once on exit.
-        return (self.spread_bps / 2.0 + self.slippage_bps) / 10000.0
 
     def entry_price(self, reference: float, direction: str) -> float:
-        """Adverse entry fill including half-spread and slippage."""
-        adj = reference * self._adverse_fraction()
+        """Simulated fill reference (adverse slippage applied)."""
+        adj = reference * self.slippage_bps / 10000.0
         return reference + adj if direction == "BUY" else reference - adj
 
     def exit_price(self, level: float, direction: str) -> float:
-        """Adverse exit fill including half-spread and slippage."""
-        adj = level * self._adverse_fraction()
+        adj = level * self.slippage_bps / 10000.0
         return level - adj if direction == "BUY" else level + adj
 
     def fees(self, notional: float) -> float:
@@ -331,8 +317,6 @@ class ReplayRunner:
         for key in ("spread_bps", "taker_fee_bps", "slippage_bps"):
             if _num(cfg[key], key) < 0:
                 raise ReplayDataError(f"{key} must be >= 0")
-        if cfg["intrabar_convention"] not in ("stop_first", "target_first"):
-            raise ReplayDataError("intrabar_convention must be 'stop_first' or 'target_first'")
         if "min_history_1m" in cfg and int(cfg["min_history_1m"]) < 1:
             raise ReplayDataError("min_history_1m must be >= 1")
         for key in ("flow_window_minutes", "max_1m_candle_age_minutes",
@@ -426,40 +410,25 @@ class ReplayRunner:
     # -- signal simulation ----------------------------------------------------
     def simulate(self, result: se.SignalResult,
                  entry_bar: Optional[Bar1m]) -> Optional[Dict[str, Any]]:
-        """Resolve a signal from its actual next-bar fill; censor incomplete paths."""
-        if entry_bar is None or result.proposed_entry is None or result.expires_at_utc is None:
+        """Resolve a confirmed signal against later bars. No fill is assumed."""
+        if entry_bar is None or result.proposed_entry is None:
             return None
         direction = "BUY" if result.signal is se.Signal.BUY else "SELL"
-        cost = CostModel(
-            self.cfg["taker_fee_bps"], self.cfg["slippage_bps"], self.cfg["spread_bps"]
-        )
-        # The caller supplies the first bar after the decision timestamp. Use that
-        # bar itself rather than advancing one more bar via bisect_right.
-        start = bisect_left(self._ts, entry_bar.ts_utc)
-        if start >= len(self.bars) or self.bars[start].ts_utc != entry_bar.ts_utc:
+        cost = CostModel(self.cfg["taker_fee_bps"], self.cfg["slippage_bps"])
+        start = bisect_right(self._ts, entry_bar.ts_utc)
+        risk = result.risk_distance or 0.0
+        if risk <= 0:
             return None
-        reference_open = self.bars[start].open
-        entry_fill = cost.entry_price(reference_open, direction)
+        ref_open = self.bars[start].open if start < len(self.bars) else None
+        if ref_open is None:
+            return None
+        entry_fill = cost.entry_price(ref_open, direction)
         entry_fee = cost.fees(entry_fill)
-        if result.stop_loss is None or result.take_profit is None:
-            return None
-        # Express R against actual fill-to-stop distance, including entry slippage/gap.
-        risk = abs(entry_fill - result.stop_loss)
-        if not math.isfinite(risk) or risk <= 0:
-            return None
-
         expiry_ts = result.expires_at_utc
-        outcome, exit_fill, exit_bar_ts = None, None, None
-        last_observed_bar = None
-        previous_bar = None
+        outcome, exit_fill, exit_fee, exit_bar_ts = "timeout", None, None, None
         for bar in self.bars[start:]:
             if bar.ts_utc > expiry_ts:
                 break
-            if previous_bar is not None and (bar.ts_utc - previous_bar.ts_utc).total_seconds() > 60:
-                # A missing bar makes stop/target sequencing unknowable; censor the trade.
-                return None
-            last_observed_bar = bar
-            previous_bar = bar
             hit_stop = bar.low <= result.stop_loss if direction == "BUY" \
                 else bar.high >= result.stop_loss
             hit_target = bar.high >= result.take_profit if direction == "BUY" \
@@ -478,19 +447,19 @@ class ReplayRunner:
                 if hit_stop:
                     outcome, exit_fill, exit_bar_ts = "stop", result.stop_loss, bar.ts_utc
                     break
-
         if exit_fill is None:
-            # Do not call a partial end-of-file path a timeout outcome.
-            if last_observed_bar is None or last_observed_bar.ts_utc < expiry_ts:
-                return None
-            outcome, exit_fill, exit_bar_ts = "timeout", last_observed_bar.close, last_observed_bar.ts_utc
-
+            last = self.bars[min(start, len(self.bars) - 1)]
+            for bar in reversed(self.bars[:min(start, len(self.bars))]):
+                if bar.ts_utc <= expiry_ts:
+                    last = bar
+                    break
+            outcome, exit_fill, exit_bar_ts = "timeout", last.close, last.ts_utc
         exit_fill = cost.exit_price(exit_fill, direction)
         exit_fee = cost.fees(exit_fill)
         pnl_per_unit = (exit_fill - entry_fill) if direction == "BUY" \
             else (entry_fill - exit_fill)
-        gross_r = pnl_per_unit / risk
-        costs_r = (entry_fee + exit_fee) / risk
+        gross_r = (pnl_per_unit) / risk
+        costs_r = (entry_fee + exit_fee) / (risk * (1.0 if direction == "BUY" else 1.0))
         net_r = gross_r - costs_r
         return {
             "signal_id": result.signal_id,
@@ -509,9 +478,6 @@ class ReplayRunner:
             "costs_r": costs_r,
             "net_r": net_r,
             "fees_currency_equiv": entry_fee + exit_fee,
-            "spread_bps_assumption": self.cfg["spread_bps"],
-            "slippage_bps_per_fill": self.cfg["slippage_bps"],
-            "taker_fee_bps_per_side": self.cfg["taker_fee_bps"],
         }
 
 
