@@ -586,6 +586,7 @@ def detect_exhaustion_labels(
     imbalance_ratio: float = 1.25,
     min_wick_ratio: float = 0.35,
     close_position_limit: float = 0.65,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Identify potential buy/sell exhaustion from completed candles and tape.
 
@@ -665,22 +666,60 @@ def detect_exhaustion_labels(
             continue
 
     labels: list[dict[str, Any]] = []
+    diag: dict[str, Any] = {
+        "input_candles": len(candles),
+        "valid_candles": len(normalized_candles),
+        "flow_buckets": len(flow_by_bucket),
+        "candidate_candles_in_flow_span": 0,
+        "gap_windows": 0,
+        "missing_flow_buckets": 0,
+        "below_min_trade_count": 0,
+        "usable_flow_candles": 0,
+        "buy_new_high": 0,
+        "buy_wick_pass": 0,
+        "buy_close_pass": 0,
+        "buy_flow_pass": 0,
+        "buy_labels": 0,
+        "sell_new_low": 0,
+        "sell_wick_pass": 0,
+        "sell_close_pass": 0,
+        "sell_flow_pass": 0,
+        "sell_labels": 0,
+    }
+    flow_times = list(flow_by_bucket)
+    flow_start = min(flow_times) if flow_times else None
+    flow_end = max(flow_times) if flow_times else None
+    diag["flow_start"] = flow_start
+    diag["flow_end"] = flow_end
+
     for i in range(lookback, len(normalized_candles)):
         candle = normalized_candles[i]
+        # Older candle history without captured tape cannot be classified from
+        # the live feed. Restrict rejection counters to the actual tape window.
+        if flow_start is None or candle["time"] < flow_start or candle["time"] > flow_end:
+            continue
+        diag["candidate_candles_in_flow_span"] += 1
         previous = normalized_candles[i - lookback:i]
         # Gaps invalidate the local comparison window.
         if any(
             (normalized_candles[j]["time"] - normalized_candles[j - 1]["time"]) != timeframe_seconds
             for j in range(i - lookback + 1, i + 1)
         ):
+            diag["gap_windows"] += 1
             continue
 
         flow = flow_by_bucket.get(candle["time"])
-        if not flow or flow["count"] < min_trades:
+        if not flow:
+            diag["missing_flow_buckets"] += 1
+            continue
+        if flow["count"] < min_trades:
+            diag["below_min_trade_count"] += 1
             continue
         buy_qty, sell_qty = flow["buy"], flow["sell"]
         if buy_qty <= 0 and sell_qty <= 0:
+            diag["missing_flow_buckets"] += 1
             continue
+        diag["usable_flow_candles"] += 1
 
         o, h, low, close = candle["open"], candle["high"], candle["low"], candle["close"]
         candle_range = h - low
@@ -690,11 +729,30 @@ def detect_exhaustion_labels(
         prior_high = max(bar["high"] for bar in previous)
         prior_low = min(bar["low"] for bar in previous)
 
-        if (h > prior_high
-                and upper_wick_ratio >= min_wick_ratio
-                and close_position <= close_position_limit
-                and buy_qty > 0
-                and buy_qty >= imbalance_ratio * sell_qty):
+        buy_hit = False
+        sell_hit = False
+        if h > prior_high:
+            diag["buy_new_high"] += 1
+            if upper_wick_ratio >= min_wick_ratio:
+                diag["buy_wick_pass"] += 1
+                if close_position <= close_position_limit:
+                    diag["buy_close_pass"] += 1
+                    if buy_qty > 0 and buy_qty >= imbalance_ratio * sell_qty:
+                        diag["buy_flow_pass"] += 1
+                        buy_hit = True
+        if low < prior_low:
+            diag["sell_new_low"] += 1
+            if lower_wick_ratio >= min_wick_ratio:
+                diag["sell_wick_pass"] += 1
+                if close_position >= 1.0 - close_position_limit:
+                    diag["sell_close_pass"] += 1
+                    if sell_qty > 0 and sell_qty >= imbalance_ratio * buy_qty:
+                        diag["sell_flow_pass"] += 1
+                        sell_hit = True
+
+        # Preserve the original detector's single-label precedence when an
+        # unusually wide candle breaks both prior extremes and both rules match.
+        if buy_hit:
             labels.append({
                 "kind": "buy_exhaust",
                 "time": candle["time"],
@@ -706,11 +764,7 @@ def detect_exhaustion_labels(
                 "close_position": close_position,
                 "aggressor_ratio": buy_qty / sell_qty if sell_qty > 0 else None,
             })
-        elif (low < prior_low
-                and lower_wick_ratio >= min_wick_ratio
-                and close_position >= 1.0 - close_position_limit
-                and sell_qty > 0
-                and sell_qty >= imbalance_ratio * buy_qty):
+        elif sell_hit:
             labels.append({
                 "kind": "sell_exhaust",
                 "time": candle["time"],
@@ -723,5 +777,10 @@ def detect_exhaustion_labels(
                 "aggressor_ratio": sell_qty / buy_qty if buy_qty > 0 else None,
             })
 
+    diag["buy_labels"] = sum(1 for label in labels if label["kind"] == "buy_exhaust")
+    diag["sell_labels"] = sum(1 for label in labels if label["kind"] == "sell_exhaust")
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(diag)
     return labels
 
