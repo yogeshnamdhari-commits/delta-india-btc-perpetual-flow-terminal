@@ -104,6 +104,29 @@ class TestExhaustionLabels(unittest.TestCase):
         self.assertEqual(labels[0]["buy_contracts"], 8.0)
         self.assertEqual(labels[0]["sell_contracts"], 1.0)
 
+    def test_diagnostics_show_the_filter_that_rejects_a_candidate(self):
+        ts = BASE + 10 * 60
+        candles = prior_bars("up") + [
+            candle(ts, open_=103, high=110, low=102, close=104)
+        ]
+        # Geometry qualifies, but selling contracts dominate; therefore the
+        # BUY exhaustion aggressor-imbalance filter must reject this candle.
+        trades = tape(ts, buy_count=1, sell_count=4)
+        diagnostics = {}
+
+        labels = orderflow.detect_exhaustion_labels(
+            candles, trades, diagnostics=diagnostics
+        )
+
+        self.assertEqual(labels, [])
+        self.assertEqual(diagnostics["candidate_candles_in_flow_span"], 1)
+        self.assertEqual(diagnostics["usable_flow_candles"], 1)
+        self.assertEqual(diagnostics["buy_new_high"], 1)
+        self.assertEqual(diagnostics["buy_wick_pass"], 1)
+        self.assertEqual(diagnostics["buy_close_pass"], 1)
+        self.assertEqual(diagnostics["buy_flow_pass"], 0)
+        self.assertEqual(diagnostics["buy_labels"], 0)
+
     def test_no_label_when_trade_sample_is_too_small(self):
         ts = BASE + 10 * 60
         candles = prior_bars("up") + [
