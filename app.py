@@ -1812,6 +1812,7 @@ def _build_price_figure(d: dict[str, Any], timeframe: str, pa: dict[str, Any] | 
                     "ts": flow_ts, "size": flow["sell_contracts"],
                     "side": "sell", "trade_count": flow["sell_count"],
                 })
+        exhaustion_diagnostics = {}
         pa_overlay["exhaustion"] = orderflow.detect_exhaustion_labels(
             completed_chart_candles,
             aggregate_flow_rows,
@@ -1821,6 +1822,7 @@ def _build_price_figure(d: dict[str, Any], timeframe: str, pa: dict[str, Any] | 
             imbalance_ratio=1.25,
             min_wick_ratio=0.35,
             close_position_limit=0.65,
+            diagnostics=exhaustion_diagnostics,
         )[-8:]
 
     flow_minutes = d.get("trade_flow_minutes", {})
@@ -1831,6 +1833,7 @@ def _build_price_figure(d: dict[str, Any], timeframe: str, pa: dict[str, Any] | 
         "minute_buckets": len(flow_minutes),
         "flow_span_minutes": flow_span_minutes,
         "timeframe": timeframe,
+        "criteria": exhaustion_diagnostics if toggles.get("exhaust") else {},
     }
 
     _add_orderflow_overlays(fig, d, pa_overlay, liq, toggles, now, y_range, x_span)
@@ -2305,12 +2308,24 @@ def _emit_price_chart(height: int) -> None:
                     "Hover a marker for the candle's aggressor volume and rejection details; labels are context warnings, not entries."
                 )
             else:
+                diag = exhaustion_status.get("criteria", {})
                 st.caption(
                     f"Exhaustion detector: 0 labels currently qualify on the {timeframe} chart. "
                     "A label requires a completed candle that breaks the prior 10-bar extreme, a rejection wick "
                     "of at least 35%, at least 5 classified trade prints, and at least 1.25:1 same-side aggressor imbalance. "
                     f"The in-memory flow summary currently has {bucket_count} minute bucket(s) spanning about {flow_span} minute(s). "
-                    "After restarting, allow at least one full chart-timeframe candle to close. No rules have been loosened."
+                    f"Capture-window candidates: {int(diag.get('candidate_candles_in_flow_span', 0))}; "
+                    f"usable-flow candles: {int(diag.get('usable_flow_candles', 0))}; "
+                    f"gap-blocked windows: {int(diag.get('gap_windows', 0))}; "
+                    f"no-flow buckets: {int(diag.get('missing_flow_buckets', 0))}; "
+                    f"below-minimum prints: {int(diag.get('below_min_trade_count', 0))}. "
+                    f"BUY path (higher high → wick → close → aggressor imbalance): "
+                    f"{int(diag.get('buy_new_high', 0))} → {int(diag.get('buy_wick_pass', 0))} → "
+                    f"{int(diag.get('buy_close_pass', 0))} → {int(diag.get('buy_flow_pass', 0))}. "
+                    f"SELL path (lower low → wick → close → aggressor imbalance): "
+                    f"{int(diag.get('sell_new_low', 0))} → {int(diag.get('sell_wick_pass', 0))} → "
+                    f"{int(diag.get('sell_close_pass', 0))} → {int(diag.get('sell_flow_pass', 0))}. "
+                    "No rules are loosened to force a label."
                 )
         _CHART_STATE["emitted_sig"] = _FIG_CACHE["sig"]
     basis = (d["last_price"] - d["index_price"]) if d["last_price"] is not None and d["index_price"] is not None else None
