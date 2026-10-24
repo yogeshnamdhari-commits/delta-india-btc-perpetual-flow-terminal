@@ -729,6 +729,8 @@ def detect_exhaustion_labels(
         prior_high = max(bar["high"] for bar in previous)
         prior_low = min(bar["low"] for bar in previous)
 
+        buy_hit = False
+        sell_hit = False
         if h > prior_high:
             diag["buy_new_high"] += 1
             if upper_wick_ratio >= min_wick_ratio:
@@ -737,17 +739,7 @@ def detect_exhaustion_labels(
                     diag["buy_close_pass"] += 1
                     if buy_qty > 0 and buy_qty >= imbalance_ratio * sell_qty:
                         diag["buy_flow_pass"] += 1
-                        labels.append({
-                            "kind": "buy_exhaust",
-                            "time": candle["time"],
-                            "price": h,
-                            "buy_contracts": buy_qty,
-                            "sell_contracts": sell_qty,
-                            "trade_count": int(flow["count"]),
-                            "wick_ratio": upper_wick_ratio,
-                            "close_position": close_position,
-                            "aggressor_ratio": buy_qty / sell_qty if sell_qty > 0 else None,
-                        })
+                        buy_hit = True
         if low < prior_low:
             diag["sell_new_low"] += 1
             if lower_wick_ratio >= min_wick_ratio:
@@ -756,17 +748,34 @@ def detect_exhaustion_labels(
                     diag["sell_close_pass"] += 1
                     if sell_qty > 0 and sell_qty >= imbalance_ratio * buy_qty:
                         diag["sell_flow_pass"] += 1
-                        labels.append({
-                            "kind": "sell_exhaust",
-                            "time": candle["time"],
-                            "price": low,
-                            "buy_contracts": buy_qty,
-                            "sell_contracts": sell_qty,
-                            "trade_count": int(flow["count"]),
-                            "wick_ratio": lower_wick_ratio,
-                            "close_position": close_position,
-                            "aggressor_ratio": sell_qty / buy_qty if buy_qty > 0 else None,
-                        })
+                        sell_hit = True
+
+        # Preserve the original detector's single-label precedence when an
+        # unusually wide candle breaks both prior extremes and both rules match.
+        if buy_hit:
+            labels.append({
+                "kind": "buy_exhaust",
+                "time": candle["time"],
+                "price": h,
+                "buy_contracts": buy_qty,
+                "sell_contracts": sell_qty,
+                "trade_count": int(flow["count"]),
+                "wick_ratio": upper_wick_ratio,
+                "close_position": close_position,
+                "aggressor_ratio": buy_qty / sell_qty if sell_qty > 0 else None,
+            })
+        elif sell_hit:
+            labels.append({
+                "kind": "sell_exhaust",
+                "time": candle["time"],
+                "price": low,
+                "buy_contracts": buy_qty,
+                "sell_contracts": sell_qty,
+                "trade_count": int(flow["count"]),
+                "wick_ratio": lower_wick_ratio,
+                "close_position": close_position,
+                "aggressor_ratio": sell_qty / buy_qty if buy_qty > 0 else None,
+            })
 
     diag["buy_labels"] = sum(1 for label in labels if label["kind"] == "buy_exhaust")
     diag["sell_labels"] = sum(1 for label in labels if label["kind"] == "sell_exhaust")
