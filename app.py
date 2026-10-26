@@ -20,6 +20,7 @@ import websocket
 
 import orderflow
 from signal_integration_bridge import evaluate_feed_snapshot
+from ai_analyst import render_ai_analyst
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -2720,5 +2721,7 @@ if show_signal_panel:
 
 with st.expander("Feed diagnostics and limitations", expanded=False):
     render_diagnostics_panel()
+
+render_ai_analyst(feed.snapshot())
 
 chart_driver()
