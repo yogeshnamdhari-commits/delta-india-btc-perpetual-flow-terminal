@@ -104,3 +104,16 @@ Select **OpenAI API (separate API billing)** in the panel. Configure `OPENAI_API
 - Answers are generated commentary, not validated trading signals or a guarantee of profitability. Live data alone cannot certify historical completeness or out-of-sample results.
 - Unit tests for the context packer and provider-response parsing can be run with `python -m unittest test_ai_analyst.py`.
 
+## Market structure and liquidity intelligence
+
+The read-only **Order flow & liquidity** area distinguishes measured market data from price-action inference:
+
+- **Market-wide liquidation levels:** deliberately shown as unavailable. Delta's documented public WebSocket channel list does not include a market-wide liquidation feed; liquidation reasons appear in private/account order notifications. This dashboard does not fabricate liquidation levels or intensity from assumed leverage.
+- **Observed resting liquidity:** requires a sequence-synchronized, checksum-valid order book with no unresolved sequence gap. It displays contracts, BTC equivalent, approximate USD notional at the observed price, time observed, and size relative to the adaptive depth threshold. Resting orders can be cancelled or moved.
+- **Supply and demand:** derived bullish/bearish order-block zones from completed candles. The “Displacement (x ATR)” field measures the price displacement used to confirm the zone; it is not a measured order quantity or probability.
+- **Stop-hunt candidates:** a prior swing/equal/session level is exceeded and price reclaims the level within the detector's configured candle window. The panel exposes breach extreme, overshoot in price points and reclaim delay. This confirms a price sweep, not that stop orders were actually present or triggered.
+- **Buy/sell exhaustion:** labels require a completed one-minute candle to break a prior local extreme, reject it with a qualifying wick, and meet the existing same-candle aggressor-flow rule. The panel shows buy/sell contracts, dominant-side ratio, wick ratio, close location and classified print count.
+
+All levels and labels are monitoring context, not trade guarantees. These UI additions do not modify the signal engine, its thresholds, signal precedence, evaluator or release criteria.
+
+Delta API references: [WebSocket public channels](https://docs.delta.exchange/) and [private order updates](https://docs.delta.exchange/).
