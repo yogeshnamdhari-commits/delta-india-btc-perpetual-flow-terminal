@@ -82,9 +82,17 @@ The dashboard includes a read-only chat panel that answers questions using a com
 
 Optional environment variables: `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
 
-### Option B — OpenAI API
+### Option B — Kilo Gateway free models (no API key required)
 
-Select **OpenAI API (separate API billing)** in the panel. Configure `OPENAI_API_KEY` locally as an environment variable or in Streamlit secrets. Optionally set `OPENAI_MODEL` (default: `gpt-6-astra`).
+Select **Kilo Gateway free model (no API key)** in the panel. The default model ID is `z-ai/glm-5:free`. Change it to another currently available Kilo model whose ID ends in `:free` if needed. This provider rejects model IDs without the `:free` suffix to prevent accidental requests to a paid Kilo model. An optional `KILO_API_KEY` environment variable or Streamlit secret may be supplied, but it is not required for Kilo's anonymous free-model access.
+
+Kilo documents a free-model rate limit of 200 requests per hour per IP, and model availability can change. Some free model routes may send prompts and outputs to upstream providers that log them or use them to improve services. Use this option only if you are comfortable sharing the compact market snapshot and recent chat turns with the selected provider. Do not send personal, account, or confidential data.
+
+See [Kilo's free-model guidance](https://kilo.ai/docs/getting-started/using-kilo-for-free) and [Gateway authentication/rate limits](https://kilo.ai/docs/gateway/authentication).
+
+### Option C — OpenAI API
+
+Select **OpenAI API (separate API billing)** in the panel. Configure `OPENAI_API_KEY` locally as an environment variable or in Streamlit secrets. Optionally set `OPENAI_MODEL`.
 
 **A ChatGPT subscription does not include OpenAI API usage.** API requests are billed separately by OpenAI. Do not commit keys to Git or paste exchange API secrets into the dashboard.
 
