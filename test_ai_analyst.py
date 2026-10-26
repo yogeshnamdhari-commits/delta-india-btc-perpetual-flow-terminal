@@ -194,8 +194,8 @@ class AiAnalystContextTests(unittest.TestCase):
 
     def test_streamlit_panel_renders_kilo_as_default_provider(self):
         script = (
-            "from ai_analyst import render_ai_analyst\\n"
-            "render_ai_analyst({'connection': 'disconnected', 'book_synced': False})\\n"
+            "from ai_analyst import render_ai_analyst\n"
+            "render_ai_analyst({'connection': 'disconnected', 'book_synced': False})\n"
         )
         app = AppTest.from_string(script).run(timeout=15)
         self.assertEqual(len(app.exception), 0, [e.message for e in app.exception])
