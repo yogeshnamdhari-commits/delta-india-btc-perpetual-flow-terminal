@@ -64,3 +64,35 @@ Double-click `start_mac.command`. macOS may ask you to confirm that you want to 
 3. If the feed remains disconnected, verify Delta India's current API/WebSocket status and the official docs: https://docs.delta.exchange/ .
 4. If the historical chart is blank but live price/tape is updating, the public historical REST request may have failed; the candle chart should gradually populate from new live candles.
 5. Stop the app with `Ctrl+C` in the terminal.
+
+## AI Trading Analyst (Q&A)
+
+The dashboard includes a read-only chat panel that answers questions using a compact snapshot of the current BTCUSD public feed: last/mark/index prices, bid/ask and depth, recent trades, recent candles, session aggressor flow/CVD, funding, open interest, channel freshness and book-integrity state. It does not retrieve missing historical trade archives, certify Gate 3, or place orders.
+
+### Option A — Local Ollama (default; no API billing)
+
+1. Install and start [Ollama](https://ollama.com/).
+2. Pull a small local model:
+
+   ```bash
+   ollama pull llama3.2:3b
+   ```
+
+3. Run the dashboard as usual. In **AI Trading Analyst**, select **Local Ollama (no API billing)** and use `http://localhost:11434` and `llama3.2:3b`, unless your local setup differs.
+
+Optional environment variables: `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
+
+### Option B — OpenAI API
+
+Select **OpenAI API (separate API billing)** in the panel. Configure `OPENAI_API_KEY` locally as an environment variable or in Streamlit secrets. Optionally set `OPENAI_MODEL` (default: `gpt-6-astra`).
+
+**A ChatGPT subscription does not include OpenAI API usage.** API requests are billed separately by OpenAI. Do not commit keys to Git or paste exchange API secrets into the dashboard.
+
+### Data handling and limitations
+
+- Only the compact snapshot supplied to the panel and recent chat turns are sent to the selected model provider. OpenAI mode sends that context to OpenAI; Ollama mode sends it to the configured Ollama server.
+- Chat history is kept in Streamlit session state, not in the market event JSONL logs.
+- The analyst has no execution tools and no access to exchange API credentials.
+- Answers are generated commentary, not validated trading signals or a guarantee of profitability. Live data alone cannot certify historical completeness or out-of-sample results.
+- Unit tests for the context packer and provider-response parsing can be run with `python -m unittest test_ai_analyst.py`.
+
