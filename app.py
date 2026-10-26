@@ -2552,6 +2552,7 @@ def render_flow_panel() -> None:
                 "Reclaim delay (bars)": s.get("reclaim_delay_bars"),
                 "Reclaim close": s.get("reclaim_close"),
                 "Breach at (IST)": _ist_str(s.get("exceed_time")),
+                "Extreme at (IST)": _ist_str(s.get("breach_extreme_time")),
                 "Reclaim at (IST)": _ist_str(s.get("sweep_time")),
             } for s in (pa["swept"][-12:] if pa else [])]
             if sweep_rows:
