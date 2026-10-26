@@ -316,7 +316,7 @@ def _extract_chat_completion_text(payload: dict[str, Any]) -> str:
     if isinstance(content, list):
         parts = [block.get("text", "") for block in content
                  if isinstance(block, dict) and isinstance(block.get("text"), str)]
-        return "\\n\\n".join(part.strip() for part in parts if part.strip())
+        return "\n\n".join(part.strip() for part in parts if part.strip())
     return ""
 
 
