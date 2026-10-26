@@ -1,8 +1,11 @@
 import json
 import unittest
+from unittest.mock import Mock, patch
+from streamlit.testing.v1 import AppTest
 from datetime import datetime, timezone
 
 from ai_analyst import (
+    KILO_PROVIDER,
     _ask_kilo_free,
     _extract_chat_completion_text,
     _extract_responses_api_text,
@@ -148,6 +151,57 @@ class AiAnalystContextTests(unittest.TestCase):
             "Evidence first.\n\nThen interpretation.",
         )
         self.assertEqual(_extract_responses_api_text({"output_text": "Direct answer"}), "Direct answer")
+
+
+    @patch("ai_analyst.requests.post")
+    def test_kilo_free_request_contract_without_api_key(self, mock_post):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": "Evidence-based test answer"}}]
+        }
+        mock_post.return_value = response
+        context = {"instrument": {"symbol": "BTCUSD"}, "price_and_quotes": {"last_trade_price": 101.5}}
+
+        with patch("ai_analyst._read_kilo_api_key", return_value=None):
+            answer = _ask_kilo_free(
+                "Summarize current data", context, [], "z-ai/glm-5:free"
+            )
+
+        self.assertEqual(answer, "Evidence-based test answer")
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+        self.assertEqual(args[0], "https://ai-gateway.kilo.ai/api/v1/chat/completions")
+        self.assertNotIn("Authorization", kwargs["headers"])
+        self.assertEqual(kwargs["json"]["model"], "z-ai/glm-5:free")
+        self.assertEqual(kwargs["json"]["stream"], False)
+        self.assertIn("CURRENT DELTA EXCHANGE MARKET SNAPSHOT", kwargs["json"]["messages"][-1]["content"])
+        self.assertIn("Summarize current data", kwargs["json"]["messages"][-1]["content"])
+        response.raise_for_status.assert_called_once()
+
+    @patch("ai_analyst.requests.post")
+    def test_kilo_rate_limit_returns_actionable_error(self, mock_post):
+        response = Mock()
+        response.status_code = 429
+        mock_post.return_value = response
+        with patch("ai_analyst._read_kilo_api_key", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "rate limit reached"):
+                _ask_kilo_free(
+                    "test question", {"instrument": {"symbol": "BTCUSD"}}, [],
+                    "z-ai/glm-5:free"
+                )
+        response.raise_for_status.assert_not_called()
+
+    def test_streamlit_panel_renders_kilo_as_default_provider(self):
+        script = (
+            "from ai_analyst import render_ai_analyst\\n"
+            "render_ai_analyst({'connection': 'disconnected', 'book_synced': False})\\n"
+        )
+        app = AppTest.from_string(script).run(timeout=15)
+        self.assertEqual(len(app.exception), 0, [e.message for e in app.exception])
+        self.assertTrue(app.selectbox, "AI provider selectbox did not render")
+        self.assertEqual(app.selectbox[0].value, KILO_PROVIDER)
+        self.assertTrue(app.chat_input, "AI question input did not render")
 
 
 if __name__ == "__main__":
