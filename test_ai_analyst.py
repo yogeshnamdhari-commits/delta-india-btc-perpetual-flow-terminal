@@ -165,7 +165,7 @@ class AiAnalystContextTests(unittest.TestCase):
 
         with patch("ai_analyst._read_kilo_api_key", return_value=None):
             answer = _ask_kilo_free(
-                "Summarize current data", context, [], "z-ai/glm-5:free"
+                "Summarize current data", context, [], "nvidia/nemotron-3.5-super-vl:free"
             )
 
         self.assertEqual(answer, "Evidence-based test answer")
@@ -173,7 +173,7 @@ class AiAnalystContextTests(unittest.TestCase):
         args, kwargs = mock_post.call_args
         self.assertEqual(args[0], "https://ai-gateway.kilo.ai/api/v1/chat/completions")
         self.assertNotIn("Authorization", kwargs["headers"])
-        self.assertEqual(kwargs["json"]["model"], "z-ai/glm-5:free")
+        self.assertEqual(kwargs["json"]["model"], "nvidia/nemotron-3.5-super-vl:free")
         self.assertEqual(kwargs["json"]["stream"], False)
         self.assertIn("CURRENT DELTA EXCHANGE MARKET SNAPSHOT", kwargs["json"]["messages"][-1]["content"])
         self.assertIn("Summarize current data", kwargs["json"]["messages"][-1]["content"])
@@ -188,7 +188,7 @@ class AiAnalystContextTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "rate limit reached"):
                 _ask_kilo_free(
                     "test question", {"instrument": {"symbol": "BTCUSD"}}, [],
-                    "z-ai/glm-5:free"
+                    "nvidia/nemotron-3.5-super-vl:free"
                 )
         response.raise_for_status.assert_not_called()
 
@@ -201,6 +201,8 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0, [e.message for e in app.exception])
         self.assertTrue(app.selectbox, "AI provider selectbox did not render")
         self.assertEqual(app.selectbox[0].value, KILO_PROVIDER)
+        self.assertTrue(app.text_input, "Kilo free model input did not render")
+        self.assertEqual(app.text_input[0].value, "nvidia/nemotron-3.5-super-vl:free")
         self.assertTrue(app.chat_input, "AI question input did not render")
 
 
