@@ -69,7 +69,7 @@ Double-click `start_mac.command`. macOS may ask you to confirm that you want to 
 
 The dashboard includes a read-only chat panel that answers questions using a compact snapshot of the current BTCUSD public feed: last/mark/index prices, bid/ask and depth, recent trades, recent candles, session aggressor flow/CVD, funding, open interest, channel freshness and book-integrity state. It does not retrieve missing historical trade archives, certify Gate 3, or place orders.
 
-### Option A — Local Ollama (default; no API billing)
+### Option A — Local Ollama (optional; no API billing)
 
 1. Install and start [Ollama](https://ollama.com/).
 2. Pull a small local model:
@@ -82,7 +82,7 @@ The dashboard includes a read-only chat panel that answers questions using a com
 
 Optional environment variables: `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
 
-### Option B — Kilo Gateway free models (no API key required)
+### Option B — Kilo Gateway free models (default; no API key required)
 
 The panel defaults to **Kilo Gateway free model (no API key)**. Its default model ID is `z-ai/glm-5:free`; you can change it in the panel or select another provider. Change it to another currently available Kilo model whose ID ends in `:free` if needed. This provider rejects model IDs without the `:free` suffix to prevent accidental requests to a paid Kilo model. An optional `KILO_API_KEY` environment variable or Streamlit secret may be supplied, but it is not required for Kilo's anonymous free-model access.
 
