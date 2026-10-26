@@ -51,7 +51,7 @@ jobs:
 
       - name: Live Kilo Gateway free-model response smoke test
         env:
-          KILO_SMOKE_PREFERRED_MODEL: z-ai/glm-5:free
+          KILO_SMOKE_PREFERRED_MODEL: nvidia/nemotron-3.5-super-vl:free
         run: |
           python - <<'PY'
           import os
@@ -59,7 +59,7 @@ jobs:
           import requests
 
           base = "https://ai-gateway.kilo.ai/api/v1"
-          preferred = os.environ.get("KILO_SMOKE_PREFERRED_MODEL", "z-ai/glm-5:free")
+          preferred = os.environ.get("KILO_SMOKE_PREFERRED_MODEL", "nvidia/nemotron-3.5-super-vl:free")
           catalog_response = requests.get(f"{base}/models", timeout=15)
           catalog_response.raise_for_status()
           catalog = catalog_response.json()
