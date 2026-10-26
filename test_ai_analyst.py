@@ -115,6 +115,13 @@ class AiAnalystContextTests(unittest.TestCase):
             ]
         }
         self.assertEqual(_extract_chat_completion_text(payload), "Kilo response text")
+        content_blocks = {
+            "choices": [{"message": {"content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"},
+            ]}}]
+        }
+        self.assertEqual(_extract_chat_completion_text(content_blocks), "first\\n\\nsecond")
         self.assertEqual(_extract_chat_completion_text({"choices": []}), "")
 
     def test_kilo_free_provider_rejects_paid_model_ids(self):
