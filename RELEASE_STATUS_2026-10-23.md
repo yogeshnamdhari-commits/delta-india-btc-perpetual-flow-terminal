@@ -4,47 +4,35 @@
 
 **NOT APPROVED for live order execution.**
 
-The current repository baseline has a passing automated-test milestone. Automated CI evidence is distinguished from live-runtime acceptance and economic certification below.
+This report records the current release status based on the provided test/audit summaries and the source tree in this repository. Reported test results are not independently reproduced here unless explicitly stated.
 
-## Verified automated tests
+## Reported verification
 
-The end-to-end test branch run is available at:
-https://github.com/yogeshnamdhari-commits/delta-india-btc-perpetual-flow-terminal/actions/runs/40001060408
-
-| Area | Verified result | Scope limitation |
+| Area | Reported result | Scope limitation |
 |---|---:|---|
-| GitHub Actions — Python 3.11 | 131 passed, 1 skipped, 2 subtests passed | Deterministic unit/integration tests |
-| GitHub Actions — Python 3.12 | 131 passed, 1 skipped, 2 subtests passed | Deterministic unit/integration tests |
-| Decision-log audit | 921 records passed (operator-reported historical result) | Internal consistency only; cannot prove feed truth or live application behavior |
-| End-to-end source-path regression | Passed in both CI jobs | Actual `DeltaFeed` and `_render_signal_panel` source plus bridge/engine are exercised with controlled socket and Streamlit stubs; no live WebSocket or full running Streamlit process |
-
-The new `test_e2e_signal_panel_failure_injection.py` verifies that disconnect, checksum-unavailable, sequence-gap, and CRC-mismatch states fail closed, recovery requires a checksum-verified snapshot, the same `SignalEngine` instance is retained, and the displayed decision matches the last persisted decision record. These are synthetic, deterministic software tests, not proof of live-feed reliability.
-
-
-The read-only `audit_live_recovery.py` utility and `LIVE_RECOVERY_RUNBOOK.md` were added to evaluate a local diagnostic reconnect capture. They are intended to require the observed trigger/disconnect/reconnect sequence, a BLOCKED decision during failure, a checksum-bearing CRC-verified book update, fresh required channels, and a healthy post-recovery decision. **This audit has not yet been run against the user's actual Mac logs**, so live-runtime recovery remains pending.
+| Signal-engine unit tests | 48 passed | Synthetic/unit-level coverage |
+| Release safety negative-path/recovery tests | 17 passed | Uses synthetic snapshots; not the live Streamlit/feed path |
+| OOS replay harness tests | 33 passed | Tests replay mechanics, not profitability on real market data |
+| Combined tests | 98 passed | Reported by operator; not an independently run CI result |
+| Decision log audit | 921 records passed | Internal consistency only; cannot prove feed truth or full app wiring |
 
 ## Required release gates still open
 
-### 1. Live application failure injection and recovery
+### 1. End-to-end integration failure injection
 
-The required production-like acceptance chain is:
+A release test must exercise the actual chain:
 
-`DeltaFeed → app.py / Streamlit → signal_integration_bridge.py → signal_engine.py → displayed decision → persisted decision log`
+`DeltaFeed → app.py → signal_integration_bridge.py → signal_engine.py → displayed decision → persisted decision log`
 
-Automated source-path fault cases now cover:
-- disconnected feed
-- missing/unverified checksum
-- invalid sequence / unresolved sequence gap
-- recovery after a fresh checksum-verified snapshot
-- parity between the displayed decision and persisted decision record
+Required fault cases:
+- disconnected/stale feed and missing required channels
+- invalid sequence or unresolved sequence gap
+- order book not synchronized
+- failed or unavailable checksum
+- recovery after each failure, using the same running integration
+- assertion that the displayed decision exactly matches the final persisted, safety-gated decision
 
-Still required on the actual running Streamlit process:
-- controlled disconnect/reconnect against the live public feed
-- observe stale/missing channel handling and book resynchronization
-- confirm the application stays `BLOCKED` until required data channels are fresh, the book is synchronized, sequence continuity is restored, and checksum state is verified when provided
-- save sanitized screen/log evidence showing that displayed and persisted decisions agree across failure and recovery
-
-Do not treat the automated source-extraction test as completion of live-runtime acceptance. The running-application test remains open.
+This repository tree does not contain a separate `DeltaFeed` implementation file, and the current test suite does not itself establish that the actual Streamlit call path has passed this fault-injection sequence. Do not report E2E acceptance until the real application implementation is available and the test runs against it.
 
 ### 2. Out-of-sample profitability
 
@@ -58,17 +46,17 @@ Report at minimum:
 - maximum drawdown
 - assumptions and uncertainty / sensitivity analysis
 
-The presence of `oos_replay.py` and passing replay-mechanics tests does not establish a profitable strategy. No OOS profitability result is certified by this report.
+The presence of `oos_replay.py` and passing `test_oos_replay.py` tests does not establish a profitable strategy. No OOS profitability result is certified by this report.
 
 ## Repository scope
 
-This is a curated source/test snapshot. Runtime logs, credentials and raw market-data captures must remain excluded. Any live-session evidence or historical market data should be stored privately and sanitized before being attached to an acceptance report.
+This is a curated source/test snapshot, not a complete runtime/evidence package. Runtime logs, credentials and raw market-data captures must remain excluded. To reproduce end-to-end and OOS work, supply the actual feed implementation and a sanitized, intentionally selected historical dataset through an appropriate private artifact/storage workflow.
 
 ## Release rule
 
 Keep live order execution disabled until:
-1. live disconnect/reconnect and failure recovery pass against the running application;
-2. displayed and persisted final decisions agree throughout those scenarios;
-3. chronological OOS evaluation with authentic data and realistic costs is completed and meets pre-defined economic acceptance thresholds.
+1. end-to-end negative-path tests and recovery tests pass against the actual running integration;
+2. the logged and displayed final decisions agree for each test case;
+3. chronological OOS evaluation with realistic costs is completed and meets pre-defined economic acceptance thresholds.
 
-Passing safety tests is not proof of profitability; passing a profitable replay is not proof of feed safety. These are independent gates.
+Passing safety tests is not proof of profitability; passing a profitable replay is not proof of feed safety. Both gates are independent.

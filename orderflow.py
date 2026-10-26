@@ -740,6 +740,19 @@ def detect_exhaustion_labels(
                     if buy_qty > 0 and buy_qty >= imbalance_ratio * sell_qty:
                         diag["buy_flow_pass"] += 1
                         buy_hit = True
+                    else:
+                        # Read-only detail for the rejected BUY candidate.
+                        diag["rejected_buy"] = {
+                            "candle_ts": int(candle["time"]),
+                            "buy_contracts": buy_qty,
+                            "sell_contracts": sell_qty,
+                            "ratio": round(buy_qty / sell_qty, 4) if sell_qty > 0 else None,
+                            "imbalance_ratio": imbalance_ratio,
+                            "reason": "zero_buy_volume" if buy_qty <= 0 else "ratio_below_threshold",
+                            "trade_count": int(flow["count"]),
+                            "wick_ratio": round(upper_wick_ratio, 4),
+                            "close_position": round(close_position, 4),
+                        }
         if low < prior_low:
             diag["sell_new_low"] += 1
             if lower_wick_ratio >= min_wick_ratio:
@@ -749,6 +762,19 @@ def detect_exhaustion_labels(
                     if sell_qty > 0 and sell_qty >= imbalance_ratio * buy_qty:
                         diag["sell_flow_pass"] += 1
                         sell_hit = True
+                    else:
+                        # Read-only detail for the rejected SELL candidate.
+                        diag["rejected_sell"] = {
+                            "candle_ts": int(candle["time"]),
+                            "buy_contracts": buy_qty,
+                            "sell_contracts": sell_qty,
+                            "ratio": round(sell_qty / buy_qty, 4) if buy_qty > 0 else None,
+                            "imbalance_ratio": imbalance_ratio,
+                            "reason": "zero_sell_volume" if sell_qty <= 0 else "ratio_below_threshold",
+                            "trade_count": int(flow["count"]),
+                            "wick_ratio": round(lower_wick_ratio, 4),
+                            "close_position": round(close_position, 4),
+                        }
 
         # Preserve the original detector's single-label precedence when an
         # unusually wide candle breaks both prior extremes and both rules match.

@@ -1836,6 +1836,27 @@ def _build_price_figure(d: dict[str, Any], timeframe: str, pa: dict[str, Any] | 
         "criteria": exhaustion_diagnostics if toggles.get("exhaust") else {},
     }
 
+    # Export diagnostic state for terminal-based inspection.
+    diagnostic_path = os.environ.get(
+        "DELTA_EXHAUSTION_DIAGNOSTICS_FILE",
+        "/tmp/delta_india_exhaustion_diagnostics.json",
+    )
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(diagnostic_path)), exist_ok=True)
+        payload = {
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            **_FIG_CACHE["exhaustion_status"],
+        }
+        temporary_path = diagnostic_path + ".tmp"
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, allow_nan=False)
+            handle.write("\n")
+        os.replace(temporary_path, diagnostic_path)
+    except (OSError, TypeError, ValueError) as exc:
+        logging.getLogger(__name__).warning(
+            "Could not export exhaustion diagnostics: %s", exc
+        )
+
     _add_orderflow_overlays(fig, d, pa_overlay, liq, toggles, now, y_range, x_span)
     fig.update_layout(
         showlegend=True,
