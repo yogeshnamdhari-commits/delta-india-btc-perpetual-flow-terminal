@@ -23,3 +23,28 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
       - name: Run unit and integration-contract tests
         run: python -m pytest -q
+      - name: Smoke-test Streamlit server startup
+        env:
+          DELTA_EVENT_LOG_FILE: /tmp/delta-feed-events.jsonl
+          DELTA_EVENT_LOG_FILE_FULL: /tmp/delta-feed-events-full.jsonl
+          DELTA_DECISION_LOG_FILE: /tmp/signal-decisions.jsonl
+        run: |
+          set -euo pipefail
+          python -m streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8502 > /tmp/delta-streamlit.log 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true; wait "$app_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8502/_stcore/health >/dev/null; then
+              echo "Streamlit server health endpoint returned HTTP 200."
+              exit 0
+            fi
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat /tmp/delta-streamlit.log
+              echo "Streamlit process exited before becoming healthy."
+              exit 1
+            fi
+            sleep 1
+          done
+          cat /tmp/delta-streamlit.log
+          echo "Streamlit server did not become healthy within 30 seconds."
+          exit 1
