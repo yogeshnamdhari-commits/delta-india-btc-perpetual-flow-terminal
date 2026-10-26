@@ -1237,35 +1237,56 @@ def _book_liquidity(d: dict[str, Any], liq_pct: float, band_ticks: int) -> dict[
 
 
 def _liquidity_level_rows(d: dict[str, Any], liq: dict[str, Any], now: float) -> list[dict[str, Any]]:
-    """Significant observed bands now, plus previously significant bands the
-    sampler has not seen for >6s (removed/faded)."""
+    """Report measured live book bands with transparent size and notional metrics.
+
+    "Intensity" is quantity relative to the current adaptive significance
+    threshold; it is not a liquidation probability or a forecast of execution.
+    Removed rows retain only their last-seen size and are marked non-live.
+    """
     rows = []
+    threshold = _f(liq.get("threshold") or d.get("book_liq_threshold"), 0.0) or 0.0
     for side, bands in (("bid", liq["sig_bid"]), ("ask", liq["sig_ask"])):
         for b in bands[:10]:
             st = d["level_stats"].get((side, b["price"]))
             dur = max(0.0, now - st["first_seen"]) if st else 0.0
-            rows.append({"Side": "BID" if side == "bid" else "ASK", "Price": b["price"],
-                         "Contracts": b["size"], "BTC equiv": b["size"] * CONTRACT_VALUE_BTC,
-                         "Levels": b["levels"], "Observed": f"{dur:.0f}s", "Status": "active"})
+            size = float(b["size"])
+            price = float(b["price"])
+            rows.append({
+                "Side": "BID" if side == "bid" else "ASK",
+                "Price": price,
+                "Contracts": size,
+                "BTC equiv": size * CONTRACT_VALUE_BTC,
+                "Approx USD notional": size * CONTRACT_VALUE_BTC * price,
+                "Intensity x threshold": (size / threshold) if threshold > 0 else None,
+                "Levels": b["levels"],
+                "Observed": f"{dur:.0f}s",
+                "Status": "active",
+            })
     current_keys = {(side, b["price"])
                     for side, bands in (("bid", liq["sig_bid"]), ("ask", liq["sig_ask"])) for b in bands}
     removed = []
     for (side, price), st in d["level_stats"].items():
         if (side, price) in current_keys or now - st["last_seen"] < 6:
             continue
-        removed.append({"Side": "BID" if side == "bid" else "ASK", "Price": price,
-                        "Contracts": st["last_size"], "BTC equiv": st["last_size"] * CONTRACT_VALUE_BTC,
-                        "Levels": None, "Observed": f"{max(0.0, st['last_seen'] - st['first_seen']):.0f}s",
-                        "Status": f"removed (last seen {_ist_str(st['last_seen'])})",
-                        "_last": st["last_seen"]})
+        last_size = float(st["last_size"])
+        removed.append({
+            "Side": "BID" if side == "bid" else "ASK",
+            "Price": float(price),
+            "Contracts": last_size,
+            "BTC equiv": last_size * CONTRACT_VALUE_BTC,
+            "Approx USD notional": last_size * CONTRACT_VALUE_BTC * float(price),
+            "Intensity x threshold": None,
+            "Levels": None,
+            "Observed": f"{max(0.0, st['last_seen'] - st['first_seen']):.0f}s",
+            "Status": f"removed (last seen {_ist_str(st['last_seen'])})",
+            "_last": st["last_seen"],
+        })
     removed.sort(key=lambda r: r["_last"], reverse=True)
-    for r in removed[:20]:          # bound the display; sampler keeps the rest
+    for r in removed[:20]:
         r.pop("_last", None)
         rows.append(r)
     rows.sort(key=lambda r: (r["Side"], -r["Price"] if r["Side"] == "BID" else r["Price"]))
     return rows
-
-
 def _large_trade_rows(d: dict[str, Any], limit: int = 20) -> list[dict[str, Any]]:
     rows = []
     for t in list(d["large_trades"])[-limit:][::-1]:
@@ -2411,31 +2432,65 @@ def render_flow_panel() -> None:
     aggressive clusters, derived pools and the captured depth heatmap."""
     d = feed.snapshot()
     now = time.time()
-    book_ready = bool(d["book_synced"]) and bool(d["asks"]) and bool(d["bids"])
+    book_integrity_ok = (
+        bool(d.get("book_synced"))
+        and not bool(d.get("sequence_gap_unresolved", True))
+        and d.get("checksum_ok") is True
+    )
+    book_ready = book_integrity_ok and bool(d["asks"]) and bool(d["bids"])
     pa = None
     closed = _closed_candles(d)
     if closed:
         pa = _price_action_analytics(closed, ob_lookback, ob_displacement,
                                      ob_zone_basis, eq_tolerance)
     liq = _book_liquidity(d, float(liq_percentile), 2) if book_ready else None
+
+    with st.expander("Authentic market-wide liquidation levels", expanded=True):
+        st.warning(
+            "UNAVAILABLE — this dashboard subscribes to Delta's public market-data channels, "
+            "which do not publish market-wide liquidation executions or liquidation-price clusters. "
+            "The documented liquidation reason appears in private/account order notifications; that "
+            "does not establish an all-market liquidation feed. No synthetic liquidation levels or "
+            "intensity scores are displayed."
+        )
+        st.caption(
+            "A position's own liquidation price is account/margin-specific and is not a market-wide "
+            "liquidation map. To add authentic levels later, a verified market-wide data source and "
+            "instrument-specific schema are required."
+        )
+
     flow_l, flow_r = st.columns([1, 1], gap="large")
     with flow_l:
         st.markdown("**Observed resting liquidity (live book)**")
         if not book_ready:
-            st.warning("Order-book-derived levels unavailable: book not sequence-synced. Price-action signals below remain available.")
+            st.warning(
+                "Observed order-book levels are withheld unless the book is sequence-synced, "
+                "CRC/checksum-valid, and has no unresolved sequence gap. Price-action-derived "
+                "zones and sweeps may still be shown separately."
+            )
         else:
             lvl_rows = _liquidity_level_rows(d, liq, now)
             if lvl_rows:
                 lvl_df = pd.DataFrame(lvl_rows)
-                st.dataframe(lvl_df.style.format({"Price": "{:,.1f}", "Contracts": "{:,.0f}",
-                                                  "BTC equiv": "{:,.3f}"}),
-                             hide_index=True, use_container_width=True, height=300)
+                st.dataframe(
+                    lvl_df.style.format({
+                        "Price": "{:,.1f}",
+                        "Contracts": "{:,.0f}",
+                        "BTC equiv": "{:,.3f}",
+                        "Approx USD notional": "${:,.0f}",
+                        "Intensity x threshold": "{:.2f}x",
+                    }, na_rep="—"),
+                    hide_index=True, use_container_width=True, height=300,
+                )
             else:
                 st.caption("No level currently exceeds the adaptive significance threshold.")
             thr = d.get("book_liq_threshold")
             st.caption(
                 f"Adaptive threshold: {'— (not enough bands yet)' if thr is None else f'{thr:,.0f} contracts (p{int(liq_percentile)} of banded depth)'} · "
-                f"bands aggregate within ±{BOOK_TICK * 2:.1f} price points · durations measured since first observed")
+                f"bands aggregate within ±{BOOK_TICK * 2:.1f} price points · durations measured since first observed. "
+                "Intensity = contracts ÷ adaptive threshold; approximate USD notional = contracts × 0.001 BTC × price. "
+                "These are observed resting orders, not proof that the orders will remain or execute."
+            )
     with flow_r:
         st.markdown("**Large executed trades (actual tape)**")
         trade_thr = d.get("large_trade_threshold")
@@ -2485,14 +2540,127 @@ def render_flow_panel() -> None:
                 st.caption("No equal levels confirmed in the current lookback.")
         with pool2:
             st.markdown("**Confirmed sweeps**")
-            sweep_rows = [{"Type": "High swept" if s["kind"] == "high" else "Low swept",
-                           "Price": s["price"], "Swept at (IST)": _ist_str(s["sweep_time"])}
-                          for s in (pa["swept"][-12:] if pa else [])]
+            sweep_rows = [{
+                "Candidate": (
+                    "Above-high sweep (buy-side liquidity)"
+                    if s["kind"] == "high"
+                    else "Below-low sweep (sell-side liquidity)"
+                ),
+                "Level": s["price"],
+                "Breach extreme": s.get("breach_price"),
+                "Overshoot (pts)": s.get("overshoot_points"),
+                "Reclaim delay (bars)": s.get("reclaim_delay_bars"),
+                "Reclaim close": s.get("reclaim_close"),
+                "Breach at (IST)": _ist_str(s.get("exceed_time")),
+                "Reclaim at (IST)": _ist_str(s.get("sweep_time")),
+            } for s in (pa["swept"][-12:] if pa else [])]
             if sweep_rows:
-                st.dataframe(pd.DataFrame(sweep_rows).style.format({"Price": "{:,.1f}"}),
-                             hide_index=True, use_container_width=True, height=200)
+                st.dataframe(
+                    pd.DataFrame(sweep_rows).style.format({
+                        "Level": "{:,.1f}",
+                        "Breach extreme": "{:,.1f}",
+                        "Overshoot (pts)": "{:,.1f}",
+                        "Reclaim close": "{:,.1f}",
+                    }, na_rep="—"),
+                    hide_index=True, use_container_width=True, height=230,
+                )
             else:
-                st.caption("No confirmed sweeps. A touch without a documented reclaim is not labelled a sweep.")
+                st.caption("No confirmed price sweeps. A touch or break without a close back through the level within the configured reclaim window is not labelled a sweep.")
+            st.caption(
+                "A confirmed price sweep is a stop-hunt candidate, not proof that stop orders actually existed or were triggered. "
+                "Overshoot and reclaim timing are measured from completed candles."
+            )
+    with st.expander("Supply / demand zones (price-action-derived)", expanded=True):
+        zones = (pa or {}).get("zones", [])
+        last_price = _f(d.get("last_price"))
+        zone_rows = []
+        for z in zones:
+            top = _f(z.get("top"))
+            bottom = _f(z.get("bottom"))
+            if top is None or bottom is None or top < bottom:
+                continue
+            midpoint = (top + bottom) / 2.0
+            distance = (midpoint - last_price) if last_price is not None else None
+            displacement = _f(z.get("displacement_x_atr"))
+            zone_rows.append({
+                "Zone": "DEMAND" if z.get("direction") == "bullish" else "SUPPLY",
+                "Lower": bottom,
+                "Upper": top,
+                "Midpoint": midpoint,
+                "Width (pts)": top - bottom,
+                "Displacement (x ATR)": displacement,
+                "Distance to mid (pts)": distance,
+                "Status": str(z.get("status", "unknown")).upper(),
+                "Confirmed (IST)": _ist_str(z.get("confirmed_time")),
+            })
+        zone_rows.sort(key=lambda r: (
+            r["Status"] == "INVALIDATED",
+            abs(r["Distance to mid (pts)"]) if r["Distance to mid (pts)"] is not None else float("inf"),
+            -(r["Displacement (x ATR)"] or 0.0),
+        ))
+        if zone_rows:
+            st.dataframe(
+                pd.DataFrame(zone_rows[:12]).style.format({
+                    "Lower": "{:,.1f}",
+                    "Upper": "{:,.1f}",
+                    "Midpoint": "{:,.1f}",
+                    "Width (pts)": "{:,.1f}",
+                    "Displacement (x ATR)": "{:.2f}",
+                    "Distance to mid (pts)": "{:+,.1f}",
+                }, na_rep="—"),
+                hide_index=True, use_container_width=True, height=300,
+            )
+        else:
+            st.caption("No confirmed supply/demand zones in the current completed-candle lookback.")
+        st.caption(
+            "Demand = bullish order-block candidates; supply = bearish order-block candidates. "
+            "Displacement (x ATR) quantifies the confirming price move, not resting order size or a probability. "
+            "Zone boundaries are derived from completed candles and do not prove institutional orders exist there."
+        )
+
+    with st.expander("Buy / sell exhaustion (1-minute candle + observed tape)", expanded=True):
+        exhaustion = orderflow.detect_exhaustion_labels(
+            closed,
+            d.get("trade_log", []),
+            timeframe_seconds=60,
+            lookback=10,
+            min_trades=5,
+            imbalance_ratio=1.25,
+            min_wick_ratio=0.35,
+            close_position_limit=0.65,
+        ) if closed else []
+        exhaustion_rows = [{
+            "Type": "BUY exhaustion · bearish risk" if e["kind"] == "buy_exhaust" else "SELL exhaustion · bullish risk",
+            "Time (IST)": _ist_str(e.get("time")),
+            "Price": e.get("price"),
+            "Buy aggr. contracts": e.get("buy_contracts"),
+            "Sell aggr. contracts": e.get("sell_contracts"),
+            "Dominant-side ratio": e.get("aggressor_ratio"),
+            "Wick (% range)": 100.0 * e.get("wick_ratio", 0.0),
+            "Close position (%)": 100.0 * e.get("close_position", 0.0),
+            "Classified prints": e.get("trade_count"),
+        } for e in exhaustion[-8:][::-1]]
+        if exhaustion_rows:
+            st.dataframe(
+                pd.DataFrame(exhaustion_rows).style.format({
+                    "Price": "{:,.1f}",
+                    "Buy aggr. contracts": "{:,.0f}",
+                    "Sell aggr. contracts": "{:,.0f}",
+                    "Dominant-side ratio": "{:.2f}x",
+                    "Wick (% range)": "{:.1f}%",
+                    "Close position (%)": "{:.1f}%",
+                    "Classified prints": "{:,.0f}",
+                }, na_rep="—"),
+                hide_index=True, use_container_width=True, height=260,
+            )
+        else:
+            st.caption("No buy/sell exhaustion candidates meet the existing completed-candle and tape-flow rules. Thresholds are not relaxed to force labels.")
+        st.caption(
+            "BUY exhaustion: a new local high rejects with an upper wick and buy-aggressor imbalance (bearish risk). "
+            "SELL exhaustion: a new local low rejects with a lower wick and sell-aggressor imbalance (bullish risk). "
+            "This is a heuristic context label, not proof of a reversal or an entry signal."
+        )
+
     if show_depth_heat:
         st.markdown("**Observed depth heatmap (captured samples only)**")
         fig_heat = _depth_heatmap(d)
