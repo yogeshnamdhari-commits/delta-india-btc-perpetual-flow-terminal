@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """Read-only AI Q&A panel for the Delta India BTCUSD Streamlit terminal.
 
-This module sends a compact current feed snapshot to either a local Ollama
-server (default; no external API billing) or the OpenAI Responses API (which
-requires a separate OpenAI API key and billing).
+This module sends a compact current feed snapshot to local Ollama, Kilo Gateway
+free models, or the OpenAI Responses API (which requires a separate OpenAI API key
+and billing). Kilo's :free model IDs are used to prevent accidental paid inference.
 
 Chat history lives in Streamlit session state only. It is not appended to
 market event logs, and this module never sends orders or calls private
@@ -23,8 +23,9 @@ import streamlit as st
 
 
 LOCAL_PROVIDER = "Local Ollama (no API billing)"
+KILO_PROVIDER = "Kilo Gateway free model (no API key)"
 OPENAI_PROVIDER = "OpenAI API (separate API billing)"
-_PROVIDER_OPTIONS = (LOCAL_PROVIDER, OPENAI_PROVIDER)
+_PROVIDER_OPTIONS = (LOCAL_PROVIDER, KILO_PROVIDER, OPENAI_PROVIDER)
 _HISTORY_KEY = "_delta_ai_analyst_history"
 _MAX_HISTORY_MESSAGES = 12
 _MAX_QUESTION_CHARS = 2400
@@ -291,6 +292,84 @@ def build_market_context(feed_data: dict[str, Any], *, now_epoch: float | None =
     return json.loads(json.dumps(context, ensure_ascii=False, default=str, allow_nan=False))
 
 
+def _read_kilo_api_key() -> str | None:
+    """Kilo key is optional when requesting a model explicitly marked free."""
+    key = os.environ.get("KILO_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        secret = st.secrets.get("KILO_API_KEY", "")
+        return str(secret).strip() or None
+    except Exception:
+        return None
+
+
+def _extract_chat_completion_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return ""
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    content = message.get("content", "") if isinstance(message, dict) else ""
+    if isinstance(content, str):
+        return content.strip()
+    # Some OpenAI-compatible providers return content as typed text blocks.
+    if isinstance(content, list):
+        parts = [block.get("text", "") for block in content
+                 if isinstance(block, dict) and isinstance(block.get("text"), str)]
+        return "\\n\\n".join(part.strip() for part in parts if part.strip())
+    return ""
+
+
+def _ask_kilo_free(
+    question: str,
+    context: dict[str, Any],
+    history: list[dict[str, str]],
+    model: str,
+) -> str:
+    """Use Kilo Gateway's OpenAI-compatible endpoint, requiring a :free model ID."""
+    model_id = model.strip() or os.environ.get("KILO_FREE_MODEL", "z-ai/glm-5:free")
+    if not model_id.endswith(":free"):
+        raise RuntimeError(
+            "For the no-cost Kilo option, select a model ID ending in ':free'. "
+            "Paid Kilo Gateway models are intentionally blocked by this provider."
+        )
+    messages = [{"role": "system", "content": SYSTEM_INSTRUCTIONS}]
+    messages.extend(_normalise_history(history))
+    messages.append({"role": "user", "content": _question_with_context(question, context)})
+    headers = {"Content-Type": "application/json"}
+    api_key = _read_kilo_api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        response = requests.post(
+            "https://ai-gateway.kilo.ai/api/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": model_id,
+                "messages": messages,
+                "stream": False,
+                "temperature": 0.2,
+                "max_tokens": 900,
+            },
+            timeout=(5, 90),
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError("Could not reach the Kilo AI Gateway. Check connectivity and try again.") from exc
+    if response.status_code == 429:
+        raise RuntimeError(
+            "Kilo free-model rate limit reached. Wait or choose another currently available free model."
+        )
+    if response.status_code in (400, 404):
+        raise RuntimeError(
+            "Kilo did not accept this model ID. Check Kilo's current free-model catalog and choose a model ending in ':free'."
+        )
+    response.raise_for_status()
+    answer = _extract_chat_completion_text(response.json())
+    if not answer:
+        raise RuntimeError("Kilo returned no text output for this request.")
+    return answer
+
+
 def _read_openai_api_key() -> str | None:
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if key:
@@ -429,6 +508,18 @@ def render_ai_analyst(feed_data: dict[str, Any]) -> None:
                     help="Install the model locally first, e.g. ollama pull llama3.2:3b.",
                 )
             st.caption("Local Ollama avoids API usage charges, but requires Ollama and a model installed on this machine.")
+        elif provider == KILO_PROVIDER:
+            kilo_model = st.text_input(
+                "Kilo free model ID",
+                value=os.environ.get("KILO_FREE_MODEL", "z-ai/glm-5:free"),
+                key="delta_ai_analyst_kilo_model",
+                help="Use a model ID ending in :free; paid model IDs are rejected by this provider.",
+            )
+            st.caption(
+                "Kilo's free models can be used without a Kilo API key, subject to changing model availability "
+                "and rate limits. The selected provider may log prompts and outputs, so send only data you are "
+                "comfortable sharing with that provider."
+            )
         else:
             openai_model = st.text_input(
                 "OpenAI API model",
@@ -464,6 +555,8 @@ def render_ai_analyst(feed_data: dict[str, Any]) -> None:
                 with st.spinner("Analysing the current Delta feed snapshot…"):
                     if provider == LOCAL_PROVIDER:
                         answer = _ask_ollama(question, context, prior_history, base_url, model)
+                    elif provider == KILO_PROVIDER:
+                        answer = _ask_kilo_free(question, context, prior_history, kilo_model)
                     else:
                         answer = _ask_openai(question, context, prior_history, openai_model)
             except requests.Timeout:
