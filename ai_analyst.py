@@ -22,10 +22,10 @@ import requests
 import streamlit as st
 
 
-LOCAL_PROVIDER = "Local Ollama (no API billing)"
 KILO_PROVIDER = "Kilo Gateway free model (no API key)"
+LOCAL_PROVIDER = "Local Ollama (no API billing)"
 OPENAI_PROVIDER = "OpenAI API (separate API billing)"
-_PROVIDER_OPTIONS = (LOCAL_PROVIDER, KILO_PROVIDER, OPENAI_PROVIDER)
+_PROVIDER_OPTIONS = (KILO_PROVIDER, LOCAL_PROVIDER, OPENAI_PROVIDER)
 _HISTORY_KEY = "_delta_ai_analyst_history"
 _MAX_HISTORY_MESSAGES = 12
 _MAX_QUESTION_CHARS = 2400
