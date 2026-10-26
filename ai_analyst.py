@@ -327,7 +327,7 @@ def _ask_kilo_free(
     model: str,
 ) -> str:
     """Use Kilo Gateway's OpenAI-compatible endpoint, requiring a :free model ID."""
-    model_id = model.strip() or os.environ.get("KILO_FREE_MODEL", "z-ai/glm-5:free")
+    model_id = model.strip() or os.environ.get("KILO_FREE_MODEL", "nvidia/nemotron-3.5-super-vl:free")
     if not model_id.endswith(":free"):
         raise RuntimeError(
             "For the no-cost Kilo option, select a model ID ending in ':free'. "
@@ -511,7 +511,7 @@ def render_ai_analyst(feed_data: dict[str, Any]) -> None:
         elif provider == KILO_PROVIDER:
             kilo_model = st.text_input(
                 "Kilo free model ID",
-                value=os.environ.get("KILO_FREE_MODEL", "z-ai/glm-5:free"),
+                value=os.environ.get("KILO_FREE_MODEL", "nvidia/nemotron-3.5-super-vl:free"),
                 key="delta_ai_analyst_kilo_model",
                 help="Use a model ID ending in :free; paid model IDs are rejected by this provider.",
             )
