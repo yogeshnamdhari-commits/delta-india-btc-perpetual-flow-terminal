@@ -2477,7 +2477,7 @@ def render_flow_panel() -> None:
                         "Price": "{:,.1f}",
                         "Contracts": "{:,.0f}",
                         "BTC equiv": "{:,.3f}",
-                        "Approx USD notional": "${:,.0f}",
+                        "Approx USD notional": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.0f}",
                         "Intensity x threshold": "{:.2f}x",
                     }, na_rep="—"),
                     hide_index=True, use_container_width=True, height=300,
