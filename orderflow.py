@@ -364,13 +364,23 @@ def detect_sweeps(candles, levels, reclaim_bars=3, eps=0.5):
             continue
         for idx in range(exceed_idx, min(exceed_idx + reclaim_bars, len(candles))):
             c = candles[idx]
-            if kind == "high" and c["close"] < level:
-                swept.append({**lv, "sweep_time": c["time"],
-                              "exceed_time": candles[exceed_idx]["time"]})
-                break
-            if kind == "low" and c["close"] > level:
-                swept.append({**lv, "sweep_time": c["time"],
-                              "exceed_time": candles[exceed_idx]["time"]})
+            high_sweep = kind == "high" and c["close"] < level
+            low_sweep = kind == "low" and c["close"] > level
+            if high_sweep or low_sweep:
+                breach_candle = candles[exceed_idx]
+                breach_price = breach_candle["high"] if kind == "high" else breach_candle["low"]
+                overshoot = (
+                    breach_price - level if kind == "high" else level - breach_price
+                )
+                swept.append({
+                    **lv,
+                    "sweep_time": c["time"],
+                    "exceed_time": breach_candle["time"],
+                    "breach_price": float(breach_price),
+                    "overshoot_points": max(0.0, float(overshoot)),
+                    "reclaim_delay_bars": idx - exceed_idx,
+                    "reclaim_close": float(c["close"]),
+                })
                 break
     return swept
 
