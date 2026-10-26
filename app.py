@@ -1010,7 +1010,7 @@ class DeltaFeed:
                             "channel": "ticker",
                             "price": _f(quotes[0]),
                             "bid": _f(quotes[2]),
-                            "ask": _f(quotes[1]),
+                            "ask": _f(quotes[0]),
                             "bid_size": _f(quotes[3]),
                             "ask_size": _f(quotes[1]),
                             "mark_price": _f(row.get("m")),
