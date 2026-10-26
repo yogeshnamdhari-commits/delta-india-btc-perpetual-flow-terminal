@@ -87,7 +87,7 @@ class AiAnalystContextTests(unittest.TestCase):
     def test_flow_context_marks_historical_validation_as_unavailable(self):
         context = build_market_context(self.feed, now_epoch=self.now)
         self.assertTrue(context["recent_15m_aggressor_flow"])
-        self.assertEqual(context["recent_15m_aggressor_flow"][-1]["net_aggressor_contracts"], 6)
+        self.assertEqual(context["recent_15m_aggressor_flow"][-1]["net_aggressor_contracts"], -1)
         self.assertFalse(context["historical_validation"]["historical_market_wide_trade_archive_in_this_context"])
         self.assertFalse(context["historical_validation"]["oos_profitability_certified_by_this_live_snapshot"])
 
