@@ -73,7 +73,7 @@ jobs:
           candidates = ([preferred] if preferred in free_ids else []) + [
               model_id for model_id in free_ids if model_id != preferred
           ]
-          candidates = candidates[:5]
+          candidates = candidates[:12]
           if not candidates:
               raise SystemExit("Kilo live smoke failed: no currently listed :free model was returned by /models.")
 
@@ -84,6 +84,7 @@ jobs:
           last_error = None
           for model_id in candidates:
               started = time.monotonic()
+              print(f"Trying current Kilo free model: {model_id}", flush=True)
               try:
                   response = requests.post(
                       f"{base}/chat/completions",
@@ -93,7 +94,7 @@ jobs:
                           "messages": [{"role": "user", "content": prompt}],
                           "stream": False,
                           "temperature": 0,
-                          "max_tokens": 32,
+                          "max_tokens": 128,
                       },
                       timeout=(10, 60),
                   )
@@ -111,7 +112,8 @@ jobs:
                           if isinstance(block, dict) and isinstance(block.get("text"), str)
                       )
                   if not isinstance(answer, str) or not answer.strip():
-                      last_error = f"{model_id}: successful HTTP response contained no assistant text"
+                      last_error = f"{model_id}: HTTP {response.status_code} response had no assistant text; top-level keys={list(payload)[:12]}, choices={len(choices)}"
+                      print(last_error, flush=True)
                       continue
                   elapsed = round(time.monotonic() - started, 2)
                   print(f"KILO_LIVE_SMOKE_OK model={model_id} elapsed_s={elapsed} anonymous=true")
@@ -119,6 +121,7 @@ jobs:
                   break
               except (requests.RequestException, ValueError) as exc:
                   last_error = f"{model_id}: {type(exc).__name__}: {str(exc)[:240]}"
+                  print(last_error, flush=True)
           else:
               raise SystemExit("Kilo live response smoke test failed for all candidate free models. Last error: " + str(last_error))
           PY
