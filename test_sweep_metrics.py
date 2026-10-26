@@ -32,7 +32,7 @@ class TestSweepMetrics(unittest.TestCase):
 
     def test_low_sweep_reports_overshoot_and_delayed_reclaim(self):
         candles = [
-            candle(60, high=101.0, low=98.0, close=99.0),
+            candle(60, high=101.0, low=98.0, close=98.2),
             candle(120, high=101.0, low=97.0, close=100.5),
         ]
         levels = [{"kind": "low", "price": 98.5, "time": 0}]
