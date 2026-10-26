@@ -3,6 +3,8 @@ import unittest
 from datetime import datetime, timezone
 
 from ai_analyst import (
+    _ask_kilo_free,
+    _extract_chat_completion_text,
     _extract_responses_api_text,
     _question_with_context,
     build_market_context,
@@ -105,6 +107,24 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertIn('"symbol":"BTCUSD"', prompt)
         self.assertIn("Is the spread wide?", prompt)
         self.assertIn("CURRENT DELTA EXCHANGE MARKET SNAPSHOT", prompt)
+
+    def test_kilo_chat_completion_text_extraction(self):
+        payload = {
+            "choices": [
+                {"message": {"role": "assistant", "content": "Kilo response text"}}
+            ]
+        }
+        self.assertEqual(_extract_chat_completion_text(payload), "Kilo response text")
+        self.assertEqual(_extract_chat_completion_text({"choices": []}), "")
+
+    def test_kilo_free_provider_rejects_paid_model_ids(self):
+        with self.assertRaisesRegex(RuntimeError, "ending in ':free'"):
+            _ask_kilo_free(
+                "test question",
+                {"instrument": {"symbol": "BTCUSD"}},
+                [],
+                "paid-model",
+            )
 
     def test_openai_responses_text_extraction_handles_output_content(self):
         payload = {
