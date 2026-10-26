@@ -48,3 +48,77 @@ jobs:
           cat /tmp/delta-streamlit.log
           echo "Streamlit server did not become healthy within 30 seconds."
           exit 1
+
+      - name: Live Kilo Gateway free-model response smoke test
+        env:
+          KILO_SMOKE_PREFERRED_MODEL: z-ai/glm-5:free
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import requests
+
+          base = "https://ai-gateway.kilo.ai/api/v1"
+          preferred = os.environ.get("KILO_SMOKE_PREFERRED_MODEL", "z-ai/glm-5:free")
+          catalog_response = requests.get(f"{base}/models", timeout=15)
+          catalog_response.raise_for_status()
+          catalog = catalog_response.json()
+          entries = catalog.get("data", []) if isinstance(catalog, dict) else []
+          free_ids = [
+              item.get("id") for item in entries
+              if isinstance(item, dict)
+              and isinstance(item.get("id"), str)
+              and item["id"].endswith(":free")
+          ]
+          candidates = ([preferred] if preferred in free_ids else []) + [
+              model_id for model_id in free_ids if model_id != preferred
+          ]
+          candidates = candidates[:5]
+          if not candidates:
+              raise SystemExit("Kilo live smoke failed: no currently listed :free model was returned by /models.")
+
+          prompt = (
+              "This is a synthetic CI connectivity test, not real market data. "
+              "Reply exactly KILO_LIVE_SMOKE_OK. Dummy fixture: BTCUSD=100000."
+          )
+          last_error = None
+          for model_id in candidates:
+              started = time.monotonic()
+              try:
+                  response = requests.post(
+                      f"{base}/chat/completions",
+                      headers={"Content-Type": "application/json"},
+                      json={
+                          "model": model_id,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "stream": False,
+                          "temperature": 0,
+                          "max_tokens": 32,
+                      },
+                      timeout=(10, 60),
+                  )
+                  if response.status_code in (400, 404, 429, 502, 503, 504):
+                      last_error = f"{model_id}: HTTP {response.status_code} {response.text[:240]}"
+                      continue
+                  response.raise_for_status()
+                  payload = response.json()
+                  choices = payload.get("choices", [])
+                  message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
+                  answer = message.get("content", "") if isinstance(message, dict) else ""
+                  if isinstance(answer, list):
+                      answer = "\\n".join(
+                          block.get("text", "") for block in answer
+                          if isinstance(block, dict) and isinstance(block.get("text"), str)
+                      )
+                  if not isinstance(answer, str) or not answer.strip():
+                      last_error = f"{model_id}: successful HTTP response contained no assistant text"
+                      continue
+                  elapsed = round(time.monotonic() - started, 2)
+                  print(f"KILO_LIVE_SMOKE_OK model={model_id} elapsed_s={elapsed} anonymous=true")
+                  print("A real response was received using synthetic test data only.")
+                  break
+              except (requests.RequestException, ValueError) as exc:
+                  last_error = f"{model_id}: {type(exc).__name__}: {str(exc)[:240]}"
+          else:
+              raise SystemExit("Kilo live response smoke test failed for all candidate free models. Last error: " + str(last_error))
+          PY
