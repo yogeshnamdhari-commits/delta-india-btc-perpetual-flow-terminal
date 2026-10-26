@@ -84,7 +84,7 @@ Optional environment variables: `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
 
 ### Option B — Kilo Gateway free models (no API key required)
 
-Select **Kilo Gateway free model (no API key)** in the panel. The default model ID is `z-ai/glm-5:free`. Change it to another currently available Kilo model whose ID ends in `:free` if needed. This provider rejects model IDs without the `:free` suffix to prevent accidental requests to a paid Kilo model. An optional `KILO_API_KEY` environment variable or Streamlit secret may be supplied, but it is not required for Kilo's anonymous free-model access.
+The panel defaults to **Kilo Gateway free model (no API key)**. Its default model ID is `z-ai/glm-5:free`; you can change it in the panel or select another provider. Change it to another currently available Kilo model whose ID ends in `:free` if needed. This provider rejects model IDs without the `:free` suffix to prevent accidental requests to a paid Kilo model. An optional `KILO_API_KEY` environment variable or Streamlit secret may be supplied, but it is not required for Kilo's anonymous free-model access.
 
 Kilo documents a free-model rate limit of 200 requests per hour per IP, and model availability can change. Some free model routes may send prompts and outputs to upstream providers that log them or use them to improve services. Use this option only if you are comfortable sharing the compact market snapshot and recent chat turns with the selected provider. Do not send personal, account, or confidential data.
 
