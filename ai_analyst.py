@@ -527,6 +527,10 @@ def build_market_context(feed_data: dict[str, Any], *, now_epoch: float | None =
             "minute_flow_buckets_in_memory": minute_flow_count,
         },
     }
+    delta_structure = feed_data.get("delta_market_structure")
+    if isinstance(delta_structure, dict):
+        context["delta_market_structure"] = delta_structure
+
     cross_venue = feed_data.get("cross_venue_binance_context")
     if isinstance(cross_venue, dict):
         # Keep venue measurements separate; never coerce Binance BTC sizes into Delta contracts.
