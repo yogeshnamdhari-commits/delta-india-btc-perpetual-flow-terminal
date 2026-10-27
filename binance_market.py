@@ -21,7 +21,7 @@ import websocket
 
 _LOGGER = logging.getLogger(__name__)
 REST_BASE_URL = "https://fapi.binance.com"
-WS_BASE_URL = "wss://fstream.binance.com/stream"
+WS_BASE_URL = "wss://fstream.binance.com"
 DEFAULT_SYMBOL = "BTCUSDT"
 _MAX_CANDLES = 2000
 _MAX_BOOK_LEVELS = 5000
@@ -146,11 +146,16 @@ def normalize_liquidation_event(event: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def depth_update_action(last_update_id: int, event: dict[str, Any]) -> str:
-    """Classify a Binance diff-depth event against the local update ID.
+def depth_update_action(
+    last_update_id: int,
+    event: dict[str, Any],
+    *,
+    require_previous: bool = False,
+) -> str:
+    """Classify Binance USDⓈ-M diff-depth data using update IDs and pu.
 
-    Returns 'stale', 'apply', or 'gap'. A gap must invalidate the current book
-    until a fresh REST snapshot and buffered diffs synchronize it again.
+    The first buffered event bridges a REST snapshot. After the bridge, each
+    event must carry pu equal to the locally applied previous u.
     """
     try:
         first_id, final_id = int(event["U"]), int(event["u"])
@@ -158,7 +163,14 @@ def depth_update_action(last_update_id: int, event: dict[str, Any]) -> str:
         return "gap"
     if final_id <= last_update_id:
         return "stale"
-    if first_id > last_update_id + 1:
+    if require_previous:
+        try:
+            previous_id = int(event["pu"])
+        except (KeyError, TypeError, ValueError):
+            return "gap"
+        if previous_id != last_update_id:
+            return "gap"
+    elif first_id > last_update_id + 1:
         return "gap"
     return "apply"
 
@@ -255,6 +267,8 @@ class BinanceUSDMFeed:
             "provider": "Binance USDⓈ-M Futures",
             "symbol": symbol,
             "connection": "starting",
+            "market_connection": "starting",
+            "depth_connection": "starting",
             "last_error": "",
             "last_rest_error": "",
             "started_at": now,
@@ -302,24 +316,37 @@ class BinanceUSDMFeed:
         }
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._depth_thread: threading.Thread | None = None
         self._rest_thread: threading.Thread | None = None
         self._book_sync_thread: threading.Thread | None = None
         self._book_sync_running = False
         self._depth_buffer: deque[dict[str, Any]] = deque(maxlen=_MAX_DEPTH_BUFFER)
         self._depth_buffer_overflow = False
         self._ws: websocket.WebSocketApp | None = None
+        self._ws_depth: websocket.WebSocketApp | None = None
         self._liquidation_seen: set[tuple[Any, ...]] = set()
-        self._ever_connected = False
+        self._ever_connected: dict[str, bool] = {"market": False, "depth": False}
         self._liquidation_seen_order: deque[tuple[Any, ...]] = deque(maxlen=10000)
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if (
+            self._thread and self._thread.is_alive()
+            and self._depth_thread and self._depth_thread.is_alive()
+        ):
             return
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run_forever, name=f"binance-{self.symbol.lower()}-ws", daemon=True
-        )
-        self._thread.start()
+        if not (self._thread and self._thread.is_alive()):
+            self._thread = threading.Thread(
+                target=self._run_forever, args=("market",),
+                name=f"binance-{self.symbol.lower()}-market-ws", daemon=True
+            )
+            self._thread.start()
+        if not (self._depth_thread and self._depth_thread.is_alive()):
+            self._depth_thread = threading.Thread(
+                target=self._run_forever, args=("depth",),
+                name=f"binance-{self.symbol.lower()}-depth-ws", daemon=True
+            )
+            self._depth_thread.start()
         if not (self._rest_thread and self._rest_thread.is_alive()):
             self._rest_thread = threading.Thread(
                 target=self._poll_rest, name=f"binance-{self.symbol.lower()}-rest", daemon=True
@@ -328,12 +355,12 @@ class BinanceUSDMFeed:
 
     def stop(self) -> None:
         self._stop.set()
-        ws = self._ws
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
+        for ws in (self._ws, self._ws_depth):
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -429,69 +456,106 @@ class BinanceUSDMFeed:
             ],
         }
 
-    def _set_connection(self, value: str, error: str | None = None) -> None:
+    def _refresh_connection_state_locked(self) -> None:
+        market = self.data.get("market_connection", "unknown")
+        depth = self.data.get("depth_connection", "unknown")
+        if market == "connected" and depth == "connected":
+            self.data["connection"] = "connected"
+        else:
+            self.data["connection"] = f"market={market}; depth={depth}"
+
+    def _set_connection(
+        self, value: str, error: str | None = None, *, group: str = "market"
+    ) -> None:
+        key = "depth_connection" if group == "depth" else "market_connection"
         with self.lock:
-            self.data["connection"] = value
+            self.data[key] = value
+            self._refresh_connection_state_locked()
             if error is not None:
                 self.data["last_error"] = str(error)[:400]
 
-    def _stream_url(self) -> str:
+    def _stream_url(self, group: str = "market") -> str:
         symbol = self.symbol.lower()
-        streams = (
-            f"{symbol}@aggTrade/{symbol}@depth@100ms/{symbol}@kline_1m/"
-            f"{symbol}@bookTicker/{symbol}@markPrice@1s/{symbol}@forceOrder"
-        )
-        base = self.ws_base_url.rstrip("/")
-        return f"{base}?streams={streams}"
+        root = self.ws_base_url.rstrip("/")
+        if group == "depth":
+            streams = f"{symbol}@depth@100ms/{symbol}@bookTicker"
+            endpoint = f"{root}/public/stream"
+        else:
+            streams = (
+                f"{symbol}@aggTrade/{symbol}@kline_1m/"
+                f"{symbol}@markPrice@1s/{symbol}@forceOrder"
+            )
+            endpoint = f"{root}/market/stream"
+        return f"{endpoint}?streams={streams}"
 
-    def _run_forever(self) -> None:
+    def _run_forever(self, group: str = "market") -> None:
         delay = 1.0
         while not self._stop.is_set():
-            self._set_connection("connecting")
+            self._set_connection("connecting", group=group)
             try:
-                self._ws = websocket.WebSocketApp(
-                    self._stream_url(),
-                    on_open=self._on_open,
+                ws = websocket.WebSocketApp(
+                    self._stream_url(group),
+                    on_open=lambda socket: self._on_open(socket, group),
                     on_message=self._on_message,
-                    on_error=self._on_error,
-                    on_close=self._on_close,
+                    on_error=lambda socket, error: self._on_error(socket, error, group),
+                    on_close=lambda socket, code, message: self._on_close(socket, code, message, group),
                 )
-                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+                if group == "depth":
+                    self._ws_depth = ws
+                else:
+                    self._ws = ws
+                ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as exc:
-                self._set_connection("disconnected", f"{type(exc).__name__}: {exc}")
+                self._set_connection("disconnected", f"{type(exc).__name__}: {exc}", group=group)
             if self._stop.is_set():
                 break
-            with self.lock:
-                self.data["book_synced"] = False
-                self.data["sequence_gap_unresolved"] = True
-                self.data["book_sync_error"] = "WebSocket disconnected; awaiting fresh snapshot"
-            self._set_connection(f"reconnecting in {delay:.0f}s")
+            if group == "depth":
+                with self.lock:
+                    self.data["book_synced"] = False
+                    self.data["sequence_gap_unresolved"] = True
+                    self.data["book_sync_error"] = "Depth WebSocket disconnected; awaiting fresh snapshot"
+                    self._depth_buffer.clear()
+                    self._depth_buffer_overflow = False
+            self._set_connection(f"reconnecting in {delay:.0f}s", group=group)
             self._stop.wait(delay)
             delay = min(delay * 1.7, 15.0)
 
-    def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        self._set_connection("connected", "")
+    def _on_open(self, ws: websocket.WebSocketApp, group: str = "market") -> None:
+        self._set_connection("connected", "", group=group)
         with self.lock:
-            if self._ever_connected:
+            if self._ever_connected[group]:
                 self.data["total_reconnects"] += 1
-            self._ever_connected = True
-            self.data["book_synced"] = False
-            self.data["sequence_gap_unresolved"] = True
-            self.data["book_sync_error"] = "Syncing REST depth snapshot with WebSocket diffs"
-        self._start_book_sync()
+            self._ever_connected[group] = True
+            if group == "depth":
+                self.data["book_synced"] = False
+                self.data["sequence_gap_unresolved"] = True
+                self.data["book_sync_error"] = "Syncing REST depth snapshot with WebSocket diffs"
+                self._depth_buffer.clear()
+                self._depth_buffer_overflow = False
+        if group == "depth":
+            self._start_book_sync()
 
-    def _on_error(self, ws: websocket.WebSocketApp, error: Any) -> None:
-        self._set_connection("socket error", str(error))
-        with self.lock:
-            self.data["book_synced"] = False
-            self.data["sequence_gap_unresolved"] = True
+    def _on_error(
+        self, ws: websocket.WebSocketApp, error: Any, group: str = "market"
+    ) -> None:
+        self._set_connection("socket error", str(error), group=group)
+        if group == "depth":
+            with self.lock:
+                self.data["book_synced"] = False
+                self.data["sequence_gap_unresolved"] = True
 
-    def _on_close(self, ws: websocket.WebSocketApp, code: Any, message: Any) -> None:
+    def _on_close(
+        self, ws: websocket.WebSocketApp, code: Any, message: Any, group: str = "market"
+    ) -> None:
         with self.lock:
             self.data["total_disconnects"] += 1
-            self.data["book_synced"] = False
-            self.data["sequence_gap_unresolved"] = True
-        self._set_connection("disconnected", f"close={code}; {message or ''}")
+            if group == "depth":
+                self.data["book_synced"] = False
+                self.data["sequence_gap_unresolved"] = True
+                self._depth_buffer.clear()
+                self._depth_buffer_overflow = False
+        self._set_connection("disconnected", f"close={code}; {message or ''}", group=group)
+
 
     def _on_message(self, ws: websocket.WebSocketApp, raw: str) -> None:
         received_at = time.time()
@@ -614,7 +678,7 @@ class BinanceUSDMFeed:
                 self._depth_buffer.append(dict(event))
                 return
             last_id = self.data.get("book_last_update_id")
-            action = depth_update_action(int(last_id or 0), event)
+            action = depth_update_action(int(last_id or 0), event, require_previous=True)
             if action == "stale":
                 return
             if action == "gap":
@@ -681,8 +745,11 @@ class BinanceUSDMFeed:
                         buffered = list(self._depth_buffer)
                         self._depth_buffer.clear()
                         last_id = snapshot_id
+                        have_applied_buffered_event = False
                         for index, event in enumerate(buffered):
-                            action = depth_update_action(last_id, event)
+                            action = depth_update_action(
+                                last_id, event, require_previous=have_applied_buffered_event
+                            )
                             if action == "stale":
                                 continue
                             if action == "gap":
@@ -690,12 +757,14 @@ class BinanceUSDMFeed:
                                 synchronized = False
                                 self.data["sequence_gaps"] += 1
                                 self.data["book_sync_error"] = (
-                                    f"Buffered depth gap: local={last_id}, U={event.get('U')}, u={event.get('u')}"
+                                    f"Buffered depth gap: local={last_id}, U={event.get('U')}, "
+                                    f"pu={event.get('pu')}, u={event.get('u')}"
                                 )
                                 break
                             _apply_depth_levels(bids, event.get("b", []), keep_high=True)
                             _apply_depth_levels(asks, event.get("a", []), keep_high=False)
                             last_id = int(event["u"])
+                            have_applied_buffered_event = True
                     if synchronized:
                         self.data["bids"] = bids
                         self.data["asks"] = asks
