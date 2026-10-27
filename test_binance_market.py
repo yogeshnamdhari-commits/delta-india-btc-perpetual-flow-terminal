@@ -22,6 +22,13 @@ class BinanceNormalizationTests(unittest.TestCase):
         self.assertEqual(sell["side"], "SELL")
         self.assertAlmostEqual(buy["notional_usd_approx"], 2000.0)
         self.assertAlmostEqual(sell["size_btc"], 0.03)
+        # If Binance supplies nq, use the explicit non-RPI quantity for flow.
+        rpi_mixed = normalize_agg_trade({
+            "p": "100000", "q": "0.20", "nq": "0.15",
+            "T": 1_700_000_002_000, "m": False, "a": 9
+        })
+        self.assertAlmostEqual(rpi_mixed["reported_size_btc"], 0.20)
+        self.assertAlmostEqual(rpi_mixed["size_btc"], 0.15)
 
     def test_bad_or_incomplete_trade_is_rejected(self):
         self.assertIsNone(normalize_agg_trade({"p": "NaN", "q": "1", "T": 1_700_000_000_000, "m": False}))
@@ -74,6 +81,18 @@ class BinanceNormalizationTests(unittest.TestCase):
         self.assertEqual(depth_update_action(100, {"U": 101, "u": 105}), "apply")
         self.assertEqual(depth_update_action(100, {"U": 102, "u": 105}), "gap")
         self.assertEqual(depth_update_action(100, {"u": 105}), "gap")
+        self.assertEqual(
+            depth_update_action(105, {"U": 106, "u": 109, "pu": 105}, require_previous=True),
+            "apply",
+        )
+        self.assertEqual(
+            depth_update_action(105, {"U": 106, "u": 109, "pu": 104}, require_previous=True),
+            "gap",
+        )
+        self.assertEqual(
+            depth_update_action(105, {"U": 106, "u": 109}, require_previous=True),
+            "gap",
+        )
 
     def test_liquidation_buckets_are_observed_historical_events(self):
         events = [
@@ -102,17 +121,25 @@ class BinanceNormalizationTests(unittest.TestCase):
         }
         get.return_value = response
         feed = BinanceUSDMFeed()
-        feed._depth_buffer.append({
-            "U": 99, "u": 101,
-            "b": [["99500", "3.0"]],
-            "a": [["101000", "0"]],
-        })
+        feed.data["depth_connection"] = "connected"
+        feed._depth_buffer.extend([
+            {
+                "U": 99, "u": 101,
+                "b": [["99500", "3.0"]],
+                "a": [["101000", "0"]],
+            },
+            {
+                "U": 102, "u": 103, "pu": 101,
+                "b": [["99500", "4.0"]],
+                "a": [["102000", "1.0"]],
+            },
+        ])
         feed._sync_book_loop()
         snapshot = feed.snapshot()
         self.assertTrue(snapshot["book_synced"])
         self.assertFalse(snapshot["sequence_gap_unresolved"])
-        self.assertEqual(snapshot["book_last_update_id"], 101)
-        self.assertAlmostEqual(snapshot["bids"][99500.0], 3.0)
+        self.assertEqual(snapshot["book_last_update_id"], 103)
+        self.assertAlmostEqual(snapshot["bids"][99500.0], 4.0)
         self.assertNotIn(101000.0, snapshot["asks"])
         self.assertAlmostEqual(snapshot["asks"][101000.0] if 101000.0 in snapshot["asks"] else 0.0, 0.0)
         get.assert_called_once()
@@ -126,6 +153,19 @@ class BinanceNormalizationTests(unittest.TestCase):
         self.assertAlmostEqual(snapshot["sell_volume_btc"], 0.03)
         self.assertAlmostEqual(snapshot["cvd_value_btc"], -0.01)
         self.assertEqual(snapshot["trade_count"], 2)
+
+    def test_websocket_streams_use_documented_market_and_public_paths(self):
+        feed = BinanceUSDMFeed()
+        market_url = feed._stream_url("market")
+        depth_url = feed._stream_url("depth")
+        self.assertIn("/market/stream?streams=", market_url)
+        self.assertIn("btcusdt@aggTrade", market_url)
+        self.assertIn("btcusdt@forceOrder", market_url)
+        self.assertNotIn("@depth", market_url)
+        self.assertIn("/public/stream?streams=", depth_url)
+        self.assertIn("btcusdt@depth@100ms", depth_url)
+        self.assertIn("btcusdt@bookTicker", depth_url)
+        self.assertNotIn("@forceOrder", depth_url)
 
     def test_feed_initializes_read_only_and_analyst_context_is_explicit_about_limitations(self):
         feed = BinanceUSDMFeed()
