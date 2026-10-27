@@ -81,6 +81,12 @@ class BybitV5NormalizationTests(unittest.TestCase):
             previous_update_id=100, previous_sequence=1000,
         )
         self.assertEqual(seq_result[4], "sequence_regression")
+        gap_result = apply_book_update(
+            {100.0: 1.0}, {101.0: 1.0}, message_type="delta",
+            data={"u": 102, "seq": 1002, "b": [], "a": []},
+            previous_update_id=100, previous_sequence=1000,
+        )
+        self.assertEqual(gap_result[4], "update_id_gap")
 
     def test_liquidation_reports_bankruptcy_price_not_execution_price(self):
         row = normalize_liquidation({
