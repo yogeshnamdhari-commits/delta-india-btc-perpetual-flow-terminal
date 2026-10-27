@@ -90,6 +90,40 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertEqual(context["recent_trades"][0]["buyer_role"], "t")
 
 
+
+    def test_completed_candle_technical_metrics_use_explicit_formulas(self):
+        minute_now = int(self.now // 60) * 60
+        candles = []
+        for i in range(250):
+            close = 100.0 + i * 0.1
+            candles.append({
+                "time": minute_now - (250 - i) * 60,
+                "open": close - 0.05,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": 10.0,
+            })
+        self.feed["candles"] = candles
+        context = build_market_context(self.feed, now_epoch=self.now)
+        metrics = context["technical_indicators_1m"]
+        self.assertEqual(metrics["completed_candle_count"], 250)
+        self.assertEqual(metrics["ema_alignment"], "bullish_alignment")
+        self.assertAlmostEqual(metrics["atr_14_price"], 2.0, places=5)
+        self.assertAlmostEqual(metrics["latest_volume_vs_preceding_20_mean_ratio"], 1.0, places=5)
+        self.assertIsNotNone(metrics["ema_20_50_144_200"]["200"]["value"])
+        self.assertIn("seeded with the first period's SMA", metrics["ema_method"])
+
+    def test_order_book_imbalance_is_only_reported_with_valid_book_health(self):
+        context = build_market_context(self.feed, now_epoch=self.now)
+        book = context["order_book"]
+        self.assertTrue(book["imbalance_data_valid"])
+        self.assertAlmostEqual(book["top_5_imbalance_pct_calculated"], (15 - 12) / 27 * 100)
+        self.feed["checksum_ok"] = False
+        invalid = build_market_context(self.feed, now_epoch=self.now)
+        self.assertIsNone(invalid["order_book"]["top_5_imbalance_pct_calculated"])
+        self.assertFalse(invalid["order_book"]["imbalance_data_valid"])
+
     def test_cross_venue_context_is_preserved_as_a_separate_source(self):
         self.feed["cross_venue_binance_context"] = {
             "venue": "Binance USDⓈ-M Futures",
