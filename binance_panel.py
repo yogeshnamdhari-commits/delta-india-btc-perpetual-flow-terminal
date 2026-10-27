@@ -232,8 +232,9 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
             "Time (IST)": _time_ist(row.get("timestamp")),
             "Aggressor": row.get("side"),
             "Price": row.get("price"),
-            "Size (BTC)": row.get("size_btc"),
-            "Approx. notional (USDT)": row.get("notional_usd_approx"),
+            "Flow size ex-RPI (BTC)": row.get("normal_size_ex_rpi_btc", row.get("size_btc")),
+            "Reported aggTrade size q (BTC)": row.get("reported_size_btc", row.get("size_btc")),
+            "Approx. flow notional (USDT)": row.get("notional_usd_approx"),
         } for row in recent_trades]
         st.dataframe(pd.DataFrame(trade_rows), use_container_width=True, hide_index=True)
     else:
@@ -248,6 +249,7 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
     trade_cols[3].metric("Trades observed this session", str(snap.get("trade_count", 0)))
     st.caption(
         "CVD is calculated locally from aggTrade buyer-maker flags, in BTC, only since this process started. "
+        "Where Binance provides nq, flow uses the non-RPI quantity; reported q is shown separately. "
         "It resets on restart and is not Binance's historical CVD."
     )
 
