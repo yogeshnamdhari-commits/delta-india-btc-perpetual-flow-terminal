@@ -469,6 +469,20 @@ class BybitV5Feed:
             self.data["book_integrity_message"] = "Subscribed; waiting for Bybit full book snapshot"
             self.data["depth_restarts"] += 1
         ws.send(json.dumps({"op": "subscribe", "args": topics}))
+        threading.Thread(
+            target=self._heartbeat_loop, args=(ws,),
+            name="bybit-v5-json-heartbeat", daemon=True
+        ).start()
+
+    def _heartbeat_loop(self, ws: websocket.WebSocketApp) -> None:
+        # Bybit V5 documents application-level JSON ping/pong heartbeats.
+        while not self._stop.wait(20.0):
+            if ws is not self._ws:
+                return
+            try:
+                ws.send(json.dumps({"op": "ping"}))
+            except Exception:
+                return
 
     def _on_error(self, ws: websocket.WebSocketApp, error: Any) -> None:
         self._set_connection("socket error", str(error))
@@ -610,7 +624,7 @@ class BybitV5Feed:
                 value = _number(payload[source])
                 if target in {"last_price", "mark_price", "index_price", "bid", "ask"}:
                     value = _positive(payload[source])
-                if value is not None and value >= 0:
+                if value is not None and (target == "funding_rate" or value >= 0):
                     self.data[target] = value
             if "nextFundingTime" in payload:
                 value = _ms_to_seconds(payload["nextFundingTime"])
@@ -680,7 +694,6 @@ class BybitV5Feed:
                         target = self.data["candles_by_interval"][timeframe]
                         for candle in rows:
                             target[int(candle["time"])] = candle
-                        self.data["candles"][int(next(iter(sorted(target))))] = next(iter(sorted(target.values(), key=lambda r: r["time"]))) if timeframe == "1m" and target else None
                         # Keep the legacy 1m map in sync without injecting other intervals.
                         if timeframe == "1m":
                             self.data["candles"] = target
