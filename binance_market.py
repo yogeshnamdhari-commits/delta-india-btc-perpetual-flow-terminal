@@ -317,6 +317,7 @@ class BinanceUSDMFeed:
             "candles_by_interval": {"5m": {}, "15m": {}, "1h": {}},
             "candle_history_loaded": {"1m": False, "5m": False, "15m": False, "1h": False},
             "candle_history_updated_at": {},
+            "candle_history_errors": {"1m": "", "5m": "", "15m": "", "1h": ""},
             "cvd": deque(maxlen=5000),
             "cvd_value_btc": 0.0,
             "buy_volume_btc": 0.0,
@@ -390,6 +391,7 @@ class BinanceUSDMFeed:
             }
             result["candle_history_loaded"] = dict(self.data["candle_history_loaded"])
             result["candle_history_updated_at"] = dict(self.data["candle_history_updated_at"])
+            result["candle_history_errors"] = dict(self.data["candle_history_errors"])
             result["cvd"] = list(self.data["cvd"])
             result["liquidations"] = [dict(x) for x in reversed(self.data["liquidations"])]
             result["ticker_24h"] = dict(self.data["ticker_24h"])
@@ -855,6 +857,8 @@ class BinanceUSDMFeed:
                     response.raise_for_status()
                     payload = response.json()
                     rows = [row for row in (normalize_rest_kline(x) for x in payload) if row]
+                    if not rows:
+                        raise ValueError(f"REST returned no valid {interval} candles")
                     with self.lock:
                         target = self.data["candles_by_interval"].setdefault(interval, {})
                         for candle in rows:
@@ -865,14 +869,15 @@ class BinanceUSDMFeed:
                                 target.pop(key, None)
                         self.data["candle_history_loaded"][interval] = True
                         self.data["candle_history_updated_at"][interval] = time.time()
+                        self.data["candle_history_errors"][interval] = ""
                         self.data["last_rest_poll_at"] = time.time()
                         self.data["last_rest_error"] = ""
                     candles_loaded.add(interval)
                 except Exception as exc:
                     with self.lock:
-                        self.data["last_rest_error"] = (
-                            f"Initial {interval} klines failed: {type(exc).__name__}: {exc}"
-                        )[:400]
+                        error_text = f"Initial {interval} klines failed: {type(exc).__name__}: {exc}"[:400]
+                        self.data["candle_history_errors"][interval] = error_text
+                        self.data["last_rest_error"] = error_text
             if now - last_oi >= 30:
                 try:
                     response = requests.get(
