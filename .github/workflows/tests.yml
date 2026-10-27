@@ -130,6 +130,70 @@ jobs:
               raise SystemExit("Kilo live response smoke test failed for all candidate free models. Last error: " + str(last_error))
           PY
 
+  binance-public-feed-smoke:
+    # Informational live integration check: the exchange or hosted runner can
+    # occasionally be unavailable, so unit/contract tests remain the required gate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install app dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Verify live read-only Binance USDⓈ-M feed
+        run: |
+          python - <<'PY'
+          import time
+          from binance_market import BinanceUSDMFeed
+
+          feed = BinanceUSDMFeed(request_timeout=8)
+          feed.start()
+          deadline = time.monotonic() + 35
+          latest = {}
+          try:
+              while time.monotonic() < deadline:
+                  latest = feed.snapshot()
+                  history = latest.get("candle_history_loaded") or {}
+                  checks = {
+                      "market_stream_trade": latest.get("last_price") is not None,
+                      "mark_and_funding": latest.get("mark_price") is not None
+                          and latest.get("funding_rate") is not None,
+                      "sequence_synchronized_depth": bool(latest.get("book_synced"))
+                          and not bool(latest.get("sequence_gap_unresolved")),
+                      "open_interest_rest": latest.get("open_interest_btc") is not None,
+                      "native_1m_history": bool(history.get("1m")),
+                      "native_5m_history": bool(history.get("5m")),
+                      "native_15m_history": bool(history.get("15m")),
+                      "native_1h_history": bool(history.get("1h")),
+                  }
+                  if all(checks.values()):
+                      print("BINANCE_PUBLIC_FEED_SMOKE_OK")
+                      print("checks=" + repr(checks))
+                      print("symbol=" + str(latest.get("symbol")))
+                      print("market_connection=" + str(latest.get("market_connection")))
+                      print("depth_connection=" + str(latest.get("depth_connection")))
+                      print("book_update_id=" + str(latest.get("book_last_update_id")))
+                      print("channel_message_counts=" + repr(latest.get("channel_message_counts")))
+                      break
+                  time.sleep(0.25)
+              else:
+                  print("BINANCE_PUBLIC_FEED_SMOKE_INCOMPLETE")
+                  print("checks=" + repr(checks))
+                  print("market_connection=" + str(latest.get("market_connection")))
+                  print("depth_connection=" + str(latest.get("depth_connection")))
+                  print("book_sync_error=" + str(latest.get("book_sync_error")))
+                  print("last_error=" + str(latest.get("last_error")))
+                  print("last_rest_error=" + str(latest.get("last_rest_error")))
+                  print("history_errors=" + repr(latest.get("candle_history_errors")))
+                  raise SystemExit("Live Binance feed did not become fully ready within 35 seconds.")
+          finally:
+              feed.stop()
+          PY
+
   macos-app-smoke:
     runs-on: macos-14
     steps:
