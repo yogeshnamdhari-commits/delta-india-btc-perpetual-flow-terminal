@@ -89,6 +89,22 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertEqual(len(context["recent_trades"]), 2)
         self.assertEqual(context["recent_trades"][0]["buyer_role"], "t")
 
+
+    def test_cross_venue_context_is_preserved_as_a_separate_source(self):
+        self.feed["cross_venue_binance_context"] = {
+            "venue": "Binance USDⓈ-M Futures",
+            "symbol": "BTCUSDT",
+            "open_interest_btc": 12.5,
+            "order_book": {"synced_by_update_ids": True, "bids": [{"price": 100, "size_btc": 0.1}]},
+            "liquidation_data_limitations": ["not a complete market-wide census"],
+        }
+        context = build_market_context(self.feed, now_epoch=self.now)
+        self.assertEqual(context["cross_venue_market_data"]["venue"], "Binance USDⓈ-M Futures")
+        self.assertEqual(context["cross_venue_market_data"]["open_interest_btc"], 12.5)
+        self.assertEqual(context["instrument"]["venue"], "Delta Exchange India")
+        prompt = _question_with_context("Explain BTC structure in detail.", context)
+        self.assertIn("separately labeled Binance", prompt)
+
     def test_flow_context_marks_historical_validation_as_unavailable(self):
         context = build_market_context(self.feed, now_epoch=self.now)
         self.assertTrue(context["recent_15m_aggressor_flow"])
