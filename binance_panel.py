@@ -98,7 +98,8 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
     snap = feed.snapshot()
     delta = delta_feed.snapshot() if delta_feed is not None else {}
     now = time.time()
-    last_message = snap.get("last_market_message_at") or snap.get("last_any_message_at")
+    # Do not let a live depth-only stream make a stalled market stream look fresh.
+    last_message = snap.get("last_market_message_at")
     feed_age = now - float(last_message) if last_message else None
 
     st.markdown("---")
@@ -297,7 +298,8 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
         st.caption(
             "Source: Binance USDⓈ-M forceOrder WebSocket. Its documented snapshot stream publishes at most "
             "the latest liquidation order per symbol per 1-second interval. Results below are observed feed "
-            "messages with reported filled quantity; they are not a complete liquidation census or predictive levels."
+            "messages with reported filled quantity; they are not a complete liquidation census or predictive levels. "
+            "The in-memory buffer is bounded to recent snapshots, so heavy activity can truncate apparent trailing-hour coverage."
         )
         liquidations = snap.get("liquidations", [])
         recent_liquidations = liquidations[:25] if isinstance(liquidations, list) else []
