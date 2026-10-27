@@ -503,11 +503,9 @@ class BybitV5Feed:
             message = json.loads(raw)
             if not isinstance(message, dict):
                 return
-            if message.get("op") == "ping":
-                try:
-                    ws.send(json.dumps({"op": "pong"}))
-                except Exception:
-                    pass
+            # Bybit replies to an application-level ping with op="ping" and
+            # ret_msg="pong". It is an acknowledgement, not a request for a pong.
+            if message.get("op") in {"ping", "pong"}:
                 return
             if message.get("success") is False:
                 self._set_connection("subscription error", str(message.get("ret_msg") or message))
