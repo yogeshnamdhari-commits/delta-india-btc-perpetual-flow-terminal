@@ -593,6 +593,11 @@ class BinanceUSDMFeed:
             if not isinstance(payload, dict):
                 return
             event_type = payload.get("e")
+            # Binance's individual-symbol bookTicker payload is documented
+            # without an event-type field; identify it from the combined
+            # stream name rather than silently dropping bid/ask updates.
+            if event_type is None and "@bookticker" in str(stream).lower():
+                event_type = "bookTicker"
             if event_type == "kline":
                 kline_payload = payload.get("k", {})
                 interval = kline_payload.get("i", "unknown") if isinstance(kline_payload, dict) else "unknown"
