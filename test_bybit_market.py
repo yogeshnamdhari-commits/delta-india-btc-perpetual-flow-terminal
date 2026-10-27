@@ -105,6 +105,18 @@ class BybitV5NormalizationTests(unittest.TestCase):
         self.assertEqual(sell["observed_liquidation_messages"], 2)
         self.assertAlmostEqual(sell["observed_size_btc"], 0.3)
 
+
+    def test_ping_acknowledgement_is_not_answered_with_invalid_pong_operation(self):
+        feed = BybitV5Feed()
+        ws = Mock()
+        feed._on_message(ws, json.dumps({
+            "success": True,
+            "ret_msg": "pong",
+            "conn_id": "test",
+            "op": "ping",
+        }))
+        ws.send.assert_not_called()
+
     def test_ws_topics_use_bybit_public_linear_stream(self):
         feed = BybitV5Feed()
         self.assertEqual(feed.ws_url, "wss://stream.bybit.com/v5/public/linear")
