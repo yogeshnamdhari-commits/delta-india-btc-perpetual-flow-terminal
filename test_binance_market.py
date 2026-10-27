@@ -169,6 +169,27 @@ class BinanceNormalizationTests(unittest.TestCase):
         self.assertAlmostEqual(snapshot["cvd_value_btc"], -0.01)
         self.assertEqual(snapshot["trade_count"], 2)
 
+
+    def test_combined_book_ticker_without_event_type_updates_best_quotes(self):
+        feed = BinanceUSDMFeed()
+        feed._on_message(None, json.dumps({
+            "stream": "btcusdt@bookTicker",
+            "data": {
+                "u": 123,
+                "s": "BTCUSDT",
+                "b": "100000.0",
+                "B": "1.25",
+                "a": "100001.0",
+                "A": "0.75",
+            },
+        }))
+        snapshot = feed.snapshot()
+        self.assertEqual(snapshot["bid"], 100000.0)
+        self.assertEqual(snapshot["ask"], 100001.0)
+        self.assertEqual(snapshot["bid_size_btc"], 1.25)
+        self.assertEqual(snapshot["ask_size_btc"], 0.75)
+        self.assertEqual(snapshot["channel_message_counts"]["bookTicker"], 1)
+
     def test_websocket_streams_use_documented_market_and_public_paths(self):
         feed = BinanceUSDMFeed()
         market_url = feed._stream_url("market")
