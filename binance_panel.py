@@ -347,6 +347,19 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
             st.dataframe(pd.DataFrame(channel_rows), use_container_width=True, hide_index=True)
         else:
             st.info("No Binance public channel messages have arrived yet.")
+        st.markdown("**Native candle-history status**")
+        candle_sets = snap.get("candles_by_interval") or {}
+        history_loaded = snap.get("candle_history_loaded") or {}
+        history_updated = snap.get("candle_history_updated_at") or {}
+        history_errors = snap.get("candle_history_errors") or {}
+        history_rows = [{
+            "Timeframe": timeframe,
+            "REST history loaded": bool(history_loaded.get(timeframe)),
+            "Candles in memory": len(candle_sets.get(timeframe, [])),
+            "Last REST history load (IST)": _time_ist(history_updated.get(timeframe)),
+            "History error": history_errors.get(timeframe) or "—",
+        } for timeframe in TIMEFRAME_SECONDS]
+        st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
         diag_cols = st.columns(4)
         diag_cols[0].metric("Messages total", str(snap.get("total_messages_received", 0)))
         diag_cols[1].metric("Disconnects", str(snap.get("total_disconnects", 0)))
@@ -390,6 +403,7 @@ def render_binance_cross_venue_panel(delta_feed: Any = None) -> dict[str, Any]:
                 ).isoformat()
                 if (binance_snapshot.get("candle_history_updated_at") or {}).get(timeframe) else None
             ),
+            "history_error": (binance_snapshot.get("candle_history_errors") or {}).get(timeframe) or None,
         }
         for timeframe in TIMEFRAME_SECONDS
     }
