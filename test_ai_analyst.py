@@ -10,6 +10,7 @@ from ai_analyst import (
     _extract_chat_completion_text,
     _extract_responses_api_text,
     _question_with_context,
+    _technical_indicators,
     build_market_context,
 )
 
@@ -113,6 +114,37 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["latest_volume_vs_preceding_20_mean_ratio"], 1.0, places=5)
         self.assertIsNotNone(metrics["ema_20_50_144_200"]["200"]["value"])
         self.assertIn("seeded with the first period's SMA", metrics["ema_method"])
+
+    def test_technical_indicators_respect_native_five_minute_candle_boundary(self):
+        five_minute_now = int(self.now // 300) * 300
+        candles = []
+        for i in range(250):
+            close = 1000.0 + i * 0.5
+            candles.append({
+                "time": five_minute_now - (250 - i) * 300,
+                "open": close - 0.1,
+                "high": close + 2.0,
+                "low": close - 2.0,
+                "close": close,
+                "volume": 30.0,
+                "is_closed": True,
+            })
+        # Deliberately in-progress candle must never be included.
+        candles.append({
+            "time": five_minute_now,
+            "open": 1125.0, "high": 1130.0, "low": 1120.0, "close": 1125.0,
+            "volume": 999.0, "is_closed": False,
+        })
+        metrics = _technical_indicators(
+            {"candles": candles, "candle_interval_seconds": 300, "timeframe": "5m"},
+            now_epoch=self.now,
+            current_price=1125.0,
+        )
+        self.assertEqual(metrics["timeframe"], "5m")
+        self.assertEqual(metrics["completed_candle_count"], 250)
+        self.assertAlmostEqual(metrics["latest_closed_volume"], 30.0)
+        self.assertEqual(metrics["ema_alignment"], "bullish_alignment")
+        self.assertIsNotNone(metrics["ema_200"]["value"] if "ema_200" in metrics else metrics["ema_20_50_144_200"]["200"]["value"])
 
     def test_order_book_imbalance_is_only_reported_with_valid_book_health(self):
         context = build_market_context(self.feed, now_epoch=self.now)
