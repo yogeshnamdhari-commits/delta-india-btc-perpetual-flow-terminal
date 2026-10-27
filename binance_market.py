@@ -121,9 +121,10 @@ def normalize_liquidation_event(event: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(order, dict):
         return None
     price = _positive(order.get("ap")) or _positive(order.get("p"))
-    # z is cumulative filled quantity; l is the last filled quantity. Never use q
-    # (original order quantity) as if it were executed.
-    qty_btc = _positive(order.get("z")) or _positive(order.get("l"))
+    # l is the last filled quantity. Do not aggregate z (cumulative fill) across
+    # snapshots: doing so could count the same earlier fills more than once.
+    # Never use q (original order quantity) as if it were executed.
+    qty_btc = _positive(order.get("l"))
     timestamp = _seconds_from_ms(order.get("T") or event.get("E"))
     side = str(order.get("S", "")).upper()
     symbol = str(order.get("s", event.get("s", ""))).upper()
