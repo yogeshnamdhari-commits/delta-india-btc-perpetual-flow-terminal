@@ -187,19 +187,19 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertIn("overshoot_points_calculated", prompt)
 
     def test_cross_venue_context_is_preserved_as_a_separate_source(self):
-        self.feed["cross_venue_binance_context"] = {
-            "venue": "Binance USDⓈ-M Futures",
+        self.feed["cross_venue_market_data"] = {
+            "venue": "Bybit V5 Linear",
             "symbol": "BTCUSDT",
             "open_interest_btc": 12.5,
-            "order_book": {"synced_by_update_ids": True, "bids": [{"price": 100, "size_btc": 0.1}]},
-            "liquidation_data_limitations": ["not a complete market-wide census"],
+            "order_book": {"synced_from_bybit_snapshot_deltas": True, "bids_top5": [{"price": 100, "size_btc": 0.1}]},
+            "liquidation_data_limitations": ["not a predictive map of untriggered liquidation prices"],
         }
         context = build_market_context(self.feed, now_epoch=self.now)
-        self.assertEqual(context["cross_venue_market_data"]["venue"], "Binance USDⓈ-M Futures")
+        self.assertEqual(context["cross_venue_market_data"]["venue"], "Bybit V5 Linear")
         self.assertEqual(context["cross_venue_market_data"]["open_interest_btc"], 12.5)
         self.assertEqual(context["instrument"]["venue"], "Delta Exchange India")
         prompt = _question_with_context("Explain BTC structure in detail.", context)
-        self.assertIn("separately labeled Binance", prompt)
+        self.assertIn("separately labeled alternative-exchange", prompt)
 
     def test_flow_context_marks_historical_validation_as_unavailable(self):
         context = build_market_context(self.feed, now_epoch=self.now)
