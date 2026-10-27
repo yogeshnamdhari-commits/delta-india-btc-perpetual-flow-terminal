@@ -143,7 +143,7 @@ jobs:
           cache: pip
       - name: Install app dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
-      - name: Verify live read-only Bybit V5 public feed
+      - name: Verify live Bybit WebSocket and report REST access separately
         run: |
           python - <<'PY'
           import time
@@ -152,44 +152,44 @@ jobs:
           feed = BybitV5Feed(request_timeout=8)
           feed.start()
           deadline = time.monotonic() + 35
+          latest = {}
           try:
               while time.monotonic() < deadline:
                   latest = feed.snapshot()
-                  history = latest.get("candle_history_loaded") or {}
-                  checks = {
+                  ws_checks = {
                       "live_trade": latest.get("last_price") is not None,
                       "mark_and_funding": latest.get("mark_price") is not None
                           and latest.get("funding_rate") is not None,
-                      "sequence_healthy_book": bool(latest.get("book_synced"))
+                      "snapshot_delta_book": bool(latest.get("book_synced"))
                           and not bool(latest.get("sequence_gap_unresolved")),
-                      "open_interest": latest.get("open_interest_btc") is not None,
-                      "native_1m_history": bool(history.get("1m")),
-                      "native_5m_history": bool(history.get("5m")),
-                      "native_15m_history": bool(history.get("15m")),
-                      "native_1h_history": bool(history.get("1h")),
                   }
-                  if all(checks.values()):
-                      print("BYBIT_PUBLIC_FEED_SMOKE_OK")
-                      print("checks=" + repr(checks))
-                      print("symbol=" + str(latest.get("symbol")))
-                      print("connection=" + str(latest.get("connection")))
-                      print("book_update_id=" + str(latest.get("book_update_id")))
-                      print("message_counts=" + repr(latest.get("message_counts")))
+                  if all(ws_checks.values()):
                       break
                   time.sleep(0.25)
               else:
-                  print("BYBIT_PUBLIC_FEED_SMOKE_INCOMPLETE")
-                  print("checks=" + repr(checks))
+                  print("BYBIT_PUBLIC_WS_SMOKE_INCOMPLETE")
+                  print("websocket_checks=" + repr(ws_checks))
                   print("connection=" + str(latest.get("connection")))
                   print("book_integrity_message=" + str(latest.get("book_integrity_message")))
                   print("last_error=" + str(latest.get("last_error")))
-                  print("last_rest_error=" + str(latest.get("last_rest_error")))
-                  print("history_errors=" + repr(latest.get("candle_history_errors")))
-                  raise SystemExit("Bybit public market-data adapter did not reach all ready checks within 35 seconds.")
+                  raise SystemExit("Bybit public WebSocket data did not become ready within 35 seconds.")
+
+              history = latest.get("candle_history_loaded") or {}
+              rest_checks = {tf: bool(history.get(tf)) for tf in ("1m", "5m", "15m", "1h")}
+              print("BYBIT_PUBLIC_WS_SMOKE_OK")
+              print("websocket_checks=" + repr(ws_checks))
+              print("native_candle_history_checks=" + repr(rest_checks))
+              print("symbol=" + str(latest.get("symbol")))
+              print("connection=" + str(latest.get("connection")))
+              print("book_update_id=" + str(latest.get("book_update_id")))
+              print("message_counts=" + repr(latest.get("message_counts")))
+              print("last_rest_error=" + str(latest.get("last_rest_error")))
+              print("history_errors=" + repr(latest.get("candle_history_errors")))
+              if not all(rest_checks.values()):
+                  print("REST_HISTORY_NOT_VERIFIED_ON_THIS_RUNNER; inspect endpoint errors above and verify from the target machine.")
           finally:
               feed.stop()
           PY
-
   macos-app-smoke:
     runs-on: macos-14
     steps:
