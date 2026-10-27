@@ -293,7 +293,7 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
         "It resets on restart and is not Binance's historical CVD."
     )
 
-    with st.expander("Observed Binance liquidation executions and price buckets", expanded=True):
+    with st.expander("Observed Binance liquidation-order snapshots and price buckets", expanded=True):
         st.caption(
             "Source: Binance USDⓈ-M forceOrder WebSocket. Its documented snapshot stream publishes at most "
             "the latest liquidation order per symbol per 1-second interval. Results below are observed feed "
