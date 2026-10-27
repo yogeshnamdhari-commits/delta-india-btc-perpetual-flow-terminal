@@ -44,6 +44,9 @@ Rules:
 - Separate observed exchange facts, locally calculated metrics, analytical
   inferences, and unavailable data. State when a value is absent, stale, or
   derived from a bounded session window.
+- When cross-venue multi-timeframe candles are provided, compare the independent
+  1m, 5m, 15m and 1h measurements. State which timeframes align or conflict,
+  and explicitly note "insufficient lookback" rather than inventing EMA values.
 - Never invent prices, order-book levels, funding, open interest, liquidation
   executions, historical coverage, backtest results, or a win rate.
 - Do not mix Delta contract counts with Binance BTC quantity. Do not treat BTCUSD
