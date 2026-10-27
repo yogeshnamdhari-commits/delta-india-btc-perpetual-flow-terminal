@@ -162,7 +162,7 @@ def depth_update_action(last_update_id: int, event: dict[str, Any]) -> str:
     return "apply"
 
 
-def _apply_depth_levels(book: dict[float, float], updates: Any) -> None:
+def _apply_depth_levels(book: dict[float, float], updates: Any, *, keep_high: bool) -> None:
     if not isinstance(updates, list):
         return
     for item in updates:
@@ -176,8 +176,8 @@ def _apply_depth_levels(book: dict[float, float], updates: Any) -> None:
         else:
             book[price] = qty
     if len(book) > _MAX_BOOK_LEVELS:
-        # Keep only the closest levels around the current market.
-        ordered = sorted(book, reverse=(book is not None))
+        # Retain the best-priced depth: highest bid prices, lowest ask prices.
+        ordered = sorted(book, reverse=keep_high)
         for price in ordered[_MAX_BOOK_LEVELS:]:
             book.pop(price, None)
 
@@ -308,6 +308,7 @@ class BinanceUSDMFeed:
         self._depth_buffer_overflow = False
         self._ws: websocket.WebSocketApp | None = None
         self._liquidation_seen: set[tuple[Any, ...]] = set()
+        self._ever_connected = False
         self._liquidation_seen_order: deque[tuple[Any, ...]] = deque(maxlen=10000)
 
     def start(self) -> None:
@@ -470,7 +471,9 @@ class BinanceUSDMFeed:
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
         self._set_connection("connected", "")
         with self.lock:
-            self.data["total_reconnects"] += 1
+            if self._ever_connected:
+                self.data["total_reconnects"] += 1
+            self._ever_connected = True
             self.data["book_synced"] = False
             self.data["sequence_gap_unresolved"] = True
             self.data["book_sync_error"] = "Syncing REST depth snapshot with WebSocket diffs"
@@ -625,8 +628,8 @@ class BinanceUSDMFeed:
                 self._depth_buffer.append(dict(event))
                 sync_again = True
             else:
-                _apply_depth_levels(self.data["bids"], event.get("b", []))
-                _apply_depth_levels(self.data["asks"], event.get("a", []))
+                _apply_depth_levels(self.data["bids"], event.get("b", []), keep_high=True)
+                _apply_depth_levels(self.data["asks"], event.get("a", []), keep_high=False)
                 self.data["book_last_update_id"] = int(event["u"])
         if sync_again:
             self._start_book_sync()
@@ -689,8 +692,8 @@ class BinanceUSDMFeed:
                                     f"Buffered depth gap: local={last_id}, U={event.get('U')}, u={event.get('u')}"
                                 )
                                 break
-                            _apply_depth_levels(bids, event.get("b", []))
-                            _apply_depth_levels(asks, event.get("a", []))
+                            _apply_depth_levels(bids, event.get("b", []), keep_high=True)
+                            _apply_depth_levels(asks, event.get("a", []), keep_high=False)
                             last_id = int(event["u"])
                     if synchronized:
                         self.data["bids"] = bids
@@ -705,15 +708,22 @@ class BinanceUSDMFeed:
         finally:
             with self.lock:
                 self._book_sync_running = False
+                should_retry = (
+                    not self.data.get("book_synced", False) and not self._stop.is_set()
+                )
+            if should_retry:
+                self._start_book_sync()
 
     def _poll_rest(self) -> None:
         # REST requests are deliberately run off the Streamlit script thread.
         last_oi = 0.0
         last_ticker = 0.0
+        last_candle_attempt = 0.0
         candles_loaded = False
         while not self._stop.is_set():
             now = time.monotonic()
-            if not candles_loaded:
+            if not candles_loaded and now - last_candle_attempt >= 30:
+                last_candle_attempt = now
                 try:
                     response = requests.get(
                         f"{self.rest_base_url}/fapi/v1/klines",
