@@ -19,6 +19,26 @@ from binance_market import (
 )
 
 IST = ZoneInfo("Asia/Kolkata")
+TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+
+
+def _technical_by_timeframe(snapshot: dict[str, Any], now_epoch: float) -> dict[str, dict[str, Any]]:
+    """Calculate independent indicators from each venue-supplied candle timeframe."""
+    candle_sets = snapshot.get("candles_by_interval") or {"1m": snapshot.get("candles", [])}
+    current_price = snapshot.get("last_price")
+    result: dict[str, dict[str, Any]] = {}
+    for timeframe, interval_seconds in TIMEFRAME_SECONDS.items():
+        rows = candle_sets.get(timeframe, []) if isinstance(candle_sets, dict) else []
+        result[timeframe] = _technical_indicators(
+            {
+                "candles": rows,
+                "candle_interval_seconds": interval_seconds,
+                "timeframe": timeframe,
+            },
+            now_epoch=now_epoch,
+            current_price=current_price,
+        )
+    return result
 
 
 @st.cache_resource(show_spinner=False)
@@ -191,7 +211,7 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
     candles = [
         row for row in (snap.get("candles", []) or [])
         if isinstance(row, dict) and isinstance(row.get("time"), (int, float))
-        and float(row["time"]) + 60 <= now
+        and row.get("is_closed") is not False and float(row["time"]) + 60 <= now
     ]
     if candles:
         chart_rows = candles[-180:]
@@ -214,30 +234,35 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
     else:
         st.info("Waiting for initial Binance candle history. The live chart appears once completed 1-minute candles are available.")
 
-    technical = _technical_indicators(
-        {"candles": snap.get("candles", [])},
-        now_epoch=now,
-        current_price=snap.get("last_price"),
-    )
-    st.markdown("**Calculated Binance 1-minute technical context**")
-    tech_cols = st.columns(5)
-    ema_values = technical.get("ema_20_50_144_200", {})
-    tech_cols[0].metric("EMA alignment", str(technical.get("ema_alignment", "insufficient_lookback")).replace("_", " "))
-    tech_cols[1].metric("EMA 20", _price((ema_values.get("20") or {}).get("value")))
-    tech_cols[2].metric("EMA 50", _price((ema_values.get("50") or {}).get("value")))
-    tech_cols[3].metric("ATR 14", _price(technical.get("atr_14_price")))
-    volume_ratio = technical.get("latest_volume_vs_preceding_20_mean_ratio")
-    tech_cols[4].metric("Latest / mean volume", f"{volume_ratio:.2f}×" if volume_ratio is not None else "—")
-    extra_cols = st.columns(3)
-    extra_cols[0].metric("EMA 144", _price((ema_values.get("144") or {}).get("value")))
-    extra_cols[1].metric("EMA 200", _price((ema_values.get("200") or {}).get("value")))
-    return_5 = technical.get("five_closed_bar_close_return_pct")
-    extra_cols[2].metric("5 closed-bar return", f"{return_5:+.3f}%" if return_5 is not None else "—")
+    technical_by_timeframe = _technical_by_timeframe(snap, now)
+    st.markdown("**Calculated Binance multi-timeframe technical context**")
+    technical_rows = []
+    for timeframe, technical in technical_by_timeframe.items():
+        emas = technical.get("ema_20_50_144_200", {})
+        volume_ratio = technical.get("latest_volume_vs_preceding_20_mean_ratio")
+        atr_percent = technical.get("atr_14_pct_of_last_closed_close")
+        return_5 = technical.get("five_closed_bar_close_return_pct")
+        technical_rows.append({
+            "Timeframe": timeframe,
+            "Closed candles": technical.get("completed_candle_count", 0),
+            "EMA alignment": str(technical.get("ema_alignment", "insufficient_lookback")).replace("_", " "),
+            "EMA 20": _price((emas.get("20") or {}).get("value")),
+            "EMA 50": _price((emas.get("50") or {}).get("value")),
+            "EMA 144": _price((emas.get("144") or {}).get("value")),
+            "EMA 200": _price((emas.get("200") or {}).get("value")),
+            "ATR 14": _price(technical.get("atr_14_price")),
+            "ATR %": f"{atr_percent:.3f}%" if atr_percent is not None else "—",
+            "Latest / previous-20 mean volume": f"{volume_ratio:.2f}×" if volume_ratio is not None else "—",
+            "5-closed-candle return": f"{return_5:+.3f}%" if return_5 is not None else "—",
+            "20-bar structure": technical.get("last_20_vs_previous_20_bar_structure", "—").replace("_", " "),
+        })
+    st.dataframe(pd.DataFrame(technical_rows), use_container_width=True, hide_index=True)
     st.caption(
-        f"Technical calculations use {technical.get('completed_candle_count', 0)} completed 1-minute candles. "
-        "EMA values use an initial-period SMA seed; ATR is the simple mean of the last 14 true ranges; "
-        "volume ratio compares the latest completed candle with the previous 20-candle mean. "
-        "These are context, not standalone signals."
+        "Each timeframe uses its own completed Binance candles; higher timeframes are not synthetically "
+        "fabricated from the 1-minute series. EMA values use an initial-period SMA seed; ATR is the simple "
+        "mean of the latest 14 true ranges; volume compares the latest closed candle with the previous "
+        "20 closed candles; structure compares the most recent 20 candles with the preceding 20. "
+        "Values show “—” or insufficient lookback when a calculation is unavailable. These are context, not standalone signals."
     )
 
     recent_trades = snap.get("trades", [])[:20]
@@ -351,11 +376,23 @@ def render_binance_cross_venue_panel(delta_feed: Any = None) -> dict[str, Any]:
     _binance_panel_fragment(feed, delta_feed)
     context = feed.analyst_context()
     binance_snapshot = feed.snapshot()
-    context["technical_indicators_1m"] = _technical_indicators(
-        {"candles": binance_snapshot.get("candles", [])},
-        now_epoch=time.time(),
-        current_price=binance_snapshot.get("last_price"),
-    )
+    technical_by_timeframe = _technical_by_timeframe(binance_snapshot, time.time())
+    context["technical_indicators_by_timeframe"] = technical_by_timeframe
+    context["technical_indicators_1m"] = technical_by_timeframe["1m"]
+    context["candle_history_by_timeframe"] = {
+        timeframe: {
+            "loaded_from_rest": bool((binance_snapshot.get("candle_history_loaded") or {}).get(timeframe)),
+            "candles_in_memory": len((binance_snapshot.get("candles_by_interval") or {}).get(timeframe, [])),
+            "last_rest_history_update_utc": (
+                datetime.fromtimestamp(
+                    (binance_snapshot.get("candle_history_updated_at") or {})[timeframe],
+                    tz=ZoneInfo("UTC"),
+                ).isoformat()
+                if (binance_snapshot.get("candle_history_updated_at") or {}).get(timeframe) else None
+            ),
+        }
+        for timeframe in TIMEFRAME_SECONDS
+    }
     delta_data = delta_feed.snapshot() if delta_feed is not None else {}
     delta_price = delta_data.get("last_price") if isinstance(delta_data, dict) else None
     binance_price = context.get("price", {}).get("last_trade")
