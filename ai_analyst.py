@@ -174,12 +174,15 @@ def _closed_candle_rows(feed_data: dict[str, Any], now_epoch: float) -> list[dic
         timestamp = _epoch_seconds(raw_time)
         if timestamp is None:
             continue
-        bucket = int(timestamp // 60) * 60
+        interval_seconds = int(_finite_number(feed_data.get("candle_interval_seconds")) or 60)
+        if interval_seconds <= 0:
+            interval_seconds = 60
+        bucket = int(timestamp // interval_seconds) * interval_seconds
         # Binance REST/WebSocket rows explicitly expose their candle-closed flag.
         # Delta historical/live rows may not; those additionally use the time boundary.
         if row.get("is_closed") is False:
             continue
-        if bucket + 60 > now_epoch:
+        if bucket + interval_seconds > now_epoch:
             continue
         values = {
             key: _finite_number(row.get(key) if row.get(key) is not None else row.get(alias))
@@ -317,7 +320,10 @@ def _technical_indicators(
         momentum = (closes[-1] / closes[-6] - 1.0) * 100.0
 
     return {
-        "timeframe": "1m",
+        "timeframe": str(feed_data.get("timeframe") or {
+            60: "1m", 300: "5m", 900: "15m", 3600: "1h"
+        }.get(int(_finite_number(feed_data.get("candle_interval_seconds")) or 60), "custom")),
+        "interval_seconds": int(_finite_number(feed_data.get("candle_interval_seconds")) or 60),
         "completed_candle_count": len(candles),
         "last_completed_candle_time_utc": _iso_utc(candles[-1]["time"]) if candles else None,
         "last_completed_close": _finite_number(latest_close),
