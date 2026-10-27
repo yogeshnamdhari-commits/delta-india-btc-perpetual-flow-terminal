@@ -314,6 +314,9 @@ class BinanceUSDMFeed:
             "total_reconnects": 0,
             "trades": deque(maxlen=500),
             "candles": {},
+            "candles_by_interval": {"5m": {}, "15m": {}, "1h": {}},
+            "candle_history_loaded": {"1m": False, "5m": False, "15m": False, "1h": False},
+            "candle_history_updated_at": {},
             "cvd": deque(maxlen=5000),
             "cvd_value_btc": 0.0,
             "buy_volume_btc": 0.0,
@@ -324,6 +327,8 @@ class BinanceUSDMFeed:
             "open_interest_updated_at": None,
             "ticker_24h_updated_at": None,
         }
+        # Keep the legacy 1m collection and its timeframe map as the same object.
+        self.data["candles_by_interval"]["1m"] = self.data["candles"]
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._depth_thread: threading.Thread | None = None
@@ -379,6 +384,12 @@ class BinanceUSDMFeed:
             result["asks"] = dict(self.data["asks"])
             result["trades"] = [dict(x) for x in reversed(self.data["trades"])]
             result["candles"] = [dict(x) for _, x in sorted(self.data["candles"].items())]
+            result["candles_by_interval"] = {
+                interval: [dict(row) for _, row in sorted(rows.items())]
+                for interval, rows in self.data["candles_by_interval"].items()
+            }
+            result["candle_history_loaded"] = dict(self.data["candle_history_loaded"])
+            result["candle_history_updated_at"] = dict(self.data["candle_history_updated_at"])
             result["cvd"] = list(self.data["cvd"])
             result["liquidations"] = [dict(x) for x in reversed(self.data["liquidations"])]
             result["ticker_24h"] = dict(self.data["ticker_24h"])
@@ -492,7 +503,8 @@ class BinanceUSDMFeed:
             endpoint = f"{root}/public/stream"
         else:
             streams = (
-                f"{symbol}@aggTrade/{symbol}@kline_1m/"
+                f"{symbol}@aggTrade/{symbol}@kline_1m/{symbol}@kline_5m/"
+                f"{symbol}@kline_15m/{symbol}@kline_1h/"
                 f"{symbol}@markPrice@1s/{symbol}@forceOrder"
             )
             endpoint = f"{root}/market/stream"
@@ -579,14 +591,18 @@ class BinanceUSDMFeed:
             if not isinstance(payload, dict):
                 return
             event_type = payload.get("e")
-            channel = {
-                "aggTrade": "aggTrade",
-                "depthUpdate": "depth",
-                "kline": "kline_1m",
-                "bookTicker": "bookTicker",
-                "markPriceUpdate": "markPrice",
-                "forceOrder": "forceOrder",
-            }.get(event_type, stream or "unknown")
+            if event_type == "kline":
+                kline_payload = payload.get("k", {})
+                interval = kline_payload.get("i", "unknown") if isinstance(kline_payload, dict) else "unknown"
+                channel = f"kline_{interval}"
+            else:
+                channel = {
+                    "aggTrade": "aggTrade",
+                    "depthUpdate": "depth",
+                    "bookTicker": "bookTicker",
+                    "markPriceUpdate": "markPrice",
+                    "forceOrder": "forceOrder",
+                }.get(event_type, stream or "unknown")
             with self.lock:
                 self.data["last_any_message_at"] = received_at
                 self.data["total_messages_received"] += 1
@@ -633,13 +649,17 @@ class BinanceUSDMFeed:
 
     def _handle_kline(self, event: dict[str, Any]) -> None:
         candle = normalize_kline_event(event)
-        if candle is None:
+        kline_payload = event.get("k")
+        interval = kline_payload.get("i", "1m") if isinstance(kline_payload, dict) else "1m"
+        if candle is None or interval not in {"1m", "5m", "15m", "1h"}:
             return
+        candle["interval"] = interval
         with self.lock:
-            self.data["candles"][int(candle["time"])] = candle
-            if len(self.data["candles"]) > _MAX_CANDLES:
-                for key in sorted(self.data["candles"])[:-_MAX_CANDLES]:
-                    self.data["candles"].pop(key, None)
+            target = self.data["candles_by_interval"].setdefault(interval, {})
+            target[int(candle["time"])] = candle
+            if len(target) > _MAX_CANDLES:
+                for key in sorted(target)[:-_MAX_CANDLES]:
+                    target.pop(key, None)
 
     def _handle_book_ticker(self, event: dict[str, Any]) -> None:
         bid, ask = _positive(event.get("b")), _positive(event.get("a"))
@@ -816,16 +836,19 @@ class BinanceUSDMFeed:
         # REST requests are deliberately run off the Streamlit script thread.
         last_oi = 0.0
         last_ticker = 0.0
-        last_candle_attempt = 0.0
-        candles_loaded = False
+        intervals = ("1m", "5m", "15m", "1h")
+        last_candle_attempt = {interval: 0.0 for interval in intervals}
+        candles_loaded: set[str] = set()
         while not self._stop.is_set():
             now = time.monotonic()
-            if not candles_loaded and now - last_candle_attempt >= 30:
-                last_candle_attempt = now
+            for interval in intervals:
+                if interval in candles_loaded or now - last_candle_attempt[interval] < 30:
+                    continue
+                last_candle_attempt[interval] = now
                 try:
                     response = requests.get(
                         f"{self.rest_base_url}/fapi/v1/klines",
-                        params={"symbol": self.symbol, "interval": "1m", "limit": 1000},
+                        params={"symbol": self.symbol, "interval": interval, "limit": 1000},
                         headers={"Accept": "application/json", "User-Agent": "ReadOnlyMarketMonitor/1.0"},
                         timeout=self.request_timeout,
                     )
@@ -833,17 +856,23 @@ class BinanceUSDMFeed:
                     payload = response.json()
                     rows = [row for row in (normalize_rest_kline(x) for x in payload) if row]
                     with self.lock:
+                        target = self.data["candles_by_interval"].setdefault(interval, {})
                         for candle in rows:
-                            self.data["candles"][int(candle["time"])] = candle
-                        if len(self.data["candles"]) > _MAX_CANDLES:
-                            for key in sorted(self.data["candles"])[:-_MAX_CANDLES]:
-                                self.data["candles"].pop(key, None)
+                            candle["interval"] = interval
+                            target[int(candle["time"])] = candle
+                        if len(target) > _MAX_CANDLES:
+                            for key in sorted(target)[:-_MAX_CANDLES]:
+                                target.pop(key, None)
+                        self.data["candle_history_loaded"][interval] = True
+                        self.data["candle_history_updated_at"][interval] = time.time()
                         self.data["last_rest_poll_at"] = time.time()
                         self.data["last_rest_error"] = ""
-                    candles_loaded = True
+                    candles_loaded.add(interval)
                 except Exception as exc:
                     with self.lock:
-                        self.data["last_rest_error"] = f"Initial klines failed: {type(exc).__name__}: {exc}"[:400]
+                        self.data["last_rest_error"] = (
+                            f"Initial {interval} klines failed: {type(exc).__name__}: {exc}"
+                        )[:400]
             if now - last_oi >= 30:
                 try:
                     response = requests.get(
