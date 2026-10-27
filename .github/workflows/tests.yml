@@ -22,6 +22,10 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
       - name: Run unit and integration-contract tests
+        env:
+          DELTA_EVENT_LOG_FILE: /tmp/delta-feed-events.jsonl
+          DELTA_EVENT_LOG_FILE_FULL: /tmp/delta-feed-events-full.jsonl
+          DELTA_DECISION_LOG_FILE: /tmp/signal-decisions.jsonl
         run: python -m pytest -q
       - name: Smoke-test Streamlit server startup
         env:
