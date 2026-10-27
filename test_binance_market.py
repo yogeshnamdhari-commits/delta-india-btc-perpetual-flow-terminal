@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, patch
 
 from binance_market import (
     BinanceUSDMFeed,
@@ -88,6 +89,43 @@ class BinanceNormalizationTests(unittest.TestCase):
         self.assertEqual(sell["observed_snapshot_count"], 2)
         self.assertAlmostEqual(sell["filled_qty_btc_reported"], 0.3)
         self.assertIn("observed_notional_usd_approx", sell)
+
+
+    @patch("binance_market.requests.get")
+    def test_depth_snapshot_and_buffered_diff_synchronize_the_book(self, get):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "lastUpdateId": 100,
+            "bids": [["99000", "1.0"]],
+            "asks": [["101000", "2.0"]],
+        }
+        get.return_value = response
+        feed = BinanceUSDMFeed()
+        feed._depth_buffer.append({
+            "U": 99, "u": 101,
+            "b": [["99500", "3.0"]],
+            "a": [["101000", "0"]],
+        })
+        feed._sync_book_loop()
+        snapshot = feed.snapshot()
+        self.assertTrue(snapshot["book_synced"])
+        self.assertFalse(snapshot["sequence_gap_unresolved"])
+        self.assertEqual(snapshot["book_last_update_id"], 101)
+        self.assertAlmostEqual(snapshot["bids"][99500.0], 3.0)
+        self.assertNotIn(101000.0, snapshot["asks"])
+        self.assertAlmostEqual(snapshot["asks"][101000.0] if 101000.0 in snapshot["asks"] else 0.0, 0.0)
+        get.assert_called_once()
+
+    def test_session_cvd_uses_aggtrade_aggressor_side(self):
+        feed = BinanceUSDMFeed()
+        feed._handle_agg_trade({"p": "100000", "q": "0.02", "T": 1_700_000_000_000, "m": False, "a": 1})
+        feed._handle_agg_trade({"p": "100000", "q": "0.03", "T": 1_700_000_001_000, "m": True, "a": 2})
+        snapshot = feed.snapshot()
+        self.assertAlmostEqual(snapshot["buy_volume_btc"], 0.02)
+        self.assertAlmostEqual(snapshot["sell_volume_btc"], 0.03)
+        self.assertAlmostEqual(snapshot["cvd_value_btc"], -0.01)
+        self.assertEqual(snapshot["trade_count"], 2)
 
     def test_feed_initializes_read_only_and_analyst_context_is_explicit_about_limitations(self):
         feed = BinanceUSDMFeed()
