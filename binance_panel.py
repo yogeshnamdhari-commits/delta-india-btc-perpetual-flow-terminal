@@ -7,7 +7,10 @@ from zoneinfo import ZoneInfo
 from typing import Any
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
+
+from ai_analyst import _technical_indicators
 
 from binance_market import (
     BinanceUSDMFeed,
@@ -170,6 +173,58 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
             "Binance does not provide the Delta CRC32 checksum in this adapter; update-ID continuity is used."
         )
 
+    candles = [
+        row for row in (snap.get("candles", []) or [])
+        if isinstance(row, dict) and isinstance(row.get("time"), (int, float))
+        and float(row["time"]) + 60 <= now
+    ]
+    if candles:
+        chart_rows = candles[-180:]
+        chart = go.Figure(data=[go.Candlestick(
+            x=[datetime.fromtimestamp(float(row["time"]), tz=IST) for row in chart_rows],
+            open=[row["open"] for row in chart_rows],
+            high=[row["high"] for row in chart_rows],
+            low=[row["low"] for row in chart_rows],
+            close=[row["close"] for row in chart_rows],
+            name="Binance BTCUSDT",
+        )])
+        chart.update_layout(
+            title="Binance BTCUSDT · completed 1-minute candles",
+            height=380,
+            margin=dict(l=10, r=10, t=45, b=10),
+            xaxis_rangeslider_visible=False,
+            uirevision="binance-btcusdt-1m",
+        )
+        st.plotly_chart(chart, use_container_width=True, key="binance-usdm-1m-chart")
+    else:
+        st.info("Waiting for initial Binance candle history. The live chart appears once completed 1-minute candles are available.")
+
+    technical = _technical_indicators(
+        {"candles": snap.get("candles", [])},
+        now_epoch=now,
+        current_price=snap.get("last_price"),
+    )
+    st.markdown("**Calculated Binance 1-minute technical context**")
+    tech_cols = st.columns(5)
+    ema_values = technical.get("ema_20_50_144_200", {})
+    tech_cols[0].metric("EMA alignment", str(technical.get("ema_alignment", "insufficient_lookback")).replace("_", " "))
+    tech_cols[1].metric("EMA 20", _price((ema_values.get("20") or {}).get("value")))
+    tech_cols[2].metric("EMA 50", _price((ema_values.get("50") or {}).get("value")))
+    tech_cols[3].metric("ATR 14", _price(technical.get("atr_14_price")))
+    volume_ratio = technical.get("latest_volume_vs_preceding_20_mean_ratio")
+    tech_cols[4].metric("Latest / mean volume", f"{volume_ratio:.2f}×" if volume_ratio is not None else "—")
+    extra_cols = st.columns(3)
+    extra_cols[0].metric("EMA 144", _price((ema_values.get("144") or {}).get("value")))
+    extra_cols[1].metric("EMA 200", _price((ema_values.get("200") or {}).get("value")))
+    return_5 = technical.get("five_closed_bar_close_return_pct")
+    extra_cols[2].metric("5 closed-bar return", f"{return_5:+.3f}%" if return_5 is not None else "—")
+    st.caption(
+        f"Technical calculations use {technical.get('completed_candle_count', 0)} completed 1-minute candles. "
+        "EMA values use an initial-period SMA seed; ATR is the simple mean of the last 14 true ranges; "
+        "volume ratio compares the latest completed candle with the previous 20-candle mean. "
+        "These are context, not standalone signals."
+    )
+
     recent_trades = snap.get("trades", [])[:20]
     if recent_trades:
         st.markdown("**Recent Binance aggTrade executions**")
@@ -236,6 +291,32 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
         else:
             st.info("No qualifying filled liquidation snapshots in the trailing 60-minute window.")
 
+    with st.expander("Binance source diagnostics by channel", expanded=False):
+        seen = snap.get("channel_last_seen", {}) or {}
+        counts = snap.get("channel_message_counts", {}) or {}
+        channels = sorted(set(seen) | set(counts))
+        channel_rows = [{
+            "Channel": channel,
+            "Messages received": counts.get(channel, 0),
+            "Last message (IST)": _time_ist(seen.get(channel)),
+            "Age (seconds)": round(max(0.0, now - float(seen[channel])), 2) if seen.get(channel) else None,
+        } for channel in channels]
+        if channel_rows:
+            st.dataframe(pd.DataFrame(channel_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No Binance public channel messages have arrived yet.")
+        diag_cols = st.columns(4)
+        diag_cols[0].metric("Messages total", str(snap.get("total_messages_received", 0)))
+        diag_cols[1].metric("Disconnects", str(snap.get("total_disconnects", 0)))
+        diag_cols[2].metric("Reconnects", str(snap.get("total_reconnects", 0)))
+        diag_cols[3].metric("Depth sequence gaps", str(snap.get("sequence_gaps", 0)))
+        st.caption("REST last poll (IST): " + _time_ist(snap.get("last_rest_poll_at")))
+        st.caption("24-hour ticker last update (IST): " + _time_ist(snap.get("ticker_24h_updated_at")))
+        if snap.get("last_error"):
+            st.error("WebSocket: " + str(snap["last_error"]))
+        if snap.get("last_rest_error"):
+            st.error("REST: " + str(snap["last_rest_error"]))
+
     st.caption(
         "Historical candles: Binance REST klines. Live price/trades/depth/mark/funding/liquidation: public WebSocket. "
         "Open interest and 24-hour statistics: public REST polling. All market-data fields remain read-only."
@@ -252,6 +333,12 @@ def render_binance_cross_venue_panel(delta_feed: Any = None) -> dict[str, Any]:
     feed = get_binance_feed()
     _binance_panel_fragment(feed, delta_feed)
     context = feed.analyst_context()
+    binance_snapshot = feed.snapshot()
+    context["technical_indicators_1m"] = _technical_indicators(
+        {"candles": binance_snapshot.get("candles", [])},
+        now_epoch=time.time(),
+        current_price=binance_snapshot.get("last_price"),
+    )
     delta_data = delta_feed.snapshot() if delta_feed is not None else {}
     delta_price = delta_data.get("last_price") if isinstance(delta_data, dict) else None
     binance_price = context.get("price", {}).get("last_trade")
