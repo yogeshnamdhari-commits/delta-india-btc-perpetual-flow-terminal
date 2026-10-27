@@ -176,6 +176,10 @@ def apply_book_update(
         if update_id == previous_update_id:
             return bids, asks, previous_update_id, previous_sequence, "duplicate"
         return bids, asks, previous_update_id, previous_sequence, "update_id_regression"
+    # Bybit update IDs advance with book updates. A skipped ID means the local
+    # state may have missed a delta, so invalidate rather than guessing.
+    if update_id > previous_update_id + 1:
+        return bids, asks, previous_update_id, previous_sequence, "update_id_gap"
     if sequence is not None and previous_sequence is not None and sequence <= previous_sequence:
         return bids, asks, previous_update_id, previous_sequence, "sequence_regression"
 
