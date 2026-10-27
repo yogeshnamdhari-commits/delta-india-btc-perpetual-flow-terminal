@@ -300,6 +300,7 @@ class BinanceUSDMFeed:
             "asks": {},
             "book_last_update_id": None,
             "book_synced": False,
+            "depth_bridge_pending": True,
             "sequence_gap_unresolved": True,
             "book_sync_error": "Waiting for depth snapshot",
             # Binance depth has update IDs; do not claim a Delta CRC32 checksum.
@@ -523,6 +524,7 @@ class BinanceUSDMFeed:
                     self.data["book_synced"] = False
                     self.data["sequence_gap_unresolved"] = True
                     self.data["book_sync_error"] = "Depth WebSocket disconnected; awaiting fresh snapshot"
+                    self.data["depth_bridge_pending"] = True
                     self._depth_buffer.clear()
                     self._depth_buffer_overflow = False
             self._set_connection(f"reconnecting in {delay:.0f}s", group=group)
@@ -539,6 +541,7 @@ class BinanceUSDMFeed:
                 self.data["book_synced"] = False
                 self.data["sequence_gap_unresolved"] = True
                 self.data["book_sync_error"] = "Syncing REST depth snapshot with WebSocket diffs"
+                self.data["depth_bridge_pending"] = True
                 self._depth_buffer.clear()
                 self._depth_buffer_overflow = False
         if group == "depth":
@@ -561,6 +564,7 @@ class BinanceUSDMFeed:
             if group == "depth":
                 self.data["book_synced"] = False
                 self.data["sequence_gap_unresolved"] = True
+                self.data["depth_bridge_pending"] = True
                 self._depth_buffer.clear()
                 self._depth_buffer_overflow = False
         self._set_connection("disconnected", f"close={code}; {message or ''}", group=group)
@@ -687,7 +691,10 @@ class BinanceUSDMFeed:
                 self._depth_buffer.append(dict(event))
                 return
             last_id = self.data.get("book_last_update_id")
-            action = depth_update_action(int(last_id or 0), event, require_previous=True)
+            bridge_pending = bool(self.data.get("depth_bridge_pending", True))
+            action = depth_update_action(
+                int(last_id or 0), event, require_previous=not bridge_pending
+            )
             if action == "stale":
                 return
             if action == "gap":
@@ -705,6 +712,7 @@ class BinanceUSDMFeed:
                 _apply_depth_levels(self.data["bids"], event.get("b", []), keep_high=True)
                 _apply_depth_levels(self.data["asks"], event.get("a", []), keep_high=False)
                 self.data["book_last_update_id"] = int(event["u"])
+                self.data["depth_bridge_pending"] = False
         if sync_again:
             self._start_book_sync()
 
@@ -782,6 +790,7 @@ class BinanceUSDMFeed:
                         self.data["bids"] = bids
                         self.data["asks"] = asks
                         self.data["book_last_update_id"] = last_id
+                        self.data["depth_bridge_pending"] = not have_applied_buffered_event
                         self.data["book_synced"] = True
                         self.data["sequence_gap_unresolved"] = False
                         self.data["book_sync_error"] = ""
