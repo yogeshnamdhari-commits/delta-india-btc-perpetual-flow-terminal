@@ -61,14 +61,14 @@ Rules:
   instrument design, quote/collateral basis, fees, funding, latency, and slippage.
 - Bybit allLiquidation messages report observed executed size and bankruptcy
   price. Use that exact meaning; bankruptcy-price buckets summarize observed
-  messages only and are not predictions for untriggered positions. If Binance
-  forceOrder context is supplied, its per-symbol snapshots are not a complete
-  liquidation census either.
+  messages only and are not predictions for untriggered positions. If legacy
+  Binance forceOrder context is supplied, its per-symbol snapshots are not a
+  complete liquidation census either.
 - Session CVD is a local proxy, not exchange-calculated historical CVD. It resets
   on process restart; in-memory trade and candle data are bounded.
 - This live snapshot does not prove historical trade completeness or certify
   Gate 3 / out-of-sample profitability. Do not describe an unvalidated setup as
-  profitable or approved. The Binance feed must not change the Delta-specific
+  profitable or approved. The alternative-venue feed must not change the Delta-specific
   frozen evaluator or release gate.
 - If connection, order-book synchronization, sequence state, checksum capability,
   or feed freshness is unhealthy, lead with that limitation. Never claim a venue-provided checksum when the adapter only tracks snapshot/delta sequence state.
@@ -189,7 +189,7 @@ def _closed_candle_rows(feed_data: dict[str, Any], now_epoch: float) -> list[dic
         if interval_seconds <= 0:
             interval_seconds = 60
         bucket = int(timestamp // interval_seconds) * interval_seconds
-        # Binance REST/WebSocket rows explicitly expose their candle-closed flag.
+        # Exchange REST/WebSocket rows may explicitly expose their candle-closed flag.
         # Delta historical/live rows may not; those additionally use the time boundary.
         if row.get("is_closed") is False:
             continue
@@ -539,7 +539,7 @@ def build_market_context(feed_data: dict[str, Any], *, now_epoch: float | None =
     if isinstance(delta_structure, dict):
         context["delta_market_structure"] = delta_structure
 
-    cross_venue = feed_data.get("cross_venue_market_data") or feed_data.get("cross_venue_bybit_context") or feed_data.get("cross_venue_binance_context")
+    cross_venue = feed_data.get("cross_venue_market_data") or feed_data.get("cross_venue_bybit_context")
     if isinstance(cross_venue, dict):
         # Keep each venue’s measurements and units separate; never coerce alternative-venue BTC sizes into Delta contracts.
         context["cross_venue_market_data"] = cross_venue
