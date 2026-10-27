@@ -152,6 +152,21 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any) -> None:
         st.caption("REST status: " + str(snap["last_rest_error"]))
 
     if snap.get("book_synced"):
+        top_bids = _top_book_rows(snap, "bids", limit=5)
+        top_asks = _top_book_rows(snap, "asks", limit=5)
+        bid_depth = sum(row["Size (BTC)"] for row in top_bids)
+        ask_depth = sum(row["Size (BTC)"] for row in top_asks)
+        total_top_depth = bid_depth + ask_depth
+        imbalance = (bid_depth - ask_depth) / total_top_depth * 100.0 if total_top_depth > 0 else None
+        depth_cols = st.columns(3)
+        depth_cols[0].metric("Top-5 bid depth", _quantity(bid_depth, 5))
+        depth_cols[1].metric("Top-5 ask depth", _quantity(ask_depth, 5))
+        depth_cols[2].metric("Top-5 depth imbalance", f"{imbalance:+.2f}%" if imbalance is not None else "—")
+        st.caption(
+            "Top-5 depth imbalance = (top-five bid BTC size − top-five ask BTC size) / "
+            "their total × 100. Positive values mean more displayed bid size; negative values mean more ask size. "
+            "This is a current snapshot of visible depth, not proof of future price direction."
+        )
         book_col1, book_col2 = st.columns(2)
         with book_col1:
             st.markdown("**Observed bids — BTC size and approximate notional**")
