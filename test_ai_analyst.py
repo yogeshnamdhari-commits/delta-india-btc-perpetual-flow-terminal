@@ -156,6 +156,36 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertIsNone(invalid["order_book"]["top_5_imbalance_pct_calculated"])
         self.assertFalse(invalid["order_book"]["imbalance_data_valid"])
 
+
+    def test_delta_market_structure_context_is_preserved_for_detailed_narration(self):
+        self.feed["delta_market_structure"] = {
+            "source": "Delta Exchange India BTCUSD public market data; read-only.",
+            "calculation_parameters": {"exhaustion_min_aggressor_ratio": 1.25},
+            "supply_demand_order_blocks": [{
+                "classification": "DEMAND",
+                "lower": 100.0,
+                "upper": 101.0,
+                "displacement_x_atr_calculated": 1.2,
+            }],
+            "confirmed_price_sweep_candidates": [{
+                "candidate": "above-high / buy-side liquidity sweep",
+                "overshoot_points_calculated": 3.0,
+                "interpretation_limit": "Stop orders are not proven.",
+            }],
+            "observed_resting_liquidity": {
+                "available": False,
+                "reason": "Withheld until book integrity passes.",
+            },
+        }
+        context = build_market_context(self.feed, now_epoch=self.now)
+        self.assertEqual(context["delta_market_structure"]["source"], "Delta Exchange India BTCUSD public market data; read-only.")
+        self.assertEqual(context["delta_market_structure"]["calculation_parameters"]["exhaustion_min_aggressor_ratio"], 1.25)
+        self.assertEqual(context["delta_market_structure"]["supply_demand_order_blocks"][0]["classification"], "DEMAND")
+        self.assertFalse(context["delta_market_structure"]["observed_resting_liquidity"]["available"])
+        prompt = _question_with_context("Narrate every calculated market-structure parameter.", context)
+        self.assertIn("confirmed_price_sweep_candidates", prompt)
+        self.assertIn("overshoot_points_calculated", prompt)
+
     def test_cross_venue_context_is_preserved_as_a_separate_source(self):
         self.feed["cross_venue_binance_context"] = {
             "venue": "Binance USDⓈ-M Futures",
