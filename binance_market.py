@@ -49,9 +49,16 @@ def _seconds_from_ms(value: Any) -> float | None:
 def normalize_agg_trade(event: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize Binance aggTrade; m=True means buyer is maker, so aggressor sold."""
     price = _positive(event.get("p"))
-    qty_btc = _positive(event.get("q"))
+    reported_qty_btc = _positive(event.get("q"))
+    # Current USDⓈ-M payloads expose nq (excluding RPI fills) alongside q.
+    # Prefer nq when present so hidden/RPI quantity is not misrepresented as
+    # ordinary visible aggressor flow. Older payloads without nq use q.
+    normal_qty_btc = _number(event.get("nq")) if "nq" in event else reported_qty_btc
     timestamp = _seconds_from_ms(event.get("T") or event.get("E"))
-    if price is None or qty_btc is None or timestamp is None:
+    if (
+        price is None or reported_qty_btc is None or timestamp is None
+        or normal_qty_btc is None or normal_qty_btc < 0
+    ):
         return None
     buyer_is_maker = event.get("m")
     if not isinstance(buyer_is_maker, bool):
@@ -59,11 +66,13 @@ def normalize_agg_trade(event: dict[str, Any]) -> dict[str, Any] | None:
     return {
         "timestamp": timestamp,
         "price": price,
-        "size_btc": qty_btc,
-        "size": qty_btc,
+        "size_btc": normal_qty_btc,
+        "size": normal_qty_btc,
+        "reported_size_btc": reported_qty_btc,
+        "normal_size_ex_rpi_btc": normal_qty_btc,
         "side": "SELL" if buyer_is_maker else "BUY",
         "buyer_role": "maker" if buyer_is_maker else "taker",
-        "notional_usd_approx": price * qty_btc,
+        "notional_usd_approx": price * normal_qty_btc,
         "trade_id": event.get("a"),
         "source": "binance_usdm_aggTrade",
     }
@@ -713,6 +722,10 @@ class BinanceUSDMFeed:
     def _sync_book_loop(self) -> None:
         try:
             while not self._stop.is_set():
+                with self.lock:
+                    depth_is_connected = self.data.get("depth_connection") == "connected"
+                if not depth_is_connected:
+                    return
                 try:
                     response = requests.get(
                         f"{self.rest_base_url}/fapi/v1/depth",
@@ -765,7 +778,7 @@ class BinanceUSDMFeed:
                             _apply_depth_levels(asks, event.get("a", []), keep_high=False)
                             last_id = int(event["u"])
                             have_applied_buffered_event = True
-                    if synchronized:
+                    if synchronized and self.data.get("depth_connection") == "connected":
                         self.data["bids"] = bids
                         self.data["asks"] = asks
                         self.data["book_last_update_id"] = last_id
@@ -773,13 +786,19 @@ class BinanceUSDMFeed:
                         self.data["sequence_gap_unresolved"] = False
                         self.data["book_sync_error"] = ""
                         return
+                    elif synchronized:
+                        self.data["book_synced"] = False
+                        self.data["sequence_gap_unresolved"] = True
+                        self.data["book_sync_error"] = "Depth stream disconnected during snapshot synchronization"
                 if self._stop.wait(0.35):
                     return
         finally:
             with self.lock:
                 self._book_sync_running = False
                 should_retry = (
-                    not self.data.get("book_synced", False) and not self._stop.is_set()
+                    not self.data.get("book_synced", False)
+                    and self.data.get("depth_connection") == "connected"
+                    and not self._stop.is_set()
                 )
             if should_retry:
                 self._start_book_sync()
