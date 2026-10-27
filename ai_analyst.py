@@ -175,7 +175,10 @@ def _closed_candle_rows(feed_data: dict[str, Any], now_epoch: float) -> list[dic
         if timestamp is None:
             continue
         bucket = int(timestamp // 60) * 60
-        # Exclude the current in-progress candle from technical calculations.
+        # Binance REST/WebSocket rows explicitly expose their candle-closed flag.
+        # Delta historical/live rows may not; those additionally use the time boundary.
+        if row.get("is_closed") is False:
+            continue
         if bucket + 60 > now_epoch:
             continue
         values = {
