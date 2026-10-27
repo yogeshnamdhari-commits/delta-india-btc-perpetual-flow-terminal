@@ -161,6 +161,180 @@ def _recent_candles(feed_data: dict[str, Any], limit: int = 24) -> list[dict[str
     return result
 
 
+def _closed_candle_rows(feed_data: dict[str, Any], now_epoch: float) -> list[dict[str, float]]:
+    """Return unique, validated completed 1-minute candles in ascending time order."""
+    rows = feed_data.get("candles", [])
+    if not isinstance(rows, (list, tuple)):
+        return []
+    by_time: dict[int, dict[str, float]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_time = row.get("time") or row.get("timestamp") or row.get("ts")
+        timestamp = _epoch_seconds(raw_time)
+        if timestamp is None:
+            continue
+        bucket = int(timestamp // 60) * 60
+        # Exclude the current in-progress candle from technical calculations.
+        if bucket + 60 > now_epoch:
+            continue
+        values = {
+            key: _finite_number(row.get(key) if row.get(key) is not None else row.get(alias))
+            for key, alias in (("open", "o"), ("high", "h"), ("low", "l"), ("close", "c"))
+        }
+        volume = _finite_number(row.get("volume") if row.get("volume") is not None else row.get("v"))
+        if any(v is None or v <= 0 for v in values.values()) or volume is None or volume < 0:
+            continue
+        if values["high"] < max(values["open"], values["low"], values["close"]):
+            continue
+        if values["low"] > min(values["open"], values["high"], values["close"]):
+            continue
+        values["time"] = float(bucket)
+        values["volume"] = volume
+        by_time[bucket] = values
+    return [by_time[key] for key in sorted(by_time)]
+
+
+def _ema_series(closes: list[float], period: int) -> list[float | None]:
+    """EMA seeded with the first period's SMA; earlier positions are unavailable."""
+    if len(closes) < period or period <= 0:
+        return []
+    series: list[float | None] = [None] * (period - 1)
+    current = sum(closes[:period]) / period
+    series.append(current)
+    alpha = 2.0 / (period + 1.0)
+    for close in closes[period:]:
+        current = alpha * close + (1.0 - alpha) * current
+        series.append(current)
+    return series
+
+
+def _technical_indicators(
+    feed_data: dict[str, Any],
+    *,
+    now_epoch: float,
+    current_price: float | None = None,
+) -> dict[str, Any]:
+    """Calculate explicit 1-minute technical measurements without forecasting."""
+    candles = _closed_candle_rows(feed_data, now_epoch)
+    closes = [row["close"] for row in candles]
+    latest_close = closes[-1] if closes else None
+    ref_price = current_price if current_price is not None and current_price > 0 else latest_close
+    ema_rows: dict[str, Any] = {}
+    ema_values: dict[int, float] = {}
+    for period in (20, 50, 144, 200):
+        series = _ema_series(closes, period)
+        value = series[-1] if series and series[-1] is not None else None
+        slope_pct = None
+        if len(series) >= 6 and series[-6] is not None and value is not None and series[-6] != 0:
+            slope_pct = (value / float(series[-6]) - 1.0) * 100.0
+        distance_pct = (
+            (ref_price / value - 1.0) * 100.0
+            if ref_price is not None and value is not None and value > 0
+            else None
+        )
+        if value is not None:
+            ema_values[period] = value
+        ema_rows[str(period)] = {
+            "value": _finite_number(value, digits=8),
+            "price_distance_pct": _finite_number(distance_pct, digits=5),
+            "slope_5_closed_bars_pct": _finite_number(slope_pct, digits=6),
+            "available": value is not None,
+        }
+
+    if all(period in ema_values for period in (20, 50, 144, 200)):
+        ordered = [ema_values[p] for p in (20, 50, 144, 200)]
+        if ordered[0] > ordered[1] > ordered[2] > ordered[3]:
+            alignment = "bullish_alignment"
+        elif ordered[0] < ordered[1] < ordered[2] < ordered[3]:
+            alignment = "bearish_alignment"
+        else:
+            alignment = "mixed_alignment"
+    else:
+        alignment = "insufficient_lookback"
+
+    atr = None
+    if len(candles) >= 15:
+        true_ranges = []
+        for idx in range(1, len(candles)):
+            current, previous = candles[idx], candles[idx - 1]
+            true_ranges.append(max(
+                current["high"] - current["low"],
+                abs(current["high"] - previous["close"]),
+                abs(current["low"] - previous["close"]),
+            ))
+        atr = sum(true_ranges[-14:]) / 14.0
+    atr_pct = (atr / latest_close * 100.0) if atr is not None and latest_close else None
+
+    volume_ratio = None
+    latest_volume = candles[-1]["volume"] if candles else None
+    preceding_volumes = [row["volume"] for row in candles[-21:-1]] if len(candles) >= 21 else []
+    preceding_mean = sum(preceding_volumes) / len(preceding_volumes) if preceding_volumes else None
+    if latest_volume is not None and preceding_mean is not None and preceding_mean > 0:
+        volume_ratio = latest_volume / preceding_mean
+
+    range_metrics: dict[str, Any] = {}
+    if len(candles) >= 20:
+        window = candles[-20:]
+        window_high = max(row["high"] for row in window)
+        window_low = min(row["low"] for row in window)
+        width = window_high - window_low
+        range_metrics = {
+            "window_bars": 20,
+            "high": _finite_number(window_high),
+            "low": _finite_number(window_low),
+            "range_points": _finite_number(width),
+            "range_pct_of_low": _finite_number(width / window_low * 100.0 if window_low > 0 else None),
+            "current_price_location_pct": _finite_number(
+                (ref_price - window_low) / width * 100.0 if ref_price is not None and width > 0 else None
+            ),
+            "formula": "(current price - 20-bar low) / (20-bar high - 20-bar low) × 100; may be outside 0–100 after a breakout",
+        }
+
+    structure = "insufficient_lookback"
+    if len(candles) >= 40:
+        previous, recent = candles[-40:-20], candles[-20:]
+        previous_high, previous_low = max(x["high"] for x in previous), min(x["low"] for x in previous)
+        recent_high, recent_low = max(x["high"] for x in recent), min(x["low"] for x in recent)
+        higher_high = recent_high > previous_high
+        higher_low = recent_low > previous_low
+        lower_high = recent_high < previous_high
+        lower_low = recent_low < previous_low
+        if higher_high and higher_low:
+            structure = "higher_20_bar_high_and_higher_20_bar_low"
+        elif lower_high and lower_low:
+            structure = "lower_20_bar_high_and_lower_20_bar_low"
+        elif higher_high or higher_low or lower_high or lower_low:
+            structure = "mixed_20_bar_range_comparison"
+        else:
+            structure = "equal_or_inside_20_bar_range_comparison"
+
+    momentum = None
+    if len(closes) >= 6 and closes[-6] > 0:
+        momentum = (closes[-1] / closes[-6] - 1.0) * 100.0
+
+    return {
+        "timeframe": "1m",
+        "completed_candle_count": len(candles),
+        "last_completed_candle_time_utc": _iso_utc(candles[-1]["time"]) if candles else None,
+        "last_completed_close": _finite_number(latest_close),
+        "reference_price": _finite_number(ref_price),
+        "ema_20_50_144_200": ema_rows,
+        "ema_alignment": alignment,
+        "ema_method": "Recursive EMA seeded with the first period's SMA; values omitted when the completed-candle lookback is insufficient.",
+        "atr_14_price": _finite_number(atr),
+        "atr_14_pct_of_last_closed_close": _finite_number(atr_pct),
+        "atr_method": "Simple mean of the latest 14 true ranges; TR=max(high-low, abs(high-prev close), abs(low-prev close)).",
+        "latest_closed_volume": _finite_number(latest_volume),
+        "preceding_20_closed_volume_mean": _finite_number(preceding_mean),
+        "latest_volume_vs_preceding_20_mean_ratio": _finite_number(volume_ratio),
+        "five_closed_bar_close_return_pct": _finite_number(momentum),
+        "last_20_bar_range": range_metrics,
+        "last_20_vs_previous_20_bar_structure": structure,
+        "limitations": "These are calculations on completed 1-minute candles, not a standalone trade signal. Intrabar order flow and other timeframes can disagree.",
+    }
+
+
 def _recent_15m_flow(feed_data: dict[str, Any], now_epoch: float, limit: int = 16) -> list[dict[str, Any]]:
     """Collapse in-memory per-minute aggressor aggregates into 15-minute buckets."""
     minute_map = feed_data.get("trade_flow_minutes", {})
@@ -223,6 +397,29 @@ def build_market_context(feed_data: dict[str, Any], *, now_epoch: float | None =
 
     flow_minutes = feed_data.get("trade_flow_minutes", {})
     minute_flow_count = len(flow_minutes) if isinstance(flow_minutes, dict) else 0
+    bid_rows = _compact_book(feed_data.get("bids"), reverse=True, limit=5)
+    ask_rows = _compact_book(feed_data.get("asks"), reverse=False, limit=5)
+    bid_top5 = sum(row["contracts"] for row in bid_rows)
+    ask_top5 = sum(row["contracts"] for row in ask_rows)
+    book_valid = (
+        bool(feed_data.get("book_synced", False))
+        and not bool(feed_data.get("sequence_gap_unresolved", True))
+        and feed_data.get("checksum_ok") is True
+    )
+    book_imbalance_pct = (
+        (bid_top5 - ask_top5) / (bid_top5 + ask_top5) * 100.0
+        if book_valid and (bid_top5 + ask_top5) > 0 else None
+    )
+    buy_contracts = _finite_number(feed_data.get("buy_contracts"))
+    sell_contracts = _finite_number(feed_data.get("sell_contracts"))
+    flow_total = (
+        buy_contracts + sell_contracts
+        if buy_contracts is not None and sell_contracts is not None else None
+    )
+    flow_imbalance_pct = (
+        (buy_contracts - sell_contracts) / flow_total * 100.0
+        if flow_total is not None and flow_total > 0 else None
+    )
     context = {
         "observed_at_utc": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
         "instrument": {"symbol": "BTCUSD", "venue": "Delta Exchange India", "product_id": 27},
@@ -247,6 +444,10 @@ def build_market_context(feed_data: dict[str, Any], *, now_epoch: float | None =
         },
         "funding": {
             "rate": _finite_number(feed_data.get("funding_rate"), digits=10),
+            "rate_percent": _finite_number(
+                _finite_number(feed_data.get("funding_rate"), digits=10) * 100.0
+                if _finite_number(feed_data.get("funding_rate"), digits=10) is not None else None
+            ),
             "interval_seconds": _finite_number(feed_data.get("funding_interval_seconds")),
             "next_funding_time_utc": _iso_utc(feed_data.get("next_funding_at")),
         },
@@ -256,6 +457,11 @@ def build_market_context(feed_data: dict[str, Any], *, now_epoch: float | None =
             "buy_aggressor_contracts": _finite_number(feed_data.get("buy_contracts")),
             "sell_aggressor_contracts": _finite_number(feed_data.get("sell_contracts")),
             "net_session_cvd_contracts": _finite_number(feed_data.get("cvd_value")),
+            "buy_sell_imbalance_pct_calculated": _finite_number(flow_imbalance_pct),
+            "buy_to_sell_ratio_calculated": _finite_number(
+                buy_contracts / sell_contracts if buy_contracts is not None and sell_contracts is not None and sell_contracts > 0 else None
+            ),
+            "formula": "(buy aggressor contracts - sell aggressor contracts) / their sum × 100.",
             "warning": "Session-only CVD proxy; resets on app restart and is not historical CVD.",
         },
         "feed_health": {
@@ -273,10 +479,16 @@ def build_market_context(feed_data: dict[str, Any], *, now_epoch: float | None =
         "order_book": {
             "asks_best_to_worse": _compact_book(feed_data.get("asks"), reverse=False),
             "bids_best_to_worse": _compact_book(feed_data.get("bids"), reverse=True),
-            "note": "Only current observed book levels; displayed orders can be cancelled or changed.",
+            "top_5_bid_size_contracts": _finite_number(bid_top5) if book_valid else None,
+            "top_5_ask_size_contracts": _finite_number(ask_top5) if book_valid else None,
+            "top_5_imbalance_pct_calculated": _finite_number(book_imbalance_pct),
+            "top_5_imbalance_formula": "(sum of top-five bid sizes - sum of top-five ask sizes) / their sum × 100; shown only with valid book health.",
+            "imbalance_data_valid": book_valid,
+            "note": "Only current observed book levels; displayed orders can be cancelled or changed. The imbalance is hidden when sequence/checksum health is invalid.",
         },
         "recent_trades": _recent_trades(feed_data),
         "recent_candles": _recent_candles(feed_data),
+        "technical_indicators_1m": _technical_indicators(feed_data, now_epoch=now, current_price=last),
         "recent_15m_aggressor_flow": _recent_15m_flow(feed_data, now),
         "recent_large_trades": [
             {
