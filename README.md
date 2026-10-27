@@ -117,3 +117,19 @@ The read-only **Order flow & liquidity** area distinguishes measured market data
 All levels and labels are monitoring context, not trade guarantees. These UI additions do not modify the signal engine, its thresholds, signal precedence, evaluator or release criteria.
 
 Delta API references: [WebSocket public channels](https://docs.delta.exchange/) and [private order updates](https://docs.delta.exchange/).
+
+## Alternative exchange: Binance USDⓈ-M cross-venue monitor
+
+The dashboard now starts a separate, read-only Binance USDⓈ-M BTCUSDT market-data adapter alongside the existing Delta India BTCUSD feed. It does not replace the Delta connection or feed Binance data into the Delta-specific signal engine, frozen evaluator, or Gate 3 requirements.
+
+- **WebSocket:** aggregate trades, diff depth, one-minute klines, best bid/ask, mark/index/funding updates, and the symbol-specific force-order liquidation snapshot stream.
+- **REST:** initial one-minute candle history, order-book synchronization snapshot, open interest about every 30 seconds, and 24-hour ticker statistics about every 60 seconds.
+- **Order-book integrity:** synchronize the REST snapshot with buffered diff-depth events using Binance update IDs; invalidate the book on a sequence gap and resynchronize. Binance does not supply the Delta CRC32 checksum in this adapter, so the panel never claims that checksum passed.
+- **Trade flow:** interpret the aggregate-trade buyer-maker flag into aggressor side and calculate a session-only CVD proxy in BTC. The proxy resets on restart and is not historical CVD.
+- **Funding and OI:** show the funding rate in its raw exchange representation, next funding timestamp, open interest in BTC and approximate USD notional. The funding interval is not assumed because the exchange's funding schedule can vary.
+- **Observed liquidation activity:** display only force-order snapshots with reported filled quantity. Price buckets aggregate messages observed during the trailing 60 minutes; they are historical observations, not forecast liquidation levels. Binance documents that each symbol's force-order stream emits at most the latest liquidation order in each 1-second interval, so missing messages cannot be interpreted as zero liquidations.
+- **Cross-venue comparison:** raw Delta BTCUSD and Binance BTCUSDT prices are displayed separately with their price difference. This is not a tradable arbitrage spread because the contracts, quote/collateral basis, funding, fees, latency and slippage differ.
+
+No exchange credentials are required; no trading endpoints are used. If Binance's public feed or REST endpoints are unavailable, the panel reports its connection/freshness/synchronization state instead of substituting guessed values.
+
+Official references: [Binance USDⓈ-M WebSocket market streams](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams), [all-market liquidation order stream](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/All-Market-Liquidation-Order-Streams), and [USDⓈ-M REST API](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api).
