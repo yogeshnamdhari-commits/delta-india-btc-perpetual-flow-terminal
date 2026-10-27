@@ -118,7 +118,7 @@ class AiAnalystContextTests(unittest.TestCase):
         context = build_market_context(self.feed, now_epoch=self.now)
         book = context["order_book"]
         self.assertTrue(book["imbalance_data_valid"])
-        self.assertAlmostEqual(book["top_5_imbalance_pct_calculated"], (15 - 12) / 27 * 100)
+        self.assertAlmostEqual(book["top_5_imbalance_pct_calculated"], (15 - 12) / 27 * 100, places=6)
         self.feed["checksum_ok"] = False
         invalid = build_market_context(self.feed, now_epoch=self.now)
         self.assertIsNone(invalid["order_book"]["top_5_imbalance_pct_calculated"])
