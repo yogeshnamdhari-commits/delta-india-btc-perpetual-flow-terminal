@@ -47,6 +47,13 @@ Rules:
 - When cross-venue multi-timeframe candles are provided, compare the independent
   1m, 5m, 15m and 1h measurements. State which timeframes align or conflict,
   and explicitly note "insufficient lookback" rather than inventing EMA values.
+- When Delta market-structure context is supplied, narrate the actual
+  configured swing/equal-level, supply/demand, sweep, exhaustion, rolling-flow,
+  and observed-book results. Quote values, units, timestamps, and configured
+  thresholds. Distinguish current visible book orders from completed-candle
+  derivations; describe a sweep as a stop-hunt candidate, never proof that stop
+  orders were present. Treat missing or incomplete UTC-session candle coverage
+  as a limitation and never substitute a guessed level.
 - Never invent prices, order-book levels, funding, open interest, liquidation
   executions, historical coverage, backtest results, or a win rate.
 - Do not mix Delta contract counts with Binance BTC quantity. Do not treat BTCUSD
