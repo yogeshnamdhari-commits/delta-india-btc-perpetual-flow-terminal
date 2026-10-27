@@ -60,13 +60,13 @@ class BinanceNormalizationTests(unittest.TestCase):
         })
         self.assertIsNotNone(row)
         self.assertEqual(row["side"], "SELL")
-        self.assertAlmostEqual(row["size_btc"], 0.02)
-        self.assertAlmostEqual(row["notional_usd_approx"], 1999.0)
+        self.assertAlmostEqual(row["size_btc"], 0.01)
+        self.assertAlmostEqual(row["notional_usd_approx"], 999.5)
         # No execution quantity: do not turn original order size q into a liquidation print.
         self.assertIsNone(normalize_liquidation_event({
             "E": 1_700_000_000_000,
             "o": {"s": "BTCUSDT", "S": "BUY", "p": "100000", "q": "2",
-                  "l": "0", "z": "0", "T": 1_700_000_000_000}
+                  "l": "0", "z": "2", "T": 1_700_000_000_000}
         }))
 
     def test_depth_update_sequence_classification(self):
