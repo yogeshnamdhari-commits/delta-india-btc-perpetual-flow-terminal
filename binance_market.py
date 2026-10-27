@@ -607,6 +607,10 @@ class BinanceUSDMFeed:
                 }.get(event_type, stream or "unknown")
             with self.lock:
                 self.data["last_any_message_at"] = received_at
+                # Keep regular market-feed freshness separate from the
+                # independently routed high-frequency order-book connection.
+                if event_type not in {"depthUpdate", "bookTicker"}:
+                    self.data["last_market_message_at"] = received_at
                 self.data["total_messages_received"] += 1
                 self.data["channel_last_seen"][channel] = received_at
                 counts = self.data["channel_message_counts"]
@@ -623,8 +627,6 @@ class BinanceUSDMFeed:
                 self._handle_mark_price(payload)
             elif event_type == "forceOrder":
                 self._handle_liquidation(payload)
-            with self.lock:
-                self.data["last_market_message_at"] = received_at
         except (ValueError, TypeError, KeyError) as exc:
             _LOGGER.debug("Ignoring malformed Binance websocket message: %s", exc)
         except Exception:
