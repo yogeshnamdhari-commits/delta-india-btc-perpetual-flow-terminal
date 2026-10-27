@@ -56,6 +56,21 @@ class BinanceNormalizationTests(unittest.TestCase):
         self.assertFalse(row["is_closed"])
         self.assertEqual(row["volume"], 12.0)
 
+    def test_kline_handler_keeps_each_native_timeframe_separate(self):
+        feed = BinanceUSDMFeed()
+        base = {
+            "t": 1_700_000_000_000, "o": "100", "h": "110", "l": "95",
+            "c": "105", "v": "12", "q": "1250", "x": True,
+        }
+        feed._handle_kline({"k": dict(base, i="5m")})
+        feed._handle_kline({"k": dict(base, i="15m", t=1_700_000_900_000)})
+        snapshot = feed.snapshot()
+        self.assertEqual(len(snapshot["candles"]), 0)
+        self.assertEqual(len(snapshot["candles_by_interval"]["5m"]), 1)
+        self.assertEqual(len(snapshot["candles_by_interval"]["15m"]), 1)
+        self.assertEqual(snapshot["candles_by_interval"]["5m"][0]["interval"], "5m")
+        self.assertEqual(snapshot["candles_by_interval"]["15m"][0]["interval"], "15m")
+
     def test_force_order_uses_reported_filled_quantity_not_original_quantity(self):
         row = normalize_liquidation_event({
             "E": 1_700_000_000_000,
@@ -160,6 +175,10 @@ class BinanceNormalizationTests(unittest.TestCase):
         depth_url = feed._stream_url("depth")
         self.assertIn("/market/stream?streams=", market_url)
         self.assertIn("btcusdt@aggTrade", market_url)
+        self.assertIn("btcusdt@kline_1m", market_url)
+        self.assertIn("btcusdt@kline_5m", market_url)
+        self.assertIn("btcusdt@kline_15m", market_url)
+        self.assertIn("btcusdt@kline_1h", market_url)
         self.assertIn("btcusdt@forceOrder", market_url)
         self.assertNotIn("@depth", market_url)
         self.assertIn("/public/stream?streams=", depth_url)
