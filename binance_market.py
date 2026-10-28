@@ -527,13 +527,6 @@ class BinanceUSDMFeed:
             return False
 
         with self.lock:
-            self.data["last_any_message_at"] = now
-            self.data["last_market_message_at"] = now
-            self.data["total_messages_received"] += 1
-            counts = self.data["channel_message_counts"]
-            counts[event] = counts.get(event, 0) + 1
-            self.data["channel_last_seen"][event] = now
-
             if event == "aggTrade":
                 price = _positive(payload.get("p"))
                 qty = _positive(payload.get("q"))
@@ -645,6 +638,14 @@ class BinanceUSDMFeed:
                 if len(candles) > MAX_CANDLES_PER_INTERVAL:
                     for old_key in sorted(candles)[:-MAX_CANDLES_PER_INTERVAL]:
                         candles.pop(old_key, None)
+
+            # Advance freshness only after this supported event passed validation.
+            self.data["last_any_message_at"] = now
+            self.data["last_market_message_at"] = now
+            self.data["total_messages_received"] += 1
+            counts = self.data["channel_message_counts"]
+            counts[event] = counts.get(event, 0) + 1
+            self.data["channel_last_seen"][event] = now
         return True
 
     def _ingest_depth(self, payload: dict[str, Any], now: float) -> bool:
