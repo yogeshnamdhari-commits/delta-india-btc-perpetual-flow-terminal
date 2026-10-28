@@ -23,6 +23,30 @@ class BybitV5NormalizationTests(unittest.TestCase):
         self.assertAlmostEqual(sell["size_btc"], 0.03)
         self.assertIsNone(normalize_trade({"p": "NaN", "v": "0.1", "T": 1700000000000, "S": "Buy"}))
 
+    def test_public_rest_falls_back_to_official_alternate_host(self):
+        feed = BybitV5Feed(request_timeout=1)
+        primary = Mock()
+        primary.raise_for_status.side_effect = __import__("requests").HTTPError("403 Forbidden")
+        fallback = Mock()
+        fallback.raise_for_status.return_value = None
+        fallback.json.return_value = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {"list": [["1700000000000", "100", "110", "95", "105", "12", "1250"]]},
+        }
+        with patch("bybit_market.requests.get", side_effect=[primary, fallback]) as get:
+            payload = feed._get_public_rest_json(
+                "/v5/market/kline",
+                {"category": "linear", "symbol": "BTCUSDT", "interval": "1", "limit": 1},
+            )
+        self.assertEqual(payload["retCode"], 0)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[0].args[0], "https://api.bybit.com/v5/market/kline")
+        self.assertEqual(get.call_args_list[1].args[0], "https://api.bytick.com/v5/market/kline")
+        self.assertEqual(feed.data["rest_endpoint_active"], "https://api.bytick.com")
+        self.assertEqual(feed.data["rest_endpoint_health"], "official_fallback")
+        self.assertEqual(feed.data["last_rest_error"], "")
+
     def test_rest_kline_and_websocket_closed_flag(self):
         now = 1700000400
         with patch("bybit_market.time.time", return_value=now):
