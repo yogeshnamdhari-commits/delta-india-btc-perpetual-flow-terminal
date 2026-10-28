@@ -28,10 +28,12 @@ REST_BASE_URLS = (
     "https://fapi3.binance.com",
     "https://fapi4.binance.com",
 )
-STREAMS = (
+PUBLIC_STREAMS = (
     "btcusdt@depth@100ms/"
+    "btcusdt@bookTicker"
+)
+MARKET_STREAMS = (
     "btcusdt@aggTrade/"
-    "btcusdt@bookTicker/"
     "btcusdt@markPrice@1s/"
     "btcusdt@forceOrder/"
     "btcusdt@ticker/"
@@ -99,18 +101,26 @@ class BinanceUSDMFeed:
         self.symbol = symbol
         self.request_timeout = float(request_timeout)
         self.rest_base_urls = REST_BASE_URLS
-        self.ws_url = (
-            "wss://fstream.binance.com/stream?streams="
-            + STREAMS.replace("btcusdt", symbol.lower())
+        self.public_ws_url = (
+            "wss://fstream.binance.com/public/stream?streams="
+            + PUBLIC_STREAMS.replace("btcusdt", symbol.lower())
+        )
+        self.market_ws_url = (
+            "wss://fstream.binance.com/market/stream?streams="
+            + MARKET_STREAMS.replace("btcusdt", symbol.lower())
         )
         self.lock = threading.RLock()
         self._stop_event = threading.Event()
         self._started = False
-        self._ever_connected = False
+        self._channel_ever_connected = {"public": False, "market": False}
         self._snapshot_worker_active = False
-        self._ws_thread: threading.Thread | None = None
+        self._ws_thread: threading.Thread | None = None  # market thread; retained for compatibility
+        self._public_ws_thread: threading.Thread | None = None
+        self._market_ws_thread: threading.Thread | None = None
         self._oi_thread: threading.Thread | None = None
-        self._ws: websocket.WebSocketApp | None = None
+        self._ws: websocket.WebSocketApp | None = None  # market socket; retained for diagnostics
+        self._public_ws: websocket.WebSocketApp | None = None
+        self._market_ws: websocket.WebSocketApp | None = None
         self._depth_buffer: deque[dict[str, Any]] = deque(maxlen=MAX_DEPTH_BUFFER)
         self._snapshot_update_id: int | None = None
 
@@ -118,6 +128,10 @@ class BinanceUSDMFeed:
             "exchange": "Binance USDⓈ-M",
             "symbol": self.symbol,
             "connection": "not started",
+            "public_connection": "not started",
+            "market_connection": "not started",
+            "public_error": "",
+            "market_error": "",
             "last_error": "",
             "last_rest_error": "",
             "open_interest_error": "",
@@ -171,27 +185,39 @@ class BinanceUSDMFeed:
         }
 
     def start(self) -> None:
-        if self._ws_thread and self._ws_thread.is_alive():
+        threads = (self._public_ws_thread, self._market_ws_thread, self._oi_thread)
+        if any(thread is not None and thread.is_alive() for thread in threads):
             return
         self._stop_event.clear()
         self._started = True
-        self._ws_thread = threading.Thread(
-            target=self._run_forever, name=f"binance-{self.symbol.lower()}-ws", daemon=True
+        self._public_ws_thread = threading.Thread(
+            target=self._run_forever,
+            args=("public", self.public_ws_url),
+            name=f"binance-{self.symbol.lower()}-public-ws",
+            daemon=True,
         )
+        self._market_ws_thread = threading.Thread(
+            target=self._run_forever,
+            args=("market", self.market_ws_url),
+            name=f"binance-{self.symbol.lower()}-market-ws",
+            daemon=True,
+        )
+        self._ws_thread = self._market_ws_thread
         self._oi_thread = threading.Thread(
             target=self._poll_open_interest, name=f"binance-{self.symbol.lower()}-oi", daemon=True
         )
-        self._ws_thread.start()
+        self._public_ws_thread.start()
+        self._market_ws_thread.start()
         self._oi_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
-        ws = self._ws
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
+        for ws in (self._public_ws, self._market_ws, self._ws):
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -303,57 +329,96 @@ class BinanceUSDMFeed:
             ],
         }
 
-    def _run_forever(self) -> None:
+    def _refresh_overall_connection_locked(self) -> None:
+        public = str(self.data.get("public_connection", "not started"))
+        market = str(self.data.get("market_connection", "not started"))
+        if public == "connected" and market == "connected":
+            overall = "connected"
+        elif public == "not started" and market == "not started":
+            overall = "not started"
+        elif public in ("socket error", "disconnected") and market in ("socket error", "disconnected"):
+            overall = "socket error" if "socket error" in (public, market) else "disconnected"
+        elif public in ("connecting", "reconnecting") and market in ("connecting", "reconnecting"):
+            overall = "connecting" if "connecting" in (public, market) else "reconnecting"
+        elif public == "connected" or market == "connected":
+            overall = f"partial connection (public={public}, market={market})"
+        elif public in ("connecting", "reconnecting") or market in ("connecting", "reconnecting"):
+            overall = "connecting" if "connecting" in (public, market) else "reconnecting"
+        else:
+            overall = f"partial connection (public={public}, market={market})"
+        self.data["connection"] = overall
+
+    def _run_forever(self, channel: str, ws_url: str) -> None:
         delay = 2.0
         while not self._stop_event.is_set():
-            self._set_status("connecting")
+            with self.lock:
+                self.data[f"{channel}_connection"] = "connecting"
+                self._refresh_overall_connection_locked()
             try:
-                self._ws = websocket.WebSocketApp(
-                    self.ws_url,
-                    on_open=self._on_open,
+                ws = websocket.WebSocketApp(
+                    ws_url,
+                    on_open=lambda socket, ch=channel: self._on_channel_open(ch, socket),
                     on_message=self._on_message,
-                    on_error=self._on_error,
-                    on_close=self._on_close,
+                    on_error=lambda socket, error, ch=channel: self._on_channel_error(ch, error),
+                    on_close=lambda socket, code, message, ch=channel: self._on_channel_close(ch, code, message),
                 )
-                self._ws.run_forever(ping_interval=120, ping_timeout=30, skip_utf8_validation=True)
+                with self.lock:
+                    if channel == "public":
+                        self._public_ws = ws
+                    else:
+                        self._market_ws = ws
+                        self._ws = ws
+                ws.run_forever(ping_interval=120, ping_timeout=30, skip_utf8_validation=True)
             except Exception as exc:
-                self._set_status("socket error", f"{type(exc).__name__}: {exc}")
+                self._set_channel_status(channel, "socket error", f"{type(exc).__name__}: {exc}")
             if self._stop_event.is_set():
                 break
             with self.lock:
-                self.data["connection"] = "reconnecting"
-                self._invalidate_book_locked("WebSocket disconnected; awaiting new snapshot", count_gap=False)
+                self.data[f"{channel}_connection"] = "reconnecting"
+                if channel == "public":
+                    self._invalidate_book_locked("Public depth WebSocket disconnected; awaiting new snapshot", count_gap=False)
+                self._refresh_overall_connection_locked()
             self._stop_event.wait(delay)
             delay = min(delay * 1.6, 20.0)
 
-    def _set_status(self, status: str, error: str | None = None) -> None:
+    def _set_channel_status(self, channel: str, status: str, error: str | None = None) -> None:
         with self.lock:
-            self.data["connection"] = status
+            self.data[f"{channel}_connection"] = status
             if error is not None:
-                self.data["last_error"] = str(error)[:350]
+                self.data[f"{channel}_error"] = str(error)[:350]
+                self.data["last_error"] = f"{channel} WebSocket: {error}"[:350]
+            self._refresh_overall_connection_locked()
 
-    def _on_open(self, ws: websocket.WebSocketApp) -> None:
+    def _on_channel_open(self, channel: str, ws: websocket.WebSocketApp) -> None:
         with self.lock:
-            self.data["connection"] = "connected"
-            self.data["last_error"] = ""
-            self.data["book_sync_state"] = "awaiting REST snapshot"
-            if self._ever_connected:
+            self.data[f"{channel}_connection"] = "connected"
+            self.data[f"{channel}_error"] = ""
+            if self.data.get(f"{channel}_error") == "" and not self.data.get("market_error") and not self.data.get("public_error"):
+                self.data["last_error"] = ""
+            if self._channel_ever_connected[channel]:
                 self.data["total_reconnects"] += 1
-            self._ever_connected = True
-        self._schedule_snapshot_worker()
+            self._channel_ever_connected[channel] = True
+            if channel == "public":
+                self.data["book_sync_state"] = "awaiting REST snapshot"
+                self._invalidate_book_locked("Public depth WebSocket connected; awaiting fresh snapshot", count_gap=False)
+            self._refresh_overall_connection_locked()
+        if channel == "public":
+            self._schedule_snapshot_worker()
 
     def _on_message(self, ws: websocket.WebSocketApp, raw: str) -> None:
         self.ingest_message(raw)
 
-    def _on_error(self, ws: websocket.WebSocketApp, error: Any) -> None:
-        self._set_status("socket error", f"{type(error).__name__}: {error}")
+    def _on_channel_error(self, channel: str, error: Any) -> None:
+        self._set_channel_status(channel, "socket error", f"{type(error).__name__}: {error}")
 
-    def _on_close(self, ws: websocket.WebSocketApp, code: Any, message: Any) -> None:
+    def _on_channel_close(self, channel: str, ws: websocket.WebSocketApp, code: Any, message: Any) -> None:
         with self.lock:
-            if self.data.get("connection") == "connected":
+            if self.data.get(f"{channel}_connection") == "connected" and not self._stop_event.is_set():
                 self.data["total_disconnects"] += 1
-            self.data["connection"] = "disconnected"
-            self._invalidate_book_locked("WebSocket closed; book invalidated", count_gap=False)
+            self.data[f"{channel}_connection"] = "disconnected"
+            if channel == "public":
+                self._invalidate_book_locked("Public depth WebSocket closed; book invalidated", count_gap=False)
+            self._refresh_overall_connection_locked()
 
     def _invalidate_book_locked(self, reason: str, *, count_gap: bool) -> None:
         if count_gap:
@@ -452,7 +517,7 @@ class BinanceUSDMFeed:
         try:
             while not self._stop_event.is_set():
                 with self.lock:
-                    if self.data.get("connection") != "connected":
+                    if self.data.get("public_connection") != "connected":
                         return
                     self.data["book_sync_state"] = "fetching REST snapshot"
                 try:
@@ -469,7 +534,7 @@ class BinanceUSDMFeed:
 
                 self.install_snapshot_payload(snapshot, rest_host=host)
                 with self.lock:
-                    if self.data.get("connection") != "connected" or self._stop_event.is_set():
+                    if self.data.get("public_connection") != "connected" or self._stop_event.is_set():
                         return
                     if self.data.get("book_sync_state") == "resync requested":
                         retry = True
@@ -484,7 +549,7 @@ class BinanceUSDMFeed:
                 self._snapshot_worker_active = False
                 restart = (
                     not self._stop_event.is_set()
-                    and self.data.get("connection") == "connected"
+                    and self.data.get("public_connection") == "connected"
                     and self.data.get("book_sync_state") == "resync requested"
                 )
             if restart:
