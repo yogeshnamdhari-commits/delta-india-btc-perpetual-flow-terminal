@@ -90,7 +90,12 @@ class OKXHistoryFeed:
         refresh_seconds: float = 60.0,
     ):
         instrument = str(inst_id).strip().upper()
-        if not instrument or "/" not in instrument or not instrument.endswith("-SWAP"):
+        if (
+            not instrument
+            or "/" in instrument
+            or instrument.count("-") < 2
+            or not instrument.endswith("-SWAP")
+        ):
             raise ValueError("inst_id must be a linear/swap instrument such as BTC-USDT-SWAP")
         self.inst_id = instrument
         self.rest_base_urls = tuple(dict.fromkeys(str(x).rstrip("/") for x in rest_base_urls if x))
