@@ -77,6 +77,8 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any = None) -> None
         book_age = None if book_ts is None else max(0.0, now - float(book_ts))
         oi_ts = d.get("open_interest_updated_at")
         oi_age = None if oi_ts is None else max(0.0, now - float(oi_ts))
+        funding_ts = d.get("funding_updated_at")
+        funding_age = None if funding_ts is None else max(0.0, now - float(funding_ts))
 
         if d.get("connection") == "connected" and market_age is not None and market_age <= 6:
             st.success(f"Binance public stream connected · last received market message {market_age:.2f}s ago")
@@ -118,6 +120,16 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any = None) -> None
         d2.metric("Open interest", _price(oi, 4) + (" BTC" if oi is not None else ""))
         d3.metric("24h price change", "—" if change_pct is None else f"{change_pct:.3f}%")
         d4.metric("Session CVD proxy", f"{float(d.get('cvd_btc') or 0):+,.4f} BTC")
+        if funding is not None and (funding_age is None or funding_age > 10):
+            st.warning(f"Binance funding value is stale or its timestamp is unavailable (age: {'—' if funding_age is None else f'{funding_age:.1f}s'}). Treat it as unverified current funding.")
+        if oi is not None and (oi_age is None or oi_age > 45):
+            st.warning(f"Binance open interest is stale or its timestamp is unavailable (age: {'—' if oi_age is None else f'{oi_age:.1f}s'}).")
+
+        if raw_difference is not None:
+            st.caption(
+                f"Raw numeric quote difference: Binance BTCUSDT price minus Delta BTCUSD price = {raw_difference:+,.2f}. "
+                "Quote/settlement conventions and contracts differ, so this is contextual only—not an executable spread."
+            )
 
         status_cols = st.columns(4)
         status_cols[0].metric("Book synchronization", "SYNCED" if d.get("book_synced") else "INVALID / WAITING")
