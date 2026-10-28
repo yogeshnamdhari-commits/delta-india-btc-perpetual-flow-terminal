@@ -549,8 +549,13 @@ def build_market_context(feed_data: dict[str, Any], *, now_epoch: float | None =
 
     okx_history = feed_data.get("cross_venue_okx_history_context")
     if isinstance(okx_history, dict):
-        # Historical OKX candles are a third, independent reference source; never merge its bars into Delta/Bybit series.
+        # Historical OKX candles are an independent reference source; never merge its bars into Delta/Bybit/Binance series.
         context["cross_venue_okx_history"] = okx_history
+
+    binance_market = feed_data.get("cross_venue_binance_market_data")
+    if isinstance(binance_market, dict):
+        # Binance quantities, prices, book state and candles remain an isolated venue-specific context.
+        context["cross_venue_binance_market_data"] = binance_market
 
     # Defensively enforce JSON-safe values and reject NaN/Infinity.
     return json.loads(json.dumps(context, ensure_ascii=False, default=str, allow_nan=False))
