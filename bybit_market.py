@@ -19,6 +19,7 @@ import websocket
 
 _LOGGER = logging.getLogger(__name__)
 REST_BASE_URL = "https://api.bybit.com"
+REST_FALLBACK_URL = "https://api.bytick.com"
 WS_URL = "wss://stream.bybit.com/v5/public/linear"
 DEFAULT_SYMBOL = "BTCUSDT"
 TIMEFRAMES = {"1m": "1", "5m": "5", "15m": "15", "1h": "60"}
@@ -253,6 +254,7 @@ class BybitV5Feed:
         symbol: str = DEFAULT_SYMBOL,
         *,
         rest_base_url: str = REST_BASE_URL,
+        rest_fallback_url: str | None = REST_FALLBACK_URL,
         ws_url: str = WS_URL,
         request_timeout: float = 8.0,
     ):
@@ -261,6 +263,7 @@ class BybitV5Feed:
             raise ValueError("symbol must be a Bybit market symbol such as BTCUSDT")
         self.symbol = symbol
         self.rest_base_url = rest_base_url.rstrip("/")
+        self.rest_fallback_url = rest_fallback_url.rstrip("/") if rest_fallback_url else None
         self.ws_url = ws_url
         self.request_timeout = float(request_timeout)
         self.lock = threading.RLock()
@@ -271,6 +274,8 @@ class BybitV5Feed:
             "connection": "starting",
             "last_error": "",
             "last_rest_error": "",
+            "rest_endpoint_active": None,
+            "rest_endpoint_health": "not_checked",
             "started_at": now,
             "last_any_message_at": None,
             "last_market_message_at": None,
@@ -660,6 +665,47 @@ class BybitV5Feed:
         with self.lock:
             self.data["liquidations"].append(row)
 
+    def _get_public_rest_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Call a documented public REST endpoint and try Bybit's official alternate hostname.
+
+        Bybit documents api.bybit.com and api.bytick.com as mainnet REST hosts.
+        This is a host-level fallback only; it does not bypass geography, account,
+        or service-access restrictions. Every failed host is preserved in the error.
+        """
+        bases = list(dict.fromkeys(
+            base for base in (self.rest_base_url, self.rest_fallback_url) if base
+        ))
+        errors: list[str] = []
+        for base in bases:
+            try:
+                response = requests.get(
+                    f"{base}{path}",
+                    params=params,
+                    headers={"Accept": "application/json", "User-Agent": "ReadOnlyMarketMonitor/1.0"},
+                    timeout=self.request_timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("Bybit REST returned a non-object JSON response")
+                ret_code = payload.get("retCode")
+                if ret_code is not None and ret_code != 0:
+                    raise ValueError(
+                        f"Bybit REST retCode={ret_code}: {payload.get('retMsg', 'unknown API error')}"
+                    )
+                with self.lock:
+                    self.data["rest_endpoint_active"] = base
+                    self.data["rest_endpoint_health"] = "primary" if base == self.rest_base_url else "official_fallback"
+                    self.data["last_rest_error"] = ""
+                return payload
+            except Exception as exc:
+                errors.append(f"{base}: {type(exc).__name__}: {str(exc)[:180]}")
+        summary = "All configured Bybit public REST hosts failed: " + " | ".join(errors)
+        with self.lock:
+            self.data["rest_endpoint_health"] = "unavailable"
+            self.data["last_rest_error"] = summary[:500]
+        raise RuntimeError(summary)
+
     def _poll_rest(self) -> None:
         last_ticker_poll = 0.0
         next_candle_retry = {tf: 0.0 for tf in TIMEFRAMES}
@@ -675,19 +721,13 @@ class BybitV5Feed:
                     continue
                 next_candle_retry[timeframe] = now_mono + 30.0
                 try:
-                    response = requests.get(
-                        f"{self.rest_base_url}/v5/market/kline",
-                        params={
+                    payload = self._get_public_rest_json(
+                        "/v5/market/kline",
+                        {
                             "category": "linear", "symbol": self.symbol,
                             "interval": interval, "limit": 1000,
                         },
-                        headers={"Accept": "application/json", "User-Agent": "ReadOnlyMarketMonitor/1.0"},
-                        timeout=self.request_timeout,
                     )
-                    response.raise_for_status()
-                    payload = response.json()
-                    if not isinstance(payload, dict) or payload.get("retCode") != 0:
-                        raise ValueError(f"Bybit kline API error: {payload.get('retCode') if isinstance(payload, dict) else 'invalid response'}")
                     raw_rows = payload.get("result", {}).get("list", [])
                     rows = [x for x in (normalize_rest_kline(row, timeframe) for row in raw_rows) if x]
                     if not rows:
@@ -713,16 +753,10 @@ class BybitV5Feed:
             if now_mono - last_ticker_poll >= 15.0:
                 last_ticker_poll = now_mono
                 try:
-                    response = requests.get(
-                        f"{self.rest_base_url}/v5/market/tickers",
-                        params={"category": "linear", "symbol": self.symbol},
-                        headers={"Accept": "application/json", "User-Agent": "ReadOnlyMarketMonitor/1.0"},
-                        timeout=self.request_timeout,
+                    payload = self._get_public_rest_json(
+                        "/v5/market/tickers",
+                        {"category": "linear", "symbol": self.symbol},
                     )
-                    response.raise_for_status()
-                    payload = response.json()
-                    if not isinstance(payload, dict) or payload.get("retCode") != 0:
-                        raise ValueError(f"Bybit ticker API error: {payload.get('retCode') if isinstance(payload, dict) else 'invalid response'}")
                     rows = payload.get("result", {}).get("list", [])
                     if not rows:
                         raise ValueError("Bybit ticker API returned no data")
