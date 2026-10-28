@@ -78,6 +78,27 @@ def test_websocket_streams_use_current_binance_public_and_market_routes():
     assert "/stream?streams=" not in public_url.replace("/public/stream?streams=", "")
     assert "/stream?streams=" not in market_url.replace("/market/stream?streams=", "")
 
+
+def test_split_websocket_connections_track_partial_health_and_close_safely():
+    feed = BinanceUSDMFeed()
+    feed._stop_event.set()  # Prevent snapshot worker side effects in this callback unit test.
+
+    feed._on_channel_open("public", None)
+    assert feed.snapshot()["public_connection"] == "connected"
+    assert feed.snapshot()["connection"] != "connected"
+
+    feed._on_channel_open("market", None)
+    state = feed.snapshot()
+    assert state["market_connection"] == "connected"
+    assert state["connection"] == "connected"
+
+    feed._on_channel_close("market", None, 1000, "unit-test close")
+    state = feed.snapshot()
+    assert state["public_connection"] == "connected"
+    assert state["market_connection"] == "disconnected"
+    assert state["connection"].startswith("partial connection")
+    assert state["book_synced"] is False
+
 def test_aggregate_trade_side_and_cvd_use_buyer_is_maker_flag():
     feed = BinanceUSDMFeed()
     assert feed.ingest_message(envelope("aggTrade", {
