@@ -250,6 +250,14 @@ def _render_bybit_panel(feed: BybitV5Feed, delta_feed: Any) -> None:
             "5-closed-candle return": f"{ret:+.3f}%" if ret is not None else "—",
             "20-bar structure": str(metrics.get("last_20_vs_previous_20_bar_structure", "—")).replace("_", " "),
         })
+    history_loaded = snap.get("candle_history_loaded") or {}
+    missing_history = [tf for tf in INTERVAL_SECONDS if not history_loaded.get(tf)]
+    if missing_history:
+        st.warning(
+            "Historical REST warm-up is incomplete for: " + ", ".join(missing_history) +
+            ". The live WebSocket may populate the current candles, but it does not replace the 1,000-bar historical warm-up. "
+            "EMA/ATR/structure values can remain unavailable or use insufficient lookback until history loads."
+        )
     st.markdown("**Calculated Bybit multi-timeframe technical context**")
     st.dataframe(pd.DataFrame(technical_rows), use_container_width=True, hide_index=True)
     st.caption(
@@ -324,6 +332,10 @@ def _render_bybit_panel(feed: BybitV5Feed, delta_feed: Any) -> None:
             })
         if channel_rows:
             st.dataframe(pd.DataFrame(channel_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "REST host status: " + str(snap.get("rest_endpoint_health", "not checked")) +
+            " · active host: " + str(snap.get("rest_endpoint_active") or "none")
+        )
         diag = st.columns(4)
         diag[0].metric("Messages total", str(snap.get("message_count", 0)))
         diag[1].metric("Disconnects", str(snap.get("total_disconnects", 0)))
