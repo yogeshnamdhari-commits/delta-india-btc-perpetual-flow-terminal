@@ -249,20 +249,23 @@ class OKXHistoryFeed:
                     self.data["history_errors"][timeframe] = error
         with self.lock:
             self.data["rest_endpoint_active"] = active_base or self.data.get("rest_endpoint_active")
-            if all(self.data["history_loaded"].values()):
+            poll_success_count = sum(1 for ok in results.values() if ok)
+            loaded_count = sum(1 for ok in self.data["history_loaded"].values() if ok)
+            if poll_success_count == len(TIMEFRAMES):
                 self.data["rest_endpoint_health"] = "healthy"
                 self.data["connection"] = "connected"
                 self.data["last_success_at"] = time.time()
                 self.data["last_error"] = ""
-            elif any(self.data["history_loaded"].values()):
+            elif poll_success_count > 0:
                 self.data["rest_endpoint_health"] = "partial"
                 self.data["connection"] = "partial"
-                if errors:
-                    self.data["last_error"] = "; ".join(f"{k}: {v}" for k, v in errors.items())[:500]
                 self.data["last_success_at"] = time.time()
+                self.data["last_error"] = "; ".join(f"{k}: {v}" for k, v in errors.items())[:500]
             else:
-                self.data["rest_endpoint_health"] = "unavailable"
-                self.data["connection"] = "unavailable"
+                # Previously loaded candles remain available for display, but a failed
+                # poll must not refresh the last-success timestamp or imply fresh data.
+                self.data["rest_endpoint_health"] = "stale" if loaded_count else "unavailable"
+                self.data["connection"] = "stale" if loaded_count else "unavailable"
                 self.data["last_error"] = "; ".join(f"{k}: {v}" for k, v in errors.items())[:500]
         return results
 
