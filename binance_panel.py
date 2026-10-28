@@ -252,7 +252,7 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any = None) -> None
             liquidation_rows = []
             for item in liquidation_events[:15]:
                 liquidation_rows.append({
-                    "Event time (UTC)": _time_ist(float(item.get("time_ms") or 0) / 1000),
+                    "Event time (IST)": _time_ist(float(item.get("time_ms") or 0) / 1000),
                     "Side": item.get("side"),
                     "Status": item.get("status"),
                     "Price (USDT)": item.get("price_usdt"),
