@@ -13,6 +13,8 @@ The dashboard adds an independent public-data-only Binance BTCUSDT perpetual ref
 
 The feed buffers depth@100ms events, obtains /fapi/v1/depth?symbol=BTCUSDT&limit=1000, bridges the snapshot update ID with buffered diff-depth updates, and then requires pu continuity for subsequent updates. A sequence break invalidates and clears the local book and requests a fresh REST snapshot. Only a synchronized book is displayed as valid.
 
+Transient network/service failures may retry through configured official Binance hosts. An explicit HTTP 403 or 451 stops host fallback immediately; the adapter reports access denied and leaves the book unavailable rather than probing more hosts.
+
 Binance's public USDⓈ-M depth stream does not provide the Delta-style CRC32 checksum. The UI explicitly says checksum unavailable. The initial REST snapshot covers up to 1000 levels per side; levels outside that range remain unknown until changed by a stream update. This is a local synchronized book, not a claim to possess the exchange's complete order book.
 
 ## Data boundaries and limitations
