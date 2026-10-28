@@ -486,7 +486,10 @@ class BinanceUSDMFeed:
                     return payload, base_url
                 except _RegionalAccessDenied as exc:
                     errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
-                    break
+                    raise _RegionalAccessDenied(
+                        "Binance USDⓈ-M depth snapshot unavailable after explicit access denial: "
+                        + " | ".join(errors)
+                    ) from exc
                 except Exception as exc:
                     errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
             raise RuntimeError("Binance USDⓈ-M depth snapshot unavailable: " + " | ".join(errors))
@@ -547,6 +550,14 @@ class BinanceUSDMFeed:
                     self.data["book_sync_state"] = "fetching REST snapshot"
                 try:
                     snapshot, host = self._fetch_depth_snapshot()
+                except _RegionalAccessDenied as exc:
+                    if self._stop_event.is_set():
+                        return
+                    with self.lock:
+                        self.data["last_rest_error"] = f"{type(exc).__name__}: {exc}"[:700]
+                        self.data["book_sync_state"] = "REST access denied (HTTP 403/451); depth unavailable"
+                        self.data["last_error"] = self.data["book_sync_state"]
+                    return
                 except Exception as exc:
                     if self._stop_event.is_set():
                         return
@@ -845,6 +856,7 @@ class BinanceUSDMFeed:
             while not self._stop_event.is_set():
                 errors = []
                 succeeded = False
+                access_denied = False
                 for base_url in self.rest_base_urls:
                     if self._stop_event.is_set():
                         break
@@ -874,12 +886,15 @@ class BinanceUSDMFeed:
                         break
                     except _RegionalAccessDenied as exc:
                         errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
+                        access_denied = True
                         break
                     except Exception as exc:
                         errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
                 if not succeeded and not self._stop_event.is_set():
                     with self.lock:
                         self.data["open_interest_error"] = " | ".join(errors)[:700]
+                if access_denied:
+                    return
                 self._stop_event.wait(OPEN_INTEREST_POLL_SECONDS)
         finally:
             session.close()
