@@ -1,0 +1,348 @@
+import json
+import unittest
+from unittest.mock import Mock, patch
+from streamlit.testing.v1 import AppTest
+from datetime import datetime, timezone
+
+from ai_analyst import (
+    KILO_PROVIDER,
+    _ask_kilo_free,
+    _extract_chat_completion_text,
+    _extract_responses_api_text,
+    _question_with_context,
+    _technical_indicators,
+    build_market_context,
+)
+
+
+class AiAnalystContextTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 1_700_000_000.0
+        minute = int(self.now // 60) * 60
+        self.feed = {
+            "connection": "connected",
+            "book_synced": True,
+            "sequence_gap_unresolved": False,
+            "checksum_ok": True,
+            "sequence_gaps": 0,
+            "checksum_failures": 0,
+            "total_disconnects": 1,
+            "total_reconnects": 1,
+            "channel_message_counts": {"ticker": 25, "trades": 500},
+            "channel_last_seen": {"ticker": self.now - 2, "trades": self.now - 0.5},
+            "last_price": 101.5,
+            "mark_price": 101.4,
+            "index_price": 101.0,
+            "bid": 101.0,
+            "ask": 102.0,
+            "bid_size": 12,
+            "ask_size": 8,
+            "funding_rate": 0.0001,
+            "funding_interval_seconds": 28800,
+            "next_funding_at": self.now + 3600,
+            "open_interest_contracts": 12345,
+            "ticker_24h": {
+                "open": 99, "high": 104, "low": 98, "close": 101,
+                "mark_change_pct": 1.2,
+            },
+            "trade_count": 501,
+            "buy_contracts": 700,
+            "sell_contracts": 450,
+            "cvd_value": 250,
+            "asks": {"103.0": 4, "102.0": 8},
+            "bids": {"99.0": 3, "101.0": 12},
+            "trades": [
+                {"timestamp": self.now, "side": "BUY TAKER", "buyer_role": "t", "price": 101.5, "size": 4},
+                {"timestamp": self.now - 1, "side": "SELL TAKER", "buyer_role": "m", "price": 101, "size": 2},
+            ],
+            "candles": [
+                {"time": int(self.now) - 60, "open": 100, "high": 102, "low": 99, "close": 101, "volume": 40}
+            ],
+            "trade_flow_minutes": {
+                minute: {"buy_count": 3, "sell_count": 2, "buy_contracts": 10, "sell_contracts": 4},
+                minute - 60: {"buy_count": 1, "sell_count": 4, "buy_contracts": 2, "sell_contracts": 9},
+            },
+            "large_trades": [
+                {"ts": self.now - 5, "side": "buy", "price": 101, "size": 20, "threshold": 15}
+            ],
+            "trade_clusters": [
+                {"side": "buy", "price": 101, "contracts": 40, "trade_count": 6, "ignored": "not included"}
+            ],
+        }
+
+    def test_context_contains_live_metrics_and_derived_spread(self):
+        context = build_market_context(self.feed, now_epoch=self.now)
+        self.assertEqual(context["instrument"]["symbol"], "BTCUSD")
+        self.assertEqual(context["instrument"]["product_id"], 27)
+        self.assertEqual(context["price_and_quotes"]["bid"], 101)
+        self.assertEqual(context["price_and_quotes"]["ask"], 102)
+        self.assertEqual(context["price_and_quotes"]["spread_price_calculated"], 1)
+        self.assertAlmostEqual(context["price_and_quotes"]["spread_bps_calculated"], 10000 / 101.5, places=3)
+        self.assertEqual(context["funding"]["interval_seconds"], 28800)
+        self.assertEqual(context["open_interest_contracts"], 12345)
+
+    def test_book_is_sorted_best_first_and_recent_tape_is_bounded(self):
+        context = build_market_context(self.feed, now_epoch=self.now)
+        asks = context["order_book"]["asks_best_to_worse"]
+        bids = context["order_book"]["bids_best_to_worse"]
+        self.assertEqual([r["price"] for r in asks], [102, 103])
+        self.assertEqual([r["price"] for r in bids], [101, 99])
+        self.assertEqual(len(context["recent_trades"]), 2)
+        self.assertEqual(context["recent_trades"][0]["buyer_role"], "t")
+
+
+
+    def test_completed_candle_technical_metrics_use_explicit_formulas(self):
+        minute_now = int(self.now // 60) * 60
+        candles = []
+        for i in range(250):
+            close = 100.0 + i * 0.1
+            candles.append({
+                "time": minute_now - (250 - i) * 60,
+                "open": close - 0.05,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": 10.0,
+            })
+        self.feed["candles"] = candles
+        context = build_market_context(self.feed, now_epoch=self.now)
+        metrics = context["technical_indicators_1m"]
+        self.assertEqual(metrics["completed_candle_count"], 250)
+        self.assertEqual(metrics["ema_alignment"], "bullish_alignment")
+        self.assertAlmostEqual(metrics["atr_14_price"], 2.0, places=5)
+        self.assertAlmostEqual(metrics["latest_volume_vs_preceding_20_mean_ratio"], 1.0, places=5)
+        self.assertIsNotNone(metrics["ema_20_50_144_200"]["200"]["value"])
+        self.assertIn("seeded with the first period's SMA", metrics["ema_method"])
+
+    def test_technical_indicators_respect_native_five_minute_candle_boundary(self):
+        five_minute_now = int(self.now // 300) * 300
+        candles = []
+        for i in range(250):
+            close = 1000.0 + i * 0.5
+            candles.append({
+                "time": five_minute_now - (250 - i) * 300,
+                "open": close - 0.1,
+                "high": close + 2.0,
+                "low": close - 2.0,
+                "close": close,
+                "volume": 30.0,
+                "is_closed": True,
+            })
+        # Deliberately in-progress candle must never be included.
+        candles.append({
+            "time": five_minute_now,
+            "open": 1125.0, "high": 1130.0, "low": 1120.0, "close": 1125.0,
+            "volume": 999.0, "is_closed": False,
+        })
+        metrics = _technical_indicators(
+            {"candles": candles, "candle_interval_seconds": 300, "timeframe": "5m"},
+            now_epoch=self.now,
+            current_price=1125.0,
+        )
+        self.assertEqual(metrics["timeframe"], "5m")
+        self.assertEqual(metrics["completed_candle_count"], 250)
+        self.assertAlmostEqual(metrics["latest_closed_volume"], 30.0)
+        self.assertEqual(metrics["ema_alignment"], "bullish_alignment")
+        self.assertIsNotNone(metrics["ema_200"]["value"] if "ema_200" in metrics else metrics["ema_20_50_144_200"]["200"]["value"])
+
+    def test_order_book_imbalance_is_only_reported_with_valid_book_health(self):
+        context = build_market_context(self.feed, now_epoch=self.now)
+        book = context["order_book"]
+        self.assertTrue(book["imbalance_data_valid"])
+        self.assertAlmostEqual(book["top_5_imbalance_pct_calculated"], (15 - 12) / 27 * 100, places=6)
+        self.feed["checksum_ok"] = False
+        invalid = build_market_context(self.feed, now_epoch=self.now)
+        self.assertIsNone(invalid["order_book"]["top_5_imbalance_pct_calculated"])
+        self.assertFalse(invalid["order_book"]["imbalance_data_valid"])
+
+
+    def test_delta_market_structure_context_is_preserved_for_detailed_narration(self):
+        self.feed["delta_market_structure"] = {
+            "source": "Delta Exchange India BTCUSD public market data; read-only.",
+            "calculation_parameters": {"exhaustion_min_aggressor_ratio": 1.25},
+            "supply_demand_order_blocks": [{
+                "classification": "DEMAND",
+                "lower": 100.0,
+                "upper": 101.0,
+                "displacement_x_atr_calculated": 1.2,
+            }],
+            "confirmed_price_sweep_candidates": [{
+                "candidate": "above-high / buy-side liquidity sweep",
+                "overshoot_points_calculated": 3.0,
+                "interpretation_limit": "Stop orders are not proven.",
+            }],
+            "observed_resting_liquidity": {
+                "available": False,
+                "reason": "Withheld until book integrity passes.",
+            },
+        }
+        context = build_market_context(self.feed, now_epoch=self.now)
+        self.assertEqual(context["delta_market_structure"]["source"], "Delta Exchange India BTCUSD public market data; read-only.")
+        self.assertEqual(context["delta_market_structure"]["calculation_parameters"]["exhaustion_min_aggressor_ratio"], 1.25)
+        self.assertEqual(context["delta_market_structure"]["supply_demand_order_blocks"][0]["classification"], "DEMAND")
+        self.assertFalse(context["delta_market_structure"]["observed_resting_liquidity"]["available"])
+        prompt = _question_with_context("Narrate every calculated market-structure parameter.", context)
+        self.assertIn("confirmed_price_sweep_candidates", prompt)
+        self.assertIn("overshoot_points_calculated", prompt)
+
+
+    def test_okx_history_context_is_kept_separate_from_delta_and_bybit(self):
+        self.feed["cross_venue_market_data"] = {
+            "venue": "Bybit V5 Linear",
+            "symbol": "BTCUSDT",
+            "technical_indicators_by_timeframe": {"1m": {"ema_alignment": "bullish_alignment"}},
+        }
+        self.feed["cross_venue_okx_history_context"] = {
+            "venue": "OKX",
+            "instrument": "BTC-USDT-SWAP",
+            "data_role": "independent historical candle reference only; not merged into Bybit or Delta",
+            "history": {"1m": {"loaded": True, "closed_candles": 300}},
+            "technical_indicators_by_timeframe": {"1m": {"ema_alignment": "mixed_alignment"}},
+        }
+        context = build_market_context(self.feed, now_epoch=self.now)
+        self.assertEqual(context["instrument"]["venue"], "Delta Exchange India")
+        self.assertEqual(context["cross_venue_market_data"]["venue"], "Bybit V5 Linear")
+        self.assertEqual(context["cross_venue_okx_history"]["venue"], "OKX")
+        self.assertEqual(
+            context["cross_venue_okx_history"]["technical_indicators_by_timeframe"]["1m"]["ema_alignment"],
+            "mixed_alignment",
+        )
+        prompt = _question_with_context("Compare all independent data sources.", context)
+        self.assertIn("OKX", prompt)
+        self.assertIn("Bybit V5 Linear", prompt)
+
+    def test_cross_venue_context_is_preserved_as_a_separate_source(self):
+        self.feed["cross_venue_market_data"] = {
+            "venue": "Bybit V5 Linear",
+            "symbol": "BTCUSDT",
+            "open_interest_btc": 12.5,
+            "order_book": {"synced_from_bybit_snapshot_deltas": True, "bids_top5": [{"price": 100, "size_btc": 0.1}]},
+            "liquidation_data_limitations": ["not a predictive map of untriggered liquidation prices"],
+        }
+        context = build_market_context(self.feed, now_epoch=self.now)
+        self.assertEqual(context["cross_venue_market_data"]["venue"], "Bybit V5 Linear")
+        self.assertEqual(context["cross_venue_market_data"]["open_interest_btc"], 12.5)
+        self.assertEqual(context["instrument"]["venue"], "Delta Exchange India")
+        prompt = _question_with_context("Explain BTC structure in detail.", context)
+        self.assertIn("separately labeled alternative-exchange", prompt)
+
+    def test_flow_context_marks_historical_validation_as_unavailable(self):
+        context = build_market_context(self.feed, now_epoch=self.now)
+        self.assertTrue(context["recent_15m_aggressor_flow"])
+        self.assertEqual(context["recent_15m_aggressor_flow"][-1]["net_aggressor_contracts"], -1)
+        self.assertFalse(context["historical_validation"]["historical_market_wide_trade_archive_in_this_context"])
+        self.assertFalse(context["historical_validation"]["oos_profitability_certified_by_this_live_snapshot"])
+
+    def test_context_is_json_serializable_and_rejects_non_finite_numbers(self):
+        data = dict(self.feed)
+        data["last_price"] = float("nan")
+        context = build_market_context(data, now_epoch=self.now)
+        self.assertIsNone(context["price_and_quotes"]["last_trade_price"])
+        serialised = json.dumps(context, allow_nan=False)
+        self.assertTrue(serialised)
+
+    def test_question_includes_compact_context_and_question(self):
+        context = build_market_context(self.feed, now_epoch=self.now)
+        prompt = _question_with_context("Is the spread wide?", context)
+        self.assertIn('"symbol":"BTCUSD"', prompt)
+        self.assertIn("Is the spread wide?", prompt)
+        self.assertIn("CURRENT DELTA EXCHANGE MARKET SNAPSHOT", prompt)
+
+    def test_kilo_chat_completion_text_extraction(self):
+        payload = {
+            "choices": [
+                {"message": {"role": "assistant", "content": "Kilo response text"}}
+            ]
+        }
+        self.assertEqual(_extract_chat_completion_text(payload), "Kilo response text")
+        content_blocks = {
+            "choices": [{"message": {"content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"},
+            ]}}]
+        }
+        self.assertEqual(_extract_chat_completion_text(content_blocks), "first\n\nsecond")
+        self.assertEqual(_extract_chat_completion_text({"choices": []}), "")
+
+    def test_kilo_free_provider_rejects_paid_model_ids(self):
+        with self.assertRaisesRegex(RuntimeError, "ending in ':free'"):
+            _ask_kilo_free(
+                "test question",
+                {"instrument": {"symbol": "BTCUSD"}},
+                [],
+                "paid-model",
+            )
+
+    def test_openai_responses_text_extraction_handles_output_content(self):
+        payload = {
+            "output": [
+                {"type": "reasoning", "content": []},
+                {"type": "message", "content": [
+                    {"type": "output_text", "text": "Evidence first."},
+                    {"type": "output_text", "text": "Then interpretation."},
+                ]},
+            ]
+        }
+        self.assertEqual(
+            _extract_responses_api_text(payload),
+            "Evidence first.\n\nThen interpretation.",
+        )
+        self.assertEqual(_extract_responses_api_text({"output_text": "Direct answer"}), "Direct answer")
+
+
+    @patch("ai_analyst.requests.post")
+    def test_kilo_free_request_contract_without_api_key(self, mock_post):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": "Evidence-based test answer"}}]
+        }
+        mock_post.return_value = response
+        context = {"instrument": {"symbol": "BTCUSD"}, "price_and_quotes": {"last_trade_price": 101.5}}
+
+        with patch("ai_analyst._read_kilo_api_key", return_value=None):
+            answer = _ask_kilo_free(
+                "Summarize current data", context, [], "nvidia/nemotron-3.5-super-vl:free"
+            )
+
+        self.assertEqual(answer, "Evidence-based test answer")
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+        self.assertEqual(args[0], "https://ai-gateway.kilo.ai/api/v1/chat/completions")
+        self.assertNotIn("Authorization", kwargs["headers"])
+        self.assertEqual(kwargs["json"]["model"], "nvidia/nemotron-3.5-super-vl:free")
+        self.assertEqual(kwargs["json"]["stream"], False)
+        self.assertIn("CURRENT DELTA EXCHANGE MARKET SNAPSHOT", kwargs["json"]["messages"][-1]["content"])
+        self.assertIn("Summarize current data", kwargs["json"]["messages"][-1]["content"])
+        response.raise_for_status.assert_called_once()
+
+    @patch("ai_analyst.requests.post")
+    def test_kilo_rate_limit_returns_actionable_error(self, mock_post):
+        response = Mock()
+        response.status_code = 429
+        mock_post.return_value = response
+        with patch("ai_analyst._read_kilo_api_key", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "rate limit reached"):
+                _ask_kilo_free(
+                    "test question", {"instrument": {"symbol": "BTCUSD"}}, [],
+                    "nvidia/nemotron-3.5-super-vl:free"
+                )
+        response.raise_for_status.assert_not_called()
+
+    def test_streamlit_panel_renders_kilo_as_default_provider(self):
+        script = (
+            "from ai_analyst import render_ai_analyst\n"
+            "render_ai_analyst({'connection': 'disconnected', 'book_synced': False})\n"
+        )
+        app = AppTest.from_string(script).run(timeout=15)
+        self.assertEqual(len(app.exception), 0, [e.message for e in app.exception])
+        self.assertTrue(app.selectbox, "AI provider selectbox did not render")
+        self.assertEqual(app.selectbox[0].value, KILO_PROVIDER)
+        self.assertTrue(app.text_input, "Kilo free model input did not render")
+        self.assertEqual(app.text_input[0].value, "nvidia/nemotron-3.5-super-vl:free")
+        self.assertTrue(app.chat_input, "AI question input did not render")
+
+
+if __name__ == "__main__":
+    unittest.main()
