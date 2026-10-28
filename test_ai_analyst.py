@@ -186,6 +186,32 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertIn("confirmed_price_sweep_candidates", prompt)
         self.assertIn("overshoot_points_calculated", prompt)
 
+
+    def test_okx_history_context_is_kept_separate_from_delta_and_bybit(self):
+        self.feed["cross_venue_market_data"] = {
+            "venue": "Bybit V5 Linear",
+            "symbol": "BTCUSDT",
+            "technical_indicators_by_timeframe": {"1m": {"ema_alignment": "bullish_alignment"}},
+        }
+        self.feed["cross_venue_okx_history_context"] = {
+            "venue": "OKX",
+            "instrument": "BTC-USDT-SWAP",
+            "data_role": "independent historical candle reference only; not merged into Bybit or Delta",
+            "history": {"1m": {"loaded": True, "closed_candles": 300}},
+            "technical_indicators_by_timeframe": {"1m": {"ema_alignment": "mixed_alignment"}},
+        }
+        context = build_market_context(self.feed, now_epoch=self.now)
+        self.assertEqual(context["instrument"]["venue"], "Delta Exchange India")
+        self.assertEqual(context["cross_venue_market_data"]["venue"], "Bybit V5 Linear")
+        self.assertEqual(context["cross_venue_okx_history"]["venue"], "OKX")
+        self.assertEqual(
+            context["cross_venue_okx_history"]["technical_indicators_by_timeframe"]["1m"]["ema_alignment"],
+            "mixed_alignment",
+        )
+        prompt = _question_with_context("Compare all independent data sources.", context)
+        self.assertIn("OKX", prompt)
+        self.assertIn("Bybit V5 Linear", prompt)
+
     def test_cross_venue_context_is_preserved_as_a_separate_source(self):
         self.feed["cross_venue_market_data"] = {
             "venue": "Bybit V5 Linear",
