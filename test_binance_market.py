@@ -218,6 +218,21 @@ def test_invalid_json_wrong_symbols_and_invalid_trades_are_ignored():
     assert state["last_market_message_at"] is None
 
 
+
+def test_analyst_context_exposes_each_route_and_rest_snapshot_error():
+    feed = BinanceUSDMFeed()
+    feed.data["connection"] = "partial connection (public=connected, market=disconnected)"
+    feed.data["public_connection"] = "connected"
+    feed.data["market_connection"] = "disconnected"
+    feed.data["last_rest_error"] = "HTTP 451 access denied; REST snapshot unavailable"
+    context = feed.analyst_context()
+
+    assert context["connection"] == "partial connection (public=connected, market=disconnected)"
+    assert context["connection_details"]["public_websocket"] == "connected"
+    assert context["connection_details"]["market_websocket"] == "disconnected"
+    assert "HTTP 451" in context["connection_details"]["last_rest_error"]
+    assert "HTTP 451" in context["order_book"]["rest_snapshot_error"]
+
 def test_snapshot_is_copy_and_book_is_never_claimed_crc_verified():
     feed = BinanceUSDMFeed()
     feed.install_snapshot_payload(snapshot_payload(100))
