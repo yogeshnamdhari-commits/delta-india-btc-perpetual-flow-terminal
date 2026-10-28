@@ -219,6 +219,23 @@ def test_invalid_json_wrong_symbols_and_invalid_trades_are_ignored():
 
 
 
+
+def test_stale_snapshot_generation_cannot_replace_book_after_reconnect():
+    feed = BinanceUSDMFeed()
+    feed._book_generation = 7
+
+    installed = feed.install_snapshot_payload(
+        snapshot_payload(101),
+        rest_host="test",
+        expected_generation=6,
+    )
+    state = feed.snapshot()
+
+    assert installed is False
+    assert state["book_snapshot_count"] == 0
+    assert state["book_bids"] == {}
+    assert state["book_asks"] == {}
+
 def test_analyst_context_exposes_each_route_and_rest_snapshot_error():
     feed = BinanceUSDMFeed()
     feed.data["connection"] = "partial connection (public=connected, market=disconnected)"
