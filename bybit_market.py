@@ -177,10 +177,10 @@ def apply_book_update(
         if update_id == previous_update_id:
             return bids, asks, previous_update_id, previous_sequence, "duplicate"
         return bids, asks, previous_update_id, previous_sequence, "update_id_regression"
-    # Bybit update IDs advance with book updates. A skipped ID means the local
-    # state may have missed a delta, so invalidate rather than guessing.
-    if update_id > previous_update_id + 1:
-        return bids, asks, previous_update_id, previous_sequence, "update_id_gap"
+    # The V5 public orderbook contract documents u as an update ID but does not
+    # promise that it increments by exactly one for every delivered delta. Apply
+    # ordered WebSocket deltas when u increases; invalidate on regressions or
+    # non-increasing cross-sequence instead of rejecting legitimate larger jumps.
     if sequence is not None and previous_sequence is not None and sequence <= previous_sequence:
         return bids, asks, previous_update_id, previous_sequence, "sequence_regression"
 
