@@ -19,6 +19,7 @@ import streamlit as st
 import websocket
 
 import orderflow
+from binance_reference import BinanceReferenceFeed
 from signal_integration_bridge import evaluate_feed_snapshot
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
@@ -1918,6 +1919,16 @@ def get_feed() -> DeltaFeed:
 
 feed = get_feed()
 
+
+@st.cache_resource(show_spinner=False)
+def get_binance_reference_feed() -> BinanceReferenceFeed:
+    reference = BinanceReferenceFeed()
+    reference.start()
+    return reference
+
+
+binance_reference_feed = get_binance_reference_feed()
+
 with st.sidebar:
     st.header("Terminal settings")
     timeframe = st.selectbox("Chart timeframe", ["1m", "3m", "5m", "15m"], index=0)
@@ -1989,7 +2000,7 @@ with st.sidebar:
             os.rename(trigger_file, trigger_file + ".executed")
 
 st.title("Delta India · BTC Perpetual Flow Terminal")
-st.caption("Direct public WebSocket · BTCUSD · read-only market-data workspace · all times IST")
+st.caption("Delta India BTCUSD primary feed + Binance BTCUSDT reference · read-only · all times IST")
 
 # propagate overlay settings to the persistent feed (leaf writes; thread-safe)
 feed.liq_percentile = float(liq_percentile)
@@ -2044,6 +2055,146 @@ def render_status_panel() -> None:
     m4.metric("Best bid", _fmt(best_bid, 2), help=f"Top bid size: {_fmt(best_bid_size, 0)} contracts")
     m5.metric("Best ask", _fmt(best_ask, 2), help=f"Top ask size: {_fmt(best_ask_size, 0)} contracts")
     m6.metric("Spread", f"{_fmt(spread, 2)} / {_fmt(spread_bps, 2)} bps")
+
+
+
+@st.fragment(run_every=2.0)
+def render_binance_reference_panel() -> None:
+    """Independent Binance BTCUSDT reference data; never used by Delta signals."""
+    with st.expander("Cross-exchange reference — Binance BTCUSDT (read-only)", expanded=False):
+        d = binance_reference_feed.snapshot()
+        delta = feed.snapshot()
+        now = time.time()
+        msg_ts = d.get("last_market_message_at")
+        msg_age = None if msg_ts is None else max(0.0, now - float(msg_ts))
+        book_ts = d.get("book_updated_at")
+        book_age = None if book_ts is None else max(0.0, now - float(book_ts))
+
+        if d.get("connection") == "connected" and msg_age is not None and msg_age <= 6:
+            st.success(f"Binance public feed connected · latest market message {msg_age:.2f}s ago")
+        elif d.get("connection") == "connected":
+            st.warning("Binance socket is connected, but market data is stale or has not arrived yet.")
+        else:
+            st.warning(f"Binance public feed status: {d.get('connection', 'unknown')}")
+
+        st.caption(
+            "Independent BTCUSDT context only. This panel does not override Delta signals, "
+            "repair Delta history, or contribute to Delta's historical coverage gate."
+        )
+
+        bid, ask = d.get("bid"), d.get("ask")
+        spread = ask - bid if bid is not None and ask is not None and ask >= bid else None
+        midpoint = (ask + bid) / 2 if spread is not None else None
+        spread_bps = spread / midpoint * 10000 if spread is not None and midpoint else None
+        funding = d.get("funding_rate")
+        oi = d.get("open_interest_btc")
+        price_difference = (
+            delta.get("last_price") - d.get("last_price")
+            if delta.get("last_price") is not None and d.get("last_price") is not None
+            else None
+        )
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Binance last (USDT)", _fmt(d.get("last_price"), 2))
+        c2.metric("Binance mark", _fmt(d.get("mark_price"), 2))
+        c3.metric("Best bid", _fmt(bid, 2), help=f"Displayed quantity: {_fmt(d.get('bid_qty_btc'), 4)} BTC")
+        c4.metric("Best ask", _fmt(ask, 2), help=f"Displayed quantity: {_fmt(d.get('ask_qty_btc'), 4)} BTC")
+        c5.metric("Spread", "—" if spread is None else f"{spread:.2f} / {spread_bps:.2f} bps")
+        c6.metric("Funding rate", "—" if funding is None else f"{funding * 100:.5f}%")
+
+        c7, c8, c9, c10 = st.columns(4)
+        c7.metric("Open interest (BTC)", _fmt(oi, 3))
+        c8.metric("Session CVD proxy (BTC)", _fmt(d.get("cvd_btc"), 4))
+        c9.metric("Delta last − Binance last", _fmt(price_difference, 2))
+        last_liquidation = d.get("last_liquidation")
+        liq_label = "—"
+        if isinstance(last_liquidation, dict):
+            liq_qty = _number = last_liquidation.get("qty_btc")
+            liq_side = str(last_liquidation.get("side", "unknown"))
+            liq_label = f"{liq_side} · {_fmt(liq_qty, 4)} BTC"
+        c10.metric("Latest liquidation sample", liq_label)
+
+        if d.get("last_error"):
+            st.warning(f"Binance WebSocket: {d['last_error']}")
+        oi_updated = d.get("open_interest_updated_at")
+        oi_age = None if oi_updated is None else max(0.0, now - float(oi_updated))
+        st.caption(
+            f"Open-interest update age: {'—' if oi_age is None else f'{oi_age:.1f}s'} · "
+            f"Top-20 book update age: {'—' if book_age is None else f'{book_age:.2f}s'} · "
+            f"Messages received: {int(d.get('total_messages_received', 0)):,} · "
+            f"Reconnects: {int(d.get('total_reconnects', 0)):,}"
+        )
+        if d.get("open_interest_error") and oi is None:
+            st.caption(f"Open interest unavailable: {d['open_interest_error']}")
+
+        if d.get("book_ready") and book_age is not None and book_age <= 3:
+            def _reference_book_frame(book: dict[float, float], reverse: bool) -> pd.DataFrame:
+                levels = sorted(book.items(), key=lambda item: item[0], reverse=reverse)[:10]
+                cumulative = 0.0
+                rows = []
+                for price, quantity in levels:
+                    cumulative += float(quantity)
+                    rows.append({"Price (USDT)": float(price), "Qty (BTC)": float(quantity), "Cum. BTC": cumulative})
+                return pd.DataFrame(rows, columns=["Price (USDT)", "Qty (BTC)", "Cum. BTC"])
+
+            book_ask, book_bid = st.columns(2)
+            with book_ask:
+                st.markdown("**Binance asks · partial top-20 snapshot**")
+                asks_df = _reference_book_frame(d.get("asks", {}), False)
+                st.dataframe(
+                    asks_df.style.format({"Price (USDT)": "{:,.2f}", "Qty (BTC)": "{:,.4f}", "Cum. BTC": "{:,.4f}"}),
+                    hide_index=True, use_container_width=True, height=250,
+                )
+            with book_bid:
+                st.markdown("**Binance bids · partial top-20 snapshot**")
+                bids_df = _reference_book_frame(d.get("bids", {}), True)
+                st.dataframe(
+                    bids_df.style.format({"Price (USDT)": "{:,.2f}", "Qty (BTC)": "{:,.4f}", "Cum. BTC": "{:,.4f}"}),
+                    hide_index=True, use_container_width=True, height=250,
+                )
+        else:
+            st.warning("Binance partial-depth snapshot is missing or stale. Do not rely on displayed depth.")
+
+        trades = d.get("recent_trades", [])
+        if trades:
+            st.markdown("**Recent Binance aggregate trades**")
+            trade_rows = []
+            for item in trades[:10]:
+                ts = item.get("time_ms")
+                try:
+                    time_label = datetime.fromtimestamp(float(ts) / 1000, timezone.utc).astimezone(TZ_IST).strftime("%H:%M:%S")
+                except (TypeError, ValueError, OSError, OverflowError):
+                    time_label = "—"
+                trade_rows.append({
+                    "Time (IST)": time_label,
+                    "Aggressor": item.get("side", "unknown"),
+                    "Price (USDT)": item.get("price_usdt"),
+                    "Qty (BTC)": item.get("qty_btc"),
+                })
+            trade_df = pd.DataFrame(trade_rows)
+            st.dataframe(
+                trade_df.style.format({"Price (USDT)": "{:,.2f}", "Qty (BTC)": "{:,.4f}"}),
+                hide_index=True, use_container_width=True, height=250,
+            )
+
+        if isinstance(last_liquidation, dict):
+            liq_time = last_liquidation.get("time_ms")
+            try:
+                liq_time_label = datetime.fromtimestamp(float(liq_time) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            except (TypeError, ValueError, OSError, OverflowError):
+                liq_time_label = "time unavailable"
+            st.caption(
+                f"Last force-order stream sample: {last_liquidation.get('side', 'unknown')} · "
+                f"price {_fmt(last_liquidation.get('price_usdt'), 2)} USDT · "
+                f"{liq_time_label}. This sampled stream is not a complete liquidation tape."
+            )
+
+        st.caption(
+            "CVD is a session-only proxy classified from Binance's buyer-is-maker field. "
+            "Binance depth is a partial top-20 feed without Delta's sequence/CRC guarantees. "
+            "Delta BTCUSD is USD-quoted and INR-settled while Binance BTCUSDT is USDT-quoted; "
+            "the displayed price difference is context, not an executable spread."
+        )
 
 
 _CHART_STATE: dict[str, Any] = {"emitted_sig": None, "height": 700}
@@ -2573,7 +2724,7 @@ def render_diagnostics_panel() -> None:
         "- This client checks order-book sequence continuity and CRC32 on book messages that include a checksum. Any gap or mismatch triggers a book resubscription.\n"
         "- Market-data timestamps/ages measure when this client receives messages; they do **not** prove zero network or exchange latency.\n"
         "- This app is read-only: it cannot place, edit, or cancel orders. Public market data does not require API credentials.\n"
-        "- The app cannot establish that an exchange is manipulation-free. Cross-venue comparison would be a separate data feed and is not included in this initial build.\n"
+        "- The app cannot establish that an exchange is manipulation-free. The Binance reference feed is separate from Delta data and never bypasses signal gates or fills Delta historical-data gaps.\n"
         f"- **Session events**: {disconnect_count} disconnect(s), {reconnect_count} reconnect(s)"
     )
 
@@ -2583,6 +2734,7 @@ def render_diagnostics_panel() -> None:
 # refresh fragments so only live data re-renders.
 # ---------------------------------------------------------------------------
 render_status_panel()
+render_binance_reference_panel()
 
 # zero-height same-origin iframe: mirrors the chart's axis view into the URL so
 # zoom/pan survives Streamlit's Plotly element re-creation on every refresh
