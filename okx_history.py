@@ -186,7 +186,7 @@ class OKXHistoryFeed:
             },
             "limitations": [
                 "Only independent OKX public OHLCV candle snapshots are provided; this source has no Bybit/Delta order book, trades, funding or liquidation stream.",
-                "Candle history from OKX remains a separate venue and is not substituted into another venue's candles, signal engine, backtest or release evaluator.",
+                "OKX history is not merged into Bybit or Delta candles and is not substituted into another venue's signal engine, backtest or release evaluator.",
                 "The in-memory set is limited to the latest 300 candles per timeframe and is refreshed by polling.",
             ],
         }
