@@ -234,6 +234,25 @@ class AiAnalystContextTests(unittest.TestCase):
         self.assertFalse(context["historical_validation"]["historical_market_wide_trade_archive_in_this_context"])
         self.assertFalse(context["historical_validation"]["oos_profitability_certified_by_this_live_snapshot"])
 
+    def test_binance_cross_venue_context_is_preserved_separately(self):
+        data = dict(self.feed)
+        data["cross_venue_binance_market_data"] = {
+            "source": {"exchange": "Binance USDⓈ-M", "symbol": "BTCUSDT", "quote_asset": "USDT"},
+            "order_book": {"synced": True, "checksum": "not provided"},
+            "trade_flow": {"cvd_btc_since_process_start": 0.125},
+        }
+        context = build_market_context(data, now_epoch=self.now)
+        self.assertEqual(
+            context["cross_venue_binance_market_data"]["source"]["symbol"],
+            "BTCUSDT",
+        )
+        self.assertEqual(
+            context["cross_venue_binance_market_data"]["trade_flow"]["cvd_btc_since_process_start"],
+            0.125,
+        )
+        self.assertNotIn("cross_venue_binance_market_data", context["price_and_quotes"])
+        json.dumps(context, allow_nan=False)
+
     def test_context_is_json_serializable_and_rejects_non_finite_numbers(self):
         data = dict(self.feed)
         data["last_price"] = float("nan")

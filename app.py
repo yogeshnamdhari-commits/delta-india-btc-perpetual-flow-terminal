@@ -20,6 +20,10 @@ import websocket
 
 import orderflow
 from signal_integration_bridge import evaluate_feed_snapshot
+from ai_analyst import render_ai_analyst
+from bybit_panel import render_bybit_cross_venue_panel
+from okx_history_panel import render_okx_history_panel
+from binance_panel import render_binance_cross_venue_panel
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -1187,7 +1191,8 @@ def _price_action_analytics(closed: list[dict[str, Any]], lookback: int, displac
         zone="body" if zone_basis == "Candle body" else "range", max_zones=10)
     orderflow.update_zone_statuses(zones, window)
     eq = orderflow.equal_levels(swings, tolerance=eq_tol)
-    session = orderflow.session_levels(window, now_epoch=time.time())
+    # Session high/low use all currently loaded completed candles, not just the shorter order-block lookback window.
+    session = orderflow.session_levels(closed, now_epoch=time.time())
     pools = ([{"kind": s["kind"], "price": s["price"], "time": s["time"]} for s in swings[-12:]]
              + [{"kind": g["kind"], "price": g["price"], "time": g["last_time"]} for g in eq[-8:]])
     if "session_high" in session:
@@ -1236,35 +1241,56 @@ def _book_liquidity(d: dict[str, Any], liq_pct: float, band_ticks: int) -> dict[
 
 
 def _liquidity_level_rows(d: dict[str, Any], liq: dict[str, Any], now: float) -> list[dict[str, Any]]:
-    """Significant observed bands now, plus previously significant bands the
-    sampler has not seen for >6s (removed/faded)."""
+    """Report measured live book bands with transparent size and notional metrics.
+
+    "Intensity" is quantity relative to the current adaptive significance
+    threshold; it is not a liquidation probability or a forecast of execution.
+    Removed rows retain only their last-seen size and are marked non-live.
+    """
     rows = []
+    threshold = _f(liq.get("threshold") or d.get("book_liq_threshold"), 0.0) or 0.0
     for side, bands in (("bid", liq["sig_bid"]), ("ask", liq["sig_ask"])):
         for b in bands[:10]:
             st = d["level_stats"].get((side, b["price"]))
             dur = max(0.0, now - st["first_seen"]) if st else 0.0
-            rows.append({"Side": "BID" if side == "bid" else "ASK", "Price": b["price"],
-                         "Contracts": b["size"], "BTC equiv": b["size"] * CONTRACT_VALUE_BTC,
-                         "Levels": b["levels"], "Observed": f"{dur:.0f}s", "Status": "active"})
+            size = float(b["size"])
+            price = float(b["price"])
+            rows.append({
+                "Side": "BID" if side == "bid" else "ASK",
+                "Price": price,
+                "Contracts": size,
+                "BTC equiv": size * CONTRACT_VALUE_BTC,
+                "Approx USD notional": size * CONTRACT_VALUE_BTC * price,
+                "Intensity x threshold": (size / threshold) if threshold > 0 else None,
+                "Levels": b["levels"],
+                "Observed": f"{dur:.0f}s",
+                "Status": "active",
+            })
     current_keys = {(side, b["price"])
                     for side, bands in (("bid", liq["sig_bid"]), ("ask", liq["sig_ask"])) for b in bands}
     removed = []
     for (side, price), st in d["level_stats"].items():
         if (side, price) in current_keys or now - st["last_seen"] < 6:
             continue
-        removed.append({"Side": "BID" if side == "bid" else "ASK", "Price": price,
-                        "Contracts": st["last_size"], "BTC equiv": st["last_size"] * CONTRACT_VALUE_BTC,
-                        "Levels": None, "Observed": f"{max(0.0, st['last_seen'] - st['first_seen']):.0f}s",
-                        "Status": f"removed (last seen {_ist_str(st['last_seen'])})",
-                        "_last": st["last_seen"]})
+        last_size = float(st["last_size"])
+        removed.append({
+            "Side": "BID" if side == "bid" else "ASK",
+            "Price": float(price),
+            "Contracts": last_size,
+            "BTC equiv": last_size * CONTRACT_VALUE_BTC,
+            "Approx USD notional": last_size * CONTRACT_VALUE_BTC * float(price),
+            "Intensity x threshold": None,
+            "Levels": None,
+            "Observed": f"{max(0.0, st['last_seen'] - st['first_seen']):.0f}s",
+            "Status": f"removed (last seen {_ist_str(st['last_seen'])})",
+            "_last": st["last_seen"],
+        })
     removed.sort(key=lambda r: r["_last"], reverse=True)
-    for r in removed[:20]:          # bound the display; sampler keeps the rest
+    for r in removed[:20]:
         r.pop("_last", None)
         rows.append(r)
     rows.sort(key=lambda r: (r["Side"], -r["Price"] if r["Side"] == "BID" else r["Price"]))
     return rows
-
-
 def _large_trade_rows(d: dict[str, Any], limit: int = 20) -> list[dict[str, Any]]:
     rows = []
     for t in list(d["large_trades"])[-limit:][::-1]:
@@ -1835,27 +1861,6 @@ def _build_price_figure(d: dict[str, Any], timeframe: str, pa: dict[str, Any] | 
         "timeframe": timeframe,
         "criteria": exhaustion_diagnostics if toggles.get("exhaust") else {},
     }
-
-    # Export diagnostic state for terminal-based inspection.
-    diagnostic_path = os.environ.get(
-        "DELTA_EXHAUSTION_DIAGNOSTICS_FILE",
-        "/tmp/delta_india_exhaustion_diagnostics.json",
-    )
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(diagnostic_path)), exist_ok=True)
-        payload = {
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-            **_FIG_CACHE["exhaustion_status"],
-        }
-        temporary_path = diagnostic_path + ".tmp"
-        with open(temporary_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, allow_nan=False)
-            handle.write("\n")
-        os.replace(temporary_path, diagnostic_path)
-    except (OSError, TypeError, ValueError) as exc:
-        logging.getLogger(__name__).warning(
-            "Could not export exhaustion diagnostics: %s", exc
-        )
 
     _add_orderflow_overlays(fig, d, pa_overlay, liq, toggles, now, y_range, x_span)
     fig.update_layout(
@@ -2431,31 +2436,65 @@ def render_flow_panel() -> None:
     aggressive clusters, derived pools and the captured depth heatmap."""
     d = feed.snapshot()
     now = time.time()
-    book_ready = bool(d["book_synced"]) and bool(d["asks"]) and bool(d["bids"])
+    book_integrity_ok = (
+        bool(d.get("book_synced"))
+        and not bool(d.get("sequence_gap_unresolved", True))
+        and d.get("checksum_ok") is True
+    )
+    book_ready = book_integrity_ok and bool(d["asks"]) and bool(d["bids"])
     pa = None
     closed = _closed_candles(d)
     if closed:
         pa = _price_action_analytics(closed, ob_lookback, ob_displacement,
                                      ob_zone_basis, eq_tolerance)
     liq = _book_liquidity(d, float(liq_percentile), 2) if book_ready else None
+
+    with st.expander("Authentic market-wide liquidation levels", expanded=True):
+        st.warning(
+            "UNAVAILABLE — this dashboard subscribes to Delta's public market-data channels, "
+            "which do not publish market-wide liquidation executions or liquidation-price clusters. "
+            "The documented liquidation reason appears in private/account order notifications; that "
+            "does not establish an all-market liquidation feed. No synthetic liquidation levels or "
+            "intensity scores are displayed."
+        )
+        st.caption(
+            "A position's own liquidation price is account/margin-specific and is not a market-wide "
+            "liquidation map. To add authentic levels later, a verified market-wide data source and "
+            "instrument-specific schema are required."
+        )
+
     flow_l, flow_r = st.columns([1, 1], gap="large")
     with flow_l:
         st.markdown("**Observed resting liquidity (live book)**")
         if not book_ready:
-            st.warning("Order-book-derived levels unavailable: book not sequence-synced. Price-action signals below remain available.")
+            st.warning(
+                "Observed order-book levels are withheld unless the book is sequence-synced, "
+                "CRC/checksum-valid, and has no unresolved sequence gap. Price-action-derived "
+                "zones and sweeps may still be shown separately."
+            )
         else:
             lvl_rows = _liquidity_level_rows(d, liq, now)
             if lvl_rows:
                 lvl_df = pd.DataFrame(lvl_rows)
-                st.dataframe(lvl_df.style.format({"Price": "{:,.1f}", "Contracts": "{:,.0f}",
-                                                  "BTC equiv": "{:,.3f}"}),
-                             hide_index=True, use_container_width=True, height=300)
+                st.dataframe(
+                    lvl_df.style.format({
+                        "Price": "{:,.1f}",
+                        "Contracts": "{:,.0f}",
+                        "BTC equiv": "{:,.3f}",
+                        "Approx USD notional": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.0f}",
+                        "Intensity x threshold": "{:.2f}x",
+                    }, na_rep="—"),
+                    hide_index=True, use_container_width=True, height=300,
+                )
             else:
                 st.caption("No level currently exceeds the adaptive significance threshold.")
             thr = d.get("book_liq_threshold")
             st.caption(
                 f"Adaptive threshold: {'— (not enough bands yet)' if thr is None else f'{thr:,.0f} contracts (p{int(liq_percentile)} of banded depth)'} · "
-                f"bands aggregate within ±{BOOK_TICK * 2:.1f} price points · durations measured since first observed")
+                f"bands aggregate within ±{BOOK_TICK * 2:.1f} price points · durations measured since first observed. "
+                "Intensity = contracts ÷ adaptive threshold; approximate USD notional = contracts × 0.001 BTC × price. "
+                "These are observed resting orders, not proof that the orders will remain or execute."
+            )
     with flow_r:
         st.markdown("**Large executed trades (actual tape)**")
         trade_thr = d.get("large_trade_threshold")
@@ -2505,14 +2544,128 @@ def render_flow_panel() -> None:
                 st.caption("No equal levels confirmed in the current lookback.")
         with pool2:
             st.markdown("**Confirmed sweeps**")
-            sweep_rows = [{"Type": "High swept" if s["kind"] == "high" else "Low swept",
-                           "Price": s["price"], "Swept at (IST)": _ist_str(s["sweep_time"])}
-                          for s in (pa["swept"][-12:] if pa else [])]
+            sweep_rows = [{
+                "Candidate": (
+                    "Above-high sweep (buy-side liquidity)"
+                    if s["kind"] == "high"
+                    else "Below-low sweep (sell-side liquidity)"
+                ),
+                "Level": s["price"],
+                "Breach extreme": s.get("breach_price"),
+                "Overshoot (pts)": s.get("overshoot_points"),
+                "Reclaim delay (bars)": s.get("reclaim_delay_bars"),
+                "Reclaim close": s.get("reclaim_close"),
+                "Breach at (IST)": _ist_str(s.get("exceed_time")),
+                "Extreme at (IST)": _ist_str(s.get("breach_extreme_time")),
+                "Reclaim at (IST)": _ist_str(s.get("sweep_time")),
+            } for s in (pa["swept"][-12:] if pa else [])]
             if sweep_rows:
-                st.dataframe(pd.DataFrame(sweep_rows).style.format({"Price": "{:,.1f}"}),
-                             hide_index=True, use_container_width=True, height=200)
+                st.dataframe(
+                    pd.DataFrame(sweep_rows).style.format({
+                        "Level": "{:,.1f}",
+                        "Breach extreme": "{:,.1f}",
+                        "Overshoot (pts)": "{:,.1f}",
+                        "Reclaim close": "{:,.1f}",
+                    }, na_rep="—"),
+                    hide_index=True, use_container_width=True, height=230,
+                )
             else:
-                st.caption("No confirmed sweeps. A touch without a documented reclaim is not labelled a sweep.")
+                st.caption("No confirmed price sweeps. A touch or break without a close back through the level within the configured reclaim window is not labelled a sweep.")
+            st.caption(
+                "A confirmed price sweep is a stop-hunt candidate, not proof that stop orders actually existed or were triggered. "
+                "Overshoot and reclaim timing are measured from completed candles."
+            )
+    with st.expander("Supply / demand zones (price-action-derived)", expanded=True):
+        zones = (pa or {}).get("zones", [])
+        last_price = _f(d.get("last_price"))
+        zone_rows = []
+        for z in zones:
+            top = _f(z.get("top"))
+            bottom = _f(z.get("bottom"))
+            if top is None or bottom is None or top < bottom:
+                continue
+            midpoint = (top + bottom) / 2.0
+            distance = (midpoint - last_price) if last_price is not None else None
+            displacement = _f(z.get("displacement_x_atr"))
+            zone_rows.append({
+                "Zone": "DEMAND" if z.get("direction") == "bullish" else "SUPPLY",
+                "Lower": bottom,
+                "Upper": top,
+                "Midpoint": midpoint,
+                "Width (pts)": top - bottom,
+                "Displacement (x ATR)": displacement,
+                "Distance to mid (pts)": distance,
+                "Status": str(z.get("status", "unknown")).upper(),
+                "Confirmed (IST)": _ist_str(z.get("confirmed_time")),
+            })
+        zone_rows.sort(key=lambda r: (
+            r["Status"] == "INVALIDATED",
+            abs(r["Distance to mid (pts)"]) if r["Distance to mid (pts)"] is not None else float("inf"),
+            -(r["Displacement (x ATR)"] or 0.0),
+        ))
+        if zone_rows:
+            st.dataframe(
+                pd.DataFrame(zone_rows[:12]).style.format({
+                    "Lower": "{:,.1f}",
+                    "Upper": "{:,.1f}",
+                    "Midpoint": "{:,.1f}",
+                    "Width (pts)": "{:,.1f}",
+                    "Displacement (x ATR)": "{:.2f}",
+                    "Distance to mid (pts)": "{:+,.1f}",
+                }, na_rep="—"),
+                hide_index=True, use_container_width=True, height=300,
+            )
+        else:
+            st.caption("No confirmed supply/demand zones in the current completed-candle lookback.")
+        st.caption(
+            "Demand = bullish order-block candidates; supply = bearish order-block candidates. "
+            "Displacement (x ATR) quantifies the confirming price move, not resting order size or a probability. "
+            "Zone boundaries are derived from completed candles and do not prove institutional orders exist there."
+        )
+
+    with st.expander("Buy / sell exhaustion (1-minute candle + observed tape)", expanded=True):
+        exhaustion = orderflow.detect_exhaustion_labels(
+            closed,
+            d.get("trade_log", []),
+            timeframe_seconds=60,
+            lookback=10,
+            min_trades=5,
+            imbalance_ratio=1.25,
+            min_wick_ratio=0.35,
+            close_position_limit=0.65,
+        ) if closed else []
+        exhaustion_rows = [{
+            "Type": "BUY exhaustion · bearish risk" if e["kind"] == "buy_exhaust" else "SELL exhaustion · bullish risk",
+            "Time (IST)": _ist_str(e.get("time")),
+            "Price": e.get("price"),
+            "Buy aggr. contracts": e.get("buy_contracts"),
+            "Sell aggr. contracts": e.get("sell_contracts"),
+            "Dominant-side ratio": e.get("aggressor_ratio"),
+            "Wick (% range)": 100.0 * e.get("wick_ratio", 0.0),
+            "Close position (%)": 100.0 * e.get("close_position", 0.0),
+            "Classified prints": e.get("trade_count"),
+        } for e in exhaustion[-8:][::-1]]
+        if exhaustion_rows:
+            st.dataframe(
+                pd.DataFrame(exhaustion_rows).style.format({
+                    "Price": "{:,.1f}",
+                    "Buy aggr. contracts": "{:,.0f}",
+                    "Sell aggr. contracts": "{:,.0f}",
+                    "Dominant-side ratio": "{:.2f}x",
+                    "Wick (% range)": "{:.1f}%",
+                    "Close position (%)": "{:.1f}%",
+                    "Classified prints": "{:,.0f}",
+                }, na_rep="—"),
+                hide_index=True, use_container_width=True, height=260,
+            )
+        else:
+            st.caption("No buy/sell exhaustion candidates meet the existing completed-candle and tape-flow rules. Thresholds are not relaxed to force labels.")
+        st.caption(
+            "BUY exhaustion: a new local high rejects with an upper wick and buy-aggressor imbalance (bearish risk). "
+            "SELL exhaustion: a new local low rejects with a lower wick and sell-aggressor imbalance (bullish risk). "
+            "This is a heuristic context label, not proof of a reversal or an entry signal."
+        )
+
     if show_depth_heat:
         st.markdown("**Observed depth heatmap (captured samples only)**")
         fig_heat = _depth_heatmap(d)
@@ -2573,7 +2726,7 @@ def render_diagnostics_panel() -> None:
         "- This client checks order-book sequence continuity and CRC32 on book messages that include a checksum. Any gap or mismatch triggers a book resubscription.\n"
         "- Market-data timestamps/ages measure when this client receives messages; they do **not** prove zero network or exchange latency.\n"
         "- This app is read-only: it cannot place, edit, or cancel orders. Public market data does not require API credentials.\n"
-        "- The app cannot establish that an exchange is manipulation-free. Cross-venue comparison would be a separate data feed and is not included in this initial build.\n"
+        "- The app cannot establish that an exchange is manipulation-free. The separate Bybit, Binance and OKX references are cross-venue context only; they do not replace Delta source data or bypass signal-release gates.\n"
         f"- **Session events**: {disconnect_count} disconnect(s), {reconnect_count} reconnect(s)"
     )
 
@@ -2617,6 +2770,221 @@ if show_flow_panel:
 
 from datetime import datetime, timezone
 import time as _time
+
+
+def _build_ai_market_structure_context(data: dict[str, Any]) -> dict[str, Any]:
+    """Package the actual Delta flow-panel calculations for grounded AI narration.
+
+    Uses the same sidebar parameters and detectors as the visible panels; it
+    never alters the frozen signal evaluator or its release criteria.
+    """
+    now = time.time()
+    closed = _closed_candles(data)
+    pa = (
+        _price_action_analytics(
+            closed, ob_lookback, ob_displacement, ob_zone_basis, eq_tolerance
+        )
+        if closed else {"swings": [], "eq": [], "zones": [], "session": {}, "swept": []}
+    )
+
+    def utc_time(value: Any) -> str | None:
+        numeric = _f(value)
+        if numeric is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(numeric), tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    session = pa.get("session") or {}
+    utc_day_start = datetime.fromtimestamp(now, tz=timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).timestamp()
+    session_candles = [
+        candle for candle in closed
+        if _f(candle.get("time")) is not None and float(candle["time"]) >= utc_day_start
+    ]
+    first_session_candle = min(
+        (float(c["time"]) for c in session_candles if _f(c.get("time")) is not None),
+        default=None,
+    )
+
+    zones = []
+    for zone in (pa.get("zones") or [])[-12:]:
+        top, bottom = _f(zone.get("top")), _f(zone.get("bottom"))
+        if top is None or bottom is None or top < bottom:
+            continue
+        zones.append({
+            "classification": "DEMAND" if zone.get("direction") == "bullish" else "SUPPLY",
+            "direction": zone.get("direction"),
+            "lower": bottom,
+            "upper": top,
+            "midpoint_calculated": (bottom + top) / 2.0,
+            "width_points_calculated": top - bottom,
+            "displacement_x_atr_calculated": _f(zone.get("displacement_x_atr")),
+            "status": zone.get("status"),
+            "formation_time_utc": utc_time(zone.get("formation_time")),
+            "confirmation_time_utc": utc_time(zone.get("confirmed_time")),
+            "reference_swing_price": _f(zone.get("swing_price")),
+        })
+
+    sweeps = []
+    for sweep in (pa.get("swept") or [])[-12:]:
+        sweeps.append({
+            "candidate": "above-high / buy-side liquidity sweep" if sweep.get("kind") == "high" else "below-low / sell-side liquidity sweep",
+            "level": _f(sweep.get("price")),
+            "breach_extreme": _f(sweep.get("breach_price")),
+            "overshoot_points_calculated": _f(sweep.get("overshoot_points")),
+            "reclaim_delay_bars": sweep.get("reclaim_delay_bars"),
+            "reclaim_close": _f(sweep.get("reclaim_close")),
+            "level_time_utc": utc_time(sweep.get("time")),
+            "first_breach_time_utc": utc_time(sweep.get("exceed_time")),
+            "extreme_time_utc": utc_time(sweep.get("breach_extreme_time")),
+            "reclaim_time_utc": utc_time(sweep.get("sweep_time")),
+            "interpretation_limit": "Price breach and reclaim are observed; actual stop orders or stop executions are not proven.",
+        })
+
+    exhaustion_raw = orderflow.detect_exhaustion_labels(
+        closed,
+        data.get("trade_log", []),
+        timeframe_seconds=60,
+        lookback=10,
+        min_trades=5,
+        imbalance_ratio=1.25,
+        min_wick_ratio=0.35,
+        close_position_limit=0.65,
+    ) if closed else []
+    exhaustion = [{
+        "type": row.get("kind"),
+        "time_utc": utc_time(row.get("time")),
+        "price": _f(row.get("price")),
+        "buy_aggressor_contracts": _f(row.get("buy_contracts")),
+        "sell_aggressor_contracts": _f(row.get("sell_contracts")),
+        "dominant_aggressor_ratio": _f(row.get("aggressor_ratio")),
+        "wick_ratio_of_range": _f(row.get("wick_ratio")),
+        "close_position_0_to_1": _f(row.get("close_position")),
+        "classified_print_count": row.get("trade_count"),
+    } for row in exhaustion_raw[-8:]]
+
+    book_valid = (
+        bool(data.get("book_synced"))
+        and not bool(data.get("sequence_gap_unresolved", True))
+        and data.get("checksum_ok") is True
+        and bool(data.get("bids")) and bool(data.get("asks"))
+    )
+    observed_liquidity: dict[str, Any] = {
+        "available": False,
+        "reason": "Withheld unless the live Delta book is synchronized, checksum-valid and gap-free.",
+    }
+    if book_valid:
+        liquidity_metrics = _book_liquidity(data, float(liq_percentile), 2)
+        rows = _liquidity_level_rows(data, liquidity_metrics, now)
+        active = [
+            {
+                "side": row.get("Side"),
+                "price": _f(row.get("Price")),
+                "contracts": _f(row.get("Contracts")),
+                "btc_equivalent_calculated": _f(row.get("BTC equiv")),
+                "approx_usd_notional_calculated": _f(row.get("Approx USD notional")),
+                "intensity_x_threshold_calculated": _f(row.get("Intensity x threshold")),
+                "observed_duration": row.get("Observed"),
+                "status": row.get("Status"),
+            }
+            for row in rows if row.get("Status") == "active"
+        ]
+        removed = [
+            {
+                "side": row.get("Side"),
+                "price": _f(row.get("Price")),
+                "last_observed_contracts": _f(row.get("Contracts")),
+                "status": row.get("Status"),
+            }
+            for row in rows if str(row.get("Status", "")).startswith("removed")
+        ]
+        active.sort(
+            key=lambda row: row.get("intensity_x_threshold_calculated") or 0.0,
+            reverse=True,
+        )
+        observed_liquidity = {
+            "available": True,
+            "basis": "Current synchronized Delta BTCUSD resting L2 book; not guaranteed execution.",
+            "adaptive_percentile": float(liq_percentile),
+            "threshold_contracts": _f(liquidity_metrics.get("threshold") or data.get("book_liq_threshold")),
+            "intensity_formula": "band contracts / current adaptive threshold",
+            "approx_usd_notional_formula": "contracts × 0.001 BTC/contract × price",
+            "active_levels": active[:10],
+            "recently_removed_levels": removed[:6],
+        }
+
+    recent_swings = [{
+        "kind": "swing_high" if item.get("kind") == "high" else "swing_low",
+        "price": _f(item.get("price")),
+        "time_utc": utc_time(item.get("time")),
+    } for item in (pa.get("swings") or [])[-12:]]
+    equal_levels = [{
+        "kind": "equal_highs" if item.get("kind") == "high" else "equal_lows",
+        "mean_price_calculated": _f(item.get("price")),
+        "touch_count": item.get("count"),
+        "last_touch_time_utc": utc_time(item.get("last_time")),
+        "configured_tolerance_points": float(eq_tolerance),
+    } for item in (pa.get("eq") or [])[-10:]]
+
+    trade_rows = [
+        {"ts": item[0], "side": item[3], "size": item[2]}
+        for item in data.get("trade_log", [])
+        if isinstance(item, (tuple, list)) and len(item) >= 4
+    ]
+    rolling_flow = orderflow.rolling_aggressor_metrics(
+        trade_rows, float(cvd_window_min) * 60.0
+    )
+
+    return {
+        "source": "Delta Exchange India BTCUSD public market data; read-only.",
+        "completed_1m_candles_available": len(closed),
+        "calculation_parameters": {
+            "order_block_lookback_candles": int(ob_lookback),
+            "order_block_displacement_threshold_x_atr": float(ob_displacement),
+            "order_block_zone_basis": str(ob_zone_basis),
+            "equal_level_tolerance_points": float(eq_tolerance),
+            "sweep_reclaim_window_bars": 3,
+            "exhaustion_lookback_bars": 10,
+            "exhaustion_min_classified_prints": 5,
+            "exhaustion_min_aggressor_ratio": 1.25,
+            "exhaustion_min_wick_ratio": 0.35,
+            "exhaustion_close_position_limit": 0.65,
+            "rolling_cvd_window_minutes": int(cvd_window_min),
+        },
+        "current_utc_session": {
+            "utc_day_start": utc_time(utc_day_start),
+            "session_high": _f(session.get("session_high")),
+            "session_high_time_utc": utc_time(session.get("session_high_time")),
+            "session_low": _f(session.get("session_low")),
+            "session_low_time_utc": utc_time(session.get("session_low_time")),
+            "first_loaded_candle_in_current_utc_day": utc_time(first_session_candle),
+            "first_loaded_candle_at_or_before_utc_day_start": bool(
+                first_session_candle is not None and first_session_candle <= utc_day_start
+            ),
+            "coverage_note": "Session highs/lows use available completed candles for the current UTC day; incomplete historical coverage must be stated.",
+        },
+        "swing_high_low_candidates": recent_swings,
+        "equal_high_low_clusters": equal_levels,
+        "supply_demand_order_blocks": zones,
+        "confirmed_price_sweep_candidates": sweeps,
+        "buy_sell_exhaustion_candidates": exhaustion,
+        "rolling_aggressor_flow": {
+            "window_minutes": int(cvd_window_min),
+            "buy_aggressor_contracts": _f(rolling_flow.get("buy_contracts")),
+            "sell_aggressor_contracts": _f(rolling_flow.get("sell_contracts")),
+            "net_cvd_contracts": _f(rolling_flow.get("cvd_contracts")),
+            "formula": "net CVD = sum of buy-aggressor contracts - sum of sell-aggressor contracts in the rolling window.",
+            "window_is_bounded_by_in_memory_trade_log": True,
+        },
+        "observed_resting_liquidity": observed_liquidity,
+        "liquidation_data": {
+            "delta_market_wide_levels_available": False,
+            "reason": "Delta's currently subscribed public channels do not supply a verified market-wide liquidation feed. Do not infer market-wide liquidation prices from an account liquidation price.",
+        },
+    }
 
 
 def _log_signal_gate_diagnostic(
@@ -2741,5 +3109,17 @@ if show_signal_panel:
 
 with st.expander("Feed diagnostics and limitations", expanded=False):
     render_diagnostics_panel()
+
+# Independent Bybit V5 public feed adds cross-venue context without altering the
+# Delta-specific detector, signal engine, frozen evaluator, or release gate.
+bybit_analyst_context = render_bybit_cross_venue_panel(feed)
+okx_history_context = render_okx_history_panel()
+binance_analyst_context = render_binance_cross_venue_panel(feed)
+ai_snapshot = feed.snapshot()
+ai_snapshot["cross_venue_market_data"] = bybit_analyst_context
+ai_snapshot["cross_venue_okx_history_context"] = okx_history_context
+ai_snapshot["cross_venue_binance_market_data"] = binance_analyst_context
+ai_snapshot["delta_market_structure"] = _build_ai_market_structure_context(ai_snapshot)
+render_ai_analyst(ai_snapshot)
 
 chart_driver()
