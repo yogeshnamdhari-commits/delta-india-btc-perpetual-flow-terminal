@@ -2109,7 +2109,7 @@ def render_binance_reference_panel() -> None:
         last_liquidation = d.get("last_liquidation")
         liq_label = "—"
         if isinstance(last_liquidation, dict):
-            liq_qty = _number = last_liquidation.get("qty_btc")
+            liq_qty = last_liquidation.get("qty_btc")
             liq_side = str(last_liquidation.get("side", "unknown"))
             liq_label = f"{liq_side} · {_fmt(liq_qty, 4)} BTC"
         c10.metric("Latest liquidation sample", liq_label)
@@ -2175,6 +2175,28 @@ def render_binance_reference_panel() -> None:
             st.dataframe(
                 trade_df.style.format({"Price (USDT)": "{:,.2f}", "Qty (BTC)": "{:,.4f}"}),
                 hide_index=True, use_container_width=True, height=250,
+            )
+
+        cvd_history = d.get("cvd_history", [])
+        if len(cvd_history) >= 2:
+            st.markdown("**Binance session CVD proxy**")
+            cvd_df = pd.DataFrame(cvd_history)
+            cvd_df["time"] = pd.to_datetime(cvd_df["time_ms"], unit="ms", utc=True).dt.tz_convert(TZ_IST)
+            cvd_figure = go.Figure()
+            cvd_figure.add_trace(go.Scatter(
+                x=cvd_df["time"], y=cvd_df["cvd_btc"],
+                mode="lines", name="Binance session CVD (BTC)",
+            ))
+            cvd_figure.update_layout(
+                height=230, margin=dict(l=8, r=8, t=12, b=8),
+                template="plotly_dark", xaxis_title="Time (IST)",
+                yaxis_title="Cumulative signed BTC", showlegend=False,
+            )
+            cvd_figure.update_xaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
+            cvd_figure.update_yaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
+            st.plotly_chart(
+                cvd_figure, use_container_width=True, key="binance_reference_cvd",
+                config={"displaylogo": False},
             )
 
         if isinstance(last_liquidation, dict):
