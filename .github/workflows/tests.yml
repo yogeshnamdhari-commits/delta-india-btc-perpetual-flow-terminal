@@ -315,7 +315,7 @@ jobs:
               print("last_rest_error=" + last_rest_error)
               if all(checks.values()):
                   print("BINANCE_PUBLIC_FEED_SMOKE_OK")
-              elif "451" in last_rest_error or "403 Client Error" in last_rest_error:
+              elif "451" in last_rest_error or "403" in last_rest_error:
                   # A region/network access denial is an availability limitation, not a passing live-feed test.
                   print("BINANCE_PUBLIC_FEED_UNAVAILABLE_FROM_RUNNER: HTTP 451/403 observed; live data remains UNVERIFIED.")
                   raise SystemExit(0)
