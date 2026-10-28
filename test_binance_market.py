@@ -1,3 +1,5 @@
+from unittest.mock import Mock, patch
+
 from binance_market import BinanceUSDMFeed
 
 
@@ -12,6 +14,44 @@ def snapshot_payload(last_id=100):
         "asks": [["101", "1.0"], ["102", "2.5"]],
     }
 
+
+
+def test_depth_rest_stops_host_fallback_on_explicit_http_451():
+    feed = BinanceUSDMFeed()
+    response = Mock()
+    response.status_code = 451
+    session = Mock()
+    session.get.return_value = response
+
+    with patch("binance_market.requests.Session", return_value=session):
+        try:
+            feed._fetch_depth_snapshot()
+        except RuntimeError as exc:
+            assert "HTTP 451" in str(exc)
+            assert "stopping REST host fallback" in str(exc)
+        else:
+            raise AssertionError("Expected regional/access denial to stop depth REST host fallback")
+
+    assert session.get.call_count == 1
+    session.close.assert_called_once()
+
+
+def test_open_interest_rest_stops_host_fallback_on_explicit_http_403():
+    feed = BinanceUSDMFeed()
+    response = Mock()
+    response.status_code = 403
+    session = Mock()
+    session.get.return_value = response
+    stop_event = Mock()
+    stop_event.is_set.side_effect = [False, False, False, True]
+    feed._stop_event = stop_event
+
+    with patch("binance_market.requests.Session", return_value=session):
+        feed._poll_open_interest()
+
+    assert session.get.call_count == 1
+    assert "HTTP 403" in feed.snapshot()["open_interest_error"]
+    session.close.assert_called_once()
 
 def test_aggregate_trade_side_and_cvd_use_buyer_is_maker_flag():
     feed = BinanceUSDMFeed()
