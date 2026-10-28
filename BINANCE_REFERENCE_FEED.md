@@ -11,6 +11,8 @@ The dashboard adds an independent public-data-only Binance BTCUSDT perpetual ref
 
 ## Order-book synchronization
 
+The feed uses two current Binance-routed WebSocket connections: `wss://fstream.binance.com/public/stream` for `depth@100ms` and `bookTicker`, and `wss://fstream.binance.com/market/stream` for `aggTrade`, `markPrice@1s`, `forceOrder`, `ticker` and native klines. The code follows the current public/market route mapping rather than legacy un-routed URLs. 【Official Binance WebSocket route migration†https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Important-WebSocket-Change-Notice】
+
 The feed buffers depth@100ms events, obtains /fapi/v1/depth?symbol=BTCUSDT&limit=1000, bridges the snapshot update ID with buffered diff-depth updates, and then requires pu continuity for subsequent updates. A sequence break invalidates and clears the local book and requests a fresh REST snapshot. Only a synchronized book is displayed as valid.
 
 Transient network/service failures may retry through configured official Binance hosts. An explicit HTTP 403 or 451 stops host fallback immediately; the adapter reports access denied and leaves the book unavailable rather than probing more hosts.
