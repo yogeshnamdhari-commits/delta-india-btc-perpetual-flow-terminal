@@ -148,6 +148,7 @@ def _render_okx_history(feed: OKXHistoryFeed) -> None:
             "Bar": TIMEFRAMES[tf][0],
             "Loaded": bool(history.get(tf)),
             "Candles in memory": len(candles_by_tf.get(tf, [])),
+            "REST host used": (snap.get("history_source_by_interval") or {}).get(tf) or "—",
             "Updated (IST)": _time_ist(updated.get(tf)),
             "Latest closed bar (IST)": _time_ist(max(
                 (float(row["time"]) for row in candles_by_tf.get(tf, []) if row.get("is_closed")),
