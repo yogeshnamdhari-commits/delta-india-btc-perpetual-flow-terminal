@@ -157,7 +157,11 @@ jobs:
               while time.monotonic() < deadline:
                   latest = feed.snapshot()
                   ws_checks = {
-                      "live_trade": latest.get("last_price") is not None,
+                      "public_trade_stream": int(latest.get("trade_count") or 0) > 0
+                          and any(
+                              str(topic).startswith("publicTrade.") and int(count or 0) > 0
+                              for topic, count in (latest.get("message_counts") or {}).items()
+                          ),
                       "mark_and_funding": latest.get("mark_price") is not None
                           and latest.get("funding_rate") is not None,
                       "snapshot_delta_book": bool(latest.get("book_synced"))
