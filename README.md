@@ -135,6 +135,20 @@ The feed is public/read-only and requires no API credentials. No order-managemen
 
 Official references: [Bybit public linear WebSocket route](https://bybit-exchange.github.io/docs/v5/ws/connect), [orderbook snapshot/delta rules](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook), [public trades](https://bybit-exchange.github.io/docs/v5/websocket/public/trade), [all liquidation stream](https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation), [native klines](https://bybit-exchange.github.io/docs/v5/market/kline), [ticker fields](https://bybit-exchange.github.io/docs/v5/market/tickers).
 
+## Independent OKX historical candle reference
+
+When Bybit's historical REST endpoints are unavailable (for example, return HTTP 403), the app also queries the public OKX V5 market-candles endpoint for BTC-USDT-SWAP as a **separate reference source**.
+
+- Fetches up to 300 bars per native timeframe (1m, 5m, 15m, 1h) from OKX public REST, refreshed in the background every 60 seconds.
+- Uses OKX's explicit candle confirmation field; the current uncompleted candle is not used in EMA/ATR calculations.
+- Displays its own completed 1m chart, independent EMA 20/50/144/200 alignment, ATR(14), volume ratio, closed-bar return and 20-bar structure calculations for each available timeframe.
+- Shows the active public REST host, last successful poll, per-timeframe bar counts, update time and errors. If both configured official REST hosts fail, the panel stays unavailable/stale and reports the failure.
+- OKX candle data is not mixed into Bybit candles or Delta BTCUSD candles, and cannot alter the Delta-specific signal engine, frozen evaluator, Gate 3 evidence or live-trading status. The OKX panel does not claim to provide live order book, public trades, funding or liquidation data.
+
+For OKX linear swaps, the normalizer preserves reported contract volume, base-currency volume and quote turnover as separate fields. Technical volume ratios use the documented base-BTC volume; the source's prices and candles remain labeled as OKX data.
+
+Official references: [OKX public market candles and candle confirmation](https://www.okx.com/docs-v5/en/) and [OKX REST-domain guidance](https://www.okx.com/docs-v5/log_en/). Regional API domains can depend on user registration and applicable access rules; the adapter does not attempt to bypass such restrictions.
+
 ## AI narration inputs
 
 For each question, the analyst receives the same configured Delta market-structure calculations used by the dashboard—current UTC-session range and its loaded-candle coverage, swing/equal-high-low candidates, derived supply/demand zones, measured sweep/reclaim fields, buy/sell exhaustion measurements and the rolling aggressor-flow window. It also receives the separate Bybit-native 1m/5m/15m/1h indicator table. The answer budget allows longer step-by-step responses; unavailable inputs remain unavailable rather than being filled with estimates.
