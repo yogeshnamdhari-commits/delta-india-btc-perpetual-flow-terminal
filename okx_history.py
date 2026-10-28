@@ -113,6 +113,7 @@ class OKXHistoryFeed:
             "candles_by_interval": {tf: {} for tf in TIMEFRAMES},
             "history_loaded": {tf: False for tf in TIMEFRAMES},
             "history_updated_at": {},
+            "history_source_by_interval": {},
             "history_errors": {tf: "" for tf in TIMEFRAMES},
         }
         self._stop = threading.Event()
@@ -139,6 +140,7 @@ class OKXHistoryFeed:
             }
             snap["history_loaded"] = dict(self.data["history_loaded"])
             snap["history_updated_at"] = dict(self.data["history_updated_at"])
+            snap["history_source_by_interval"] = dict(self.data["history_source_by_interval"])
             snap["history_errors"] = dict(self.data["history_errors"])
             return snap
 
@@ -172,6 +174,7 @@ class OKXHistoryFeed:
                         datetime.fromtimestamp(float(snap["history_updated_at"][timeframe]), tz=timezone.utc).isoformat()
                         if snap.get("history_updated_at", {}).get(timeframe) else None
                     ),
+                    "source_host": snap.get("history_source_by_interval", {}).get(timeframe),
                     "error": snap.get("history_errors", {}).get(timeframe) or None,
                 }
                 for timeframe in TIMEFRAMES
@@ -239,6 +242,7 @@ class OKXHistoryFeed:
                         target.pop(key, None)
                     self.data["history_loaded"][timeframe] = True
                     self.data["history_updated_at"][timeframe] = time.time()
+                    self.data["history_source_by_interval"][timeframe] = base
                     self.data["history_errors"][timeframe] = ""
                 results[timeframe] = True
             except Exception as exc:
