@@ -399,8 +399,11 @@ class BinanceUSDMFeed:
                 self.data["total_reconnects"] += 1
             self._channel_ever_connected[channel] = True
             if channel == "public":
-                self.data["book_sync_state"] = "awaiting REST snapshot"
                 self._invalidate_book_locked("Public depth WebSocket connected; awaiting fresh snapshot", count_gap=False)
+                if self.data.get("market_error"):
+                    self.data["last_error"] = f"market WebSocket: {self.data['market_error']}"[:350]
+                else:
+                    self.data["last_error"] = ""
             self._refresh_overall_connection_locked()
         if channel == "public":
             self._schedule_snapshot_worker()
