@@ -53,6 +53,31 @@ def test_open_interest_rest_stops_host_fallback_on_explicit_http_403():
     assert "HTTP 403" in feed.snapshot()["open_interest_error"]
     session.close.assert_called_once()
 
+
+def test_websocket_streams_use_current_binance_public_and_market_routes():
+    feed = BinanceUSDMFeed()
+    public_url = feed.public_ws_url
+    market_url = feed.market_ws_url
+
+    assert public_url.startswith("wss://fstream.binance.com/public/stream?streams=")
+    assert "btcusdt@depth@100ms" in public_url
+    assert "btcusdt@bookTicker" in public_url
+    assert "@aggTrade" not in public_url
+    assert market_url.startswith("wss://fstream.binance.com/market/stream?streams=")
+    for stream in (
+        "btcusdt@aggTrade",
+        "btcusdt@markPrice@1s",
+        "btcusdt@forceOrder",
+        "btcusdt@ticker",
+        "btcusdt@kline_1m",
+        "btcusdt@kline_5m",
+        "btcusdt@kline_15m",
+        "btcusdt@kline_1h",
+    ):
+        assert stream in market_url
+    assert "/stream?streams=" not in public_url.replace("/public/stream?streams=", "")
+    assert "/stream?streams=" not in market_url.replace("/market/stream?streams=", "")
+
 def test_aggregate_trade_side_and_cvd_use_buyer_is_maker_flag():
     feed = BinanceUSDMFeed()
     assert feed.ingest_message(envelope("aggTrade", {
