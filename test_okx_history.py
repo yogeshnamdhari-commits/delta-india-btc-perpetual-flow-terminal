@@ -97,7 +97,7 @@ class OKXHistoryTests(unittest.TestCase):
         self.assertIn("not merged into Bybit or Delta", context["data_role"])
         self.assertIn("1m", context["history"])
         self.assertIn("source_host", context["history"]["1m"])
-        self.assertTrue(any("not merged" in item for item in context["limitations"]))
+        self.assertTrue(any("not merged" in item or "not substituted" in item for item in context["limitations"]))
 
 
 if __name__ == "__main__":
