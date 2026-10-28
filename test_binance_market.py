@@ -166,7 +166,10 @@ def test_invalid_json_wrong_symbols_and_invalid_trades_are_ignored():
     assert not feed.ingest_message(envelope("aggTrade", {
         "s": "BTCUSDT", "p": "NaN", "q": "1", "m": False,
     }))
-    assert feed.snapshot()["trade_count"] == 0
+    state = feed.snapshot()
+    assert state["trade_count"] == 0
+    assert state["total_messages_received"] == 0
+    assert state["last_market_message_at"] is None
 
 
 def test_snapshot_is_copy_and_book_is_never_claimed_crc_verified():
