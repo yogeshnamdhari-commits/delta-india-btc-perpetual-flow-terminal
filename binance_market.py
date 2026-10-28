@@ -212,7 +212,7 @@ class BinanceUSDMFeed:
 
     def stop(self) -> None:
         self._stop_event.set()
-        for ws in (self._public_ws, self._market_ws, self._ws):
+        for ws in (self._public_ws, self._market_ws):
             if ws is not None:
                 try:
                     ws.close()
@@ -360,7 +360,7 @@ class BinanceUSDMFeed:
                     on_open=lambda socket, ch=channel: self._on_channel_open(ch, socket),
                     on_message=self._on_message,
                     on_error=lambda socket, error, ch=channel: self._on_channel_error(ch, error),
-                    on_close=lambda socket, code, message, ch=channel: self._on_channel_close(ch, code, message),
+                    on_close=lambda socket, code, message, ch=channel: self._on_channel_close(ch, socket, code, message),
                 )
                 with self.lock:
                     if channel == "public":
