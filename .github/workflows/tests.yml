@@ -190,6 +190,45 @@ jobs:
           finally:
               feed.stop()
           PY
+  okx-public-history-smoke:
+    # Public REST reachability can vary by runner and region. Preserve endpoint errors in logs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install app dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Verify separate OKX public candle-history reference
+        run: |
+          python - <<'PY'
+          from okx_history import OKXHistoryFeed
+
+          feed = OKXHistoryFeed(request_timeout=4, refresh_seconds=60)
+          try:
+              results = feed.poll_once()
+              snapshot = feed.snapshot()
+              print("OKX_PUBLIC_HISTORY_CHECKS=" + repr(results))
+              print("endpoint_health=" + str(snapshot.get("rest_endpoint_health")))
+              print("active_rest_host=" + str(snapshot.get("rest_endpoint_active")))
+              print("last_error=" + str(snapshot.get("last_error")))
+              print("history_errors=" + repr(snapshot.get("history_errors")))
+              print("candles_by_timeframe=" + repr({
+                  timeframe: len(rows)
+                  for timeframe, rows in snapshot.get("candles_by_interval", {}).items()
+              }))
+              if all(results.values()):
+                  print("OKX_PUBLIC_HISTORY_SMOKE_OK")
+              else:
+                  print("OKX_PUBLIC_HISTORY_NOT_VERIFIED; see per-timeframe errors. The app must keep OKX data separate and report unavailability.")
+                  raise SystemExit(1)
+          finally:
+              feed.stop()
+          PY
   macos-app-smoke:
     runs-on: macos-14
     steps:
