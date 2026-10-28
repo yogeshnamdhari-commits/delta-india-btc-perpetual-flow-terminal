@@ -266,7 +266,7 @@ jobs:
           cat /tmp/delta-streamlit.log
           echo "Streamlit server did not become healthy within 45 seconds on macOS."
           exit 1
-binance-public-feed-smoke:
+  binance-public-feed-smoke:
     # Live exchange access varies by runner/region; unit and sequence tests are the required gate.
     runs-on: ubuntu-latest
     timeout-minutes: 3
