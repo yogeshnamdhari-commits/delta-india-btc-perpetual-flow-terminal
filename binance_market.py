@@ -319,7 +319,6 @@ class BinanceUSDMFeed:
             with self.lock:
                 self.data["connection"] = "reconnecting"
                 self._invalidate_book_locked("WebSocket disconnected; awaiting new snapshot", count_gap=False)
-                self.data["total_reconnects"] += 1
             self._stop_event.wait(delay)
             delay = min(delay * 1.6, 20.0)
 
@@ -581,7 +580,13 @@ class BinanceUSDMFeed:
             elif event == "forceOrder":
                 order = payload.get("o") or {}
                 price = _positive(order.get("ap")) or _positive(order.get("p"))
-                qty = _positive(order.get("z")) or _positive(order.get("q"))
+                qty = _number(order.get("z"))
+                if qty is None:
+                    qty = _number(order.get("l"))
+                if qty is None:
+                    qty = _number(order.get("q"))
+                if qty is not None and qty < 0:
+                    qty = None
                 event_time = _integer(order.get("T")) or _integer(payload.get("E")) or int(now * 1000)
                 observation = {
                     "side": str(order.get("S") or "unknown"),
