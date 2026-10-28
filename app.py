@@ -22,6 +22,7 @@ import orderflow
 from signal_integration_bridge import evaluate_feed_snapshot
 from ai_analyst import render_ai_analyst
 from bybit_panel import render_bybit_cross_venue_panel
+from okx_history_panel import render_okx_history_panel
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -3111,8 +3112,10 @@ with st.expander("Feed diagnostics and limitations", expanded=False):
 # Independent Bybit V5 public feed adds cross-venue context without altering the
 # Delta-specific detector, signal engine, frozen evaluator, or release gate.
 bybit_analyst_context = render_bybit_cross_venue_panel(feed)
+okx_history_context = render_okx_history_panel()
 ai_snapshot = feed.snapshot()
 ai_snapshot["cross_venue_market_data"] = bybit_analyst_context
+ai_snapshot["cross_venue_okx_history_context"] = okx_history_context
 ai_snapshot["delta_market_structure"] = _build_ai_market_structure_context(ai_snapshot)
 render_ai_analyst(ai_snapshot)
 
