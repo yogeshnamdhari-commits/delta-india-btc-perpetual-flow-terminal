@@ -81,11 +81,19 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any = None) -> None
         funding_age = None if funding_ts is None else max(0.0, now - float(funding_ts))
 
         if d.get("connection") == "connected" and market_age is not None and market_age <= 6:
-            st.success(f"Binance public stream connected · last received market message {market_age:.2f}s ago")
+            st.success(f"Binance public + market streams connected · last valid market message {market_age:.2f}s ago")
         elif d.get("connection") == "connected":
-            st.warning("Binance WebSocket is connected, but market data is stale or has not arrived.")
+            st.warning("Binance public + market streams are connected, but valid market data is stale or has not arrived.")
         else:
-            st.warning(f"Binance public feed status: {d.get('connection', 'unknown')}")
+            st.warning(f"Binance feed status: {d.get('connection', 'unknown')}")
+        st.caption(
+            f"Public endpoint: {d.get('public_connection', 'unknown')} · "
+            f"Market endpoint: {d.get('market_connection', 'unknown')}"
+        )
+        if d.get("public_error"):
+            st.warning("Public-stream connection: " + str(d["public_error"]))
+        if d.get("market_error"):
+            st.warning("Market-stream connection: " + str(d["market_error"]))
 
         st.caption(
             "Separate BTCUSDT context. Binance values are not Delta BTCUSD contract data and do not modify "
