@@ -22,4 +22,247 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
       - name: Run unit and integration-contract tests
+        env:
+          DELTA_EVENT_LOG_FILE: /tmp/delta-feed-events.jsonl
+          DELTA_EVENT_LOG_FILE_FULL: /tmp/delta-feed-events-full.jsonl
+          DELTA_DECISION_LOG_FILE: /tmp/signal-decisions.jsonl
         run: python -m pytest -q
+      - name: Smoke-test Streamlit server startup
+        env:
+          DELTA_EVENT_LOG_FILE: /tmp/delta-feed-events.jsonl
+          DELTA_EVENT_LOG_FILE_FULL: /tmp/delta-feed-events-full.jsonl
+          DELTA_DECISION_LOG_FILE: /tmp/signal-decisions.jsonl
+        run: |
+          set -euo pipefail
+          python -m streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8502 > /tmp/delta-streamlit.log 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true; wait "$app_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8502/_stcore/health >/dev/null; then
+              echo "Streamlit server health endpoint returned HTTP 200."
+              exit 0
+            fi
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat /tmp/delta-streamlit.log
+              echo "Streamlit process exited before becoming healthy."
+              exit 1
+            fi
+            sleep 1
+          done
+          cat /tmp/delta-streamlit.log
+          echo "Streamlit server did not become healthy within 30 seconds."
+          exit 1
+
+      - name: Live Kilo Gateway free-model response smoke test
+        env:
+          KILO_SMOKE_PREFERRED_MODEL: nvidia/nemotron-3.5-super-vl:free
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import requests
+
+          base = "https://ai-gateway.kilo.ai/api/v1"
+          preferred = os.environ.get("KILO_SMOKE_PREFERRED_MODEL", "nvidia/nemotron-3.5-super-vl:free")
+          catalog_response = requests.get(f"{base}/models", timeout=15)
+          catalog_response.raise_for_status()
+          catalog = catalog_response.json()
+          entries = catalog.get("data", []) if isinstance(catalog, dict) else []
+          free_ids = [
+              item.get("id") for item in entries
+              if isinstance(item, dict)
+              and isinstance(item.get("id"), str)
+              and item["id"].endswith(":free")
+          ]
+          candidates = ([preferred] if preferred in free_ids else []) + [
+              model_id for model_id in free_ids if model_id != preferred
+          ]
+          candidates = candidates[:12]
+          if not candidates:
+              raise SystemExit("Kilo live smoke failed: no currently listed :free model was returned by /models.")
+
+          prompt = (
+              "This is a synthetic CI connectivity test, not real market data. "
+              "Reply exactly KILO_LIVE_SMOKE_OK. Dummy fixture: BTCUSD=100000."
+          )
+          last_error = None
+          for model_id in candidates:
+              started = time.monotonic()
+              print(f"Trying current Kilo free model: {model_id}", flush=True)
+              try:
+                  response = requests.post(
+                      f"{base}/chat/completions",
+                      headers={"Content-Type": "application/json"},
+                      json={
+                          "model": model_id,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "stream": False,
+                          "temperature": 0,
+                          "max_tokens": 128,
+                      },
+                      timeout=(10, 60),
+                  )
+                  if response.status_code in (400, 404, 429, 502, 503, 504):
+                      last_error = f"{model_id}: HTTP {response.status_code} {response.text[:240]}"
+                      continue
+                  response.raise_for_status()
+                  payload = response.json()
+                  choices = payload.get("choices", [])
+                  message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
+                  answer = message.get("content", "") if isinstance(message, dict) else ""
+                  if isinstance(answer, list):
+                      answer = "\\n".join(
+                          block.get("text", "") for block in answer
+                          if isinstance(block, dict) and isinstance(block.get("text"), str)
+                      )
+                  if not isinstance(answer, str) or not answer.strip():
+                      last_error = f"{model_id}: HTTP {response.status_code} response had no assistant text; top-level keys={list(payload)[:12]}, choices={len(choices)}"
+                      print(last_error, flush=True)
+                      continue
+                  elapsed = round(time.monotonic() - started, 2)
+                  print(f"KILO_LIVE_SMOKE_OK model={model_id} elapsed_s={elapsed} anonymous=true")
+                  print("A real response was received using synthetic test data only.")
+                  break
+              except (requests.RequestException, ValueError) as exc:
+                  last_error = f"{model_id}: {type(exc).__name__}: {str(exc)[:240]}"
+                  print(last_error, flush=True)
+          else:
+              raise SystemExit("Kilo live response smoke test failed for all candidate free models. Last error: " + str(last_error))
+          PY
+
+  bybit-public-feed-smoke:
+    # Live exchange availability can vary by runner/region; unit/contract tests remain the required gate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install app dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Verify live Bybit WebSocket and report REST access separately
+        run: |
+          python - <<'PY'
+          import time
+          from bybit_market import BybitV5Feed
+
+          feed = BybitV5Feed(request_timeout=8)
+          feed.start()
+          deadline = time.monotonic() + 35
+          latest = {}
+          try:
+              while time.monotonic() < deadline:
+                  latest = feed.snapshot()
+                  ws_checks = {
+                      "live_trade": latest.get("last_price") is not None,
+                      "mark_and_funding": latest.get("mark_price") is not None
+                          and latest.get("funding_rate") is not None,
+                      "snapshot_delta_book": bool(latest.get("book_synced"))
+                          and not bool(latest.get("sequence_gap_unresolved")),
+                  }
+                  if all(ws_checks.values()):
+                      break
+                  time.sleep(0.25)
+              else:
+                  print("BYBIT_PUBLIC_WS_SMOKE_INCOMPLETE")
+                  print("websocket_checks=" + repr(ws_checks))
+                  print("connection=" + str(latest.get("connection")))
+                  print("book_integrity_message=" + str(latest.get("book_integrity_message")))
+                  print("last_error=" + str(latest.get("last_error")))
+                  raise SystemExit("Bybit public WebSocket data did not become ready within 35 seconds.")
+
+              history = latest.get("candle_history_loaded") or {}
+              rest_checks = {tf: bool(history.get(tf)) for tf in ("1m", "5m", "15m", "1h")}
+              print("BYBIT_PUBLIC_WS_SMOKE_OK")
+              print("websocket_checks=" + repr(ws_checks))
+              print("native_candle_history_checks=" + repr(rest_checks))
+              print("symbol=" + str(latest.get("symbol")))
+              print("connection=" + str(latest.get("connection")))
+              print("book_update_id=" + str(latest.get("book_update_id")))
+              print("message_counts=" + repr(latest.get("message_counts")))
+              print("last_rest_error=" + str(latest.get("last_rest_error")))
+              print("history_errors=" + repr(latest.get("candle_history_errors")))
+              if not all(rest_checks.values()):
+                  print("REST_HISTORY_NOT_VERIFIED_ON_THIS_RUNNER; inspect endpoint errors above and verify from the target machine.")
+          finally:
+              feed.stop()
+          PY
+  okx-public-history-smoke:
+    # Public REST reachability can vary by runner and region. Preserve endpoint errors in logs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install app dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Verify separate OKX public candle-history reference
+        run: |
+          python - <<'PY'
+          from okx_history import OKXHistoryFeed
+
+          feed = OKXHistoryFeed(request_timeout=4, refresh_seconds=60)
+          try:
+              results = feed.poll_once()
+              snapshot = feed.snapshot()
+              print("OKX_PUBLIC_HISTORY_CHECKS=" + repr(results))
+              print("endpoint_health=" + str(snapshot.get("rest_endpoint_health")))
+              print("active_rest_host=" + str(snapshot.get("rest_endpoint_active")))
+              print("last_error=" + str(snapshot.get("last_error")))
+              print("history_errors=" + repr(snapshot.get("history_errors")))
+              print("candles_by_timeframe=" + repr({
+                  timeframe: len(rows)
+                  for timeframe, rows in snapshot.get("candles_by_interval", {}).items()
+              }))
+              if all(results.values()):
+                  print("OKX_PUBLIC_HISTORY_SMOKE_OK")
+              else:
+                  print("OKX_PUBLIC_HISTORY_NOT_VERIFIED; see per-timeframe errors. The app must keep OKX data separate and report unavailability.")
+                  raise SystemExit(1)
+          finally:
+              feed.stop()
+          PY
+  macos-app-smoke:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install app dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
+      - name: Run AI analyst tests on macOS
+        run: python -m pytest -q test_ai_analyst.py
+      - name: Smoke-test Streamlit on macOS port 8502
+        env:
+          DELTA_EVENT_LOG_FILE: /tmp/delta-feed-events.jsonl
+          DELTA_EVENT_LOG_FILE_FULL: /tmp/delta-feed-events-full.jsonl
+          DELTA_DECISION_LOG_FILE: /tmp/signal-decisions.jsonl
+        run: |
+          set -euo pipefail
+          python -m streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8502 > /tmp/delta-streamlit.log 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true; wait "$app_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 45); do
+            if curl --fail --silent http://127.0.0.1:8502/_stcore/health >/dev/null; then
+              echo "Hosted macOS Streamlit health endpoint returned HTTP 200 on port 8502."
+              exit 0
+            fi
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat /tmp/delta-streamlit.log
+              echo "Streamlit process exited before becoming healthy on macOS."
+              exit 1
+            fi
+            sleep 1
+          done
+          cat /tmp/delta-streamlit.log
+          echo "Streamlit server did not become healthy within 45 seconds on macOS."
+          exit 1

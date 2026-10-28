@@ -64,3 +64,91 @@ Double-click `start_mac.command`. macOS may ask you to confirm that you want to 
 3. If the feed remains disconnected, verify Delta India's current API/WebSocket status and the official docs: https://docs.delta.exchange/ .
 4. If the historical chart is blank but live price/tape is updating, the public historical REST request may have failed; the candle chart should gradually populate from new live candles.
 5. Stop the app with `Ctrl+C` in the terminal.
+
+## AI Trading Analyst (Q&A)
+
+The dashboard includes a read-only chat panel that answers questions using a compact snapshot of the current BTCUSD public feed: last/mark/index prices, bid/ask and depth, recent trades, recent candles, session aggressor flow/CVD, funding, open interest, channel freshness and book-integrity state. It does not retrieve missing historical trade archives, certify Gate 3, or place orders.
+
+### Option A — Local Ollama (optional; no API billing)
+
+1. Install and start [Ollama](https://ollama.com/).
+2. Pull a small local model:
+
+   ```bash
+   ollama pull llama3.2:3b
+   ```
+
+3. Run the dashboard as usual. In **AI Trading Analyst**, select **Local Ollama (no API billing)** and use `http://localhost:11434` and `llama3.2:3b`, unless your local setup differs.
+
+Optional environment variables: `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
+
+### Option B — Kilo Gateway free models (default; no API key required)
+
+The panel defaults to **Kilo Gateway free model (no API key)**. Its current default model ID is `nvidia/nemotron-3.5-super-vl:free`, selected after a successful anonymous live-response check in GitHub Actions on 26 October 2026. You can change it in the panel or select another provider. Change it to another currently available Kilo model whose ID ends in `:free` if needed. This provider rejects model IDs without the `:free` suffix to prevent accidental requests to a paid Kilo model. An optional `KILO_API_KEY` environment variable or Streamlit secret may be supplied, but it is not required for Kilo's anonymous free-model access.
+
+Kilo documents a free-model rate limit of 200 requests per hour per IP, and model availability can change. Some free model routes may send prompts and outputs to upstream providers that log them or use them to improve services. Use this option only if you are comfortable sharing the compact market snapshot and recent chat turns with the selected provider. Do not send personal, account, or confidential data.
+
+See [Kilo's free-model guidance](https://kilo.ai/docs/getting-started/using-kilo-for-free) and [Gateway authentication/rate limits](https://kilo.ai/docs/gateway/authentication).
+
+### Option C — OpenAI API
+
+Select **OpenAI API (separate API billing)** in the panel. Configure `OPENAI_API_KEY` locally as an environment variable or in Streamlit secrets. Optionally set `OPENAI_MODEL`.
+
+**A ChatGPT subscription does not include OpenAI API usage.** API requests are billed separately by OpenAI. Do not commit keys to Git or paste exchange API secrets into the dashboard.
+
+### Data handling and limitations
+
+- Only the compact snapshot supplied to the panel and recent chat turns are sent to the selected model provider. OpenAI mode sends that context to OpenAI; Ollama mode sends it to the configured Ollama server.
+- Chat history is kept in Streamlit session state, not in the market event JSONL logs.
+- The analyst has no execution tools and no access to exchange API credentials.
+- Answers are generated commentary, not validated trading signals or a guarantee of profitability. Live data alone cannot certify historical completeness or out-of-sample results.
+- Unit tests for the context packer and provider-response parsing can be run with `python -m unittest test_ai_analyst.py`.
+
+## Market structure and liquidity intelligence
+
+The read-only **Order flow & liquidity** area distinguishes measured market data from price-action inference:
+
+- **Market-wide liquidation levels:** deliberately shown as unavailable. Delta's documented public WebSocket channel list does not include a market-wide liquidation feed; liquidation reasons appear in private/account order notifications. This dashboard does not fabricate liquidation levels or intensity from assumed leverage.
+- **Observed resting liquidity:** requires a sequence-synchronized, checksum-valid order book with no unresolved sequence gap. It displays contracts, BTC equivalent, approximate USD notional at the observed price, time observed, and size relative to the adaptive depth threshold. Resting orders can be cancelled or moved.
+- **Supply and demand:** derived bullish/bearish order-block zones from completed candles. The “Displacement (x ATR)” field measures the price displacement used to confirm the zone; it is not a measured order quantity or probability.
+- **Stop-hunt candidates:** a prior swing/equal/session level is exceeded and price reclaims the level within the detector's configured candle window. The panel exposes breach extreme, overshoot in price points and reclaim delay. This confirms a price sweep, not that stop orders were actually present or triggered.
+- **Buy/sell exhaustion:** labels require a completed one-minute candle to break a prior local extreme, reject it with a qualifying wick, and meet the existing same-candle aggressor-flow rule. The panel shows buy/sell contracts, dominant-side ratio, wick ratio, close location and classified print count.
+
+All levels and labels are monitoring context, not trade guarantees. These UI additions do not modify the signal engine, its thresholds, signal precedence, evaluator or release criteria.
+
+Delta API references: [WebSocket public channels](https://docs.delta.exchange/) and [private order updates](https://docs.delta.exchange/).
+
+## Active alternative exchange: Bybit V5 Linear BTCUSDT
+
+The dashboard currently uses Bybit's public V5 linear BTCUSDT perpetual market-data endpoints as its active cross-venue feed. It runs beside Delta India BTCUSD; it does not replace Delta's feed and does not change the Delta signal engine, frozen evaluator, or Gate 3 release criteria.
+
+- **WebSocket:** documented public linear route `wss://stream.bybit.com/v5/public/linear`; subscribes to orderbook snapshot/deltas, public taker trades, ticker, native 1m/5m/15m/1h klines, and the public all-liquidation topic.
+- **REST:** retrieves up to 1,000 recent native candles for each timeframe via `/v5/market/kline` and a ticker snapshot via `/v5/market/tickers`. Each interval has its own loading flag and error; missing bars are not synthesized.
+- **Order-book integrity:** a snapshot replaces the entire local book; delta messages update/delete exact price levels. The adapter tracks update ID and cross-sequence regressions, invalidates the book on regression/disconnect, closes the connection and waits for a new full snapshot. Bybit public depth omits RPI orders; this adapter does not claim a CRC32 checksum.
+- **Trade flow:** public trade messages identify taker side. The local CVD proxy uses taker-buy BTC volume minus taker-sell BTC volume since process start and resets on restart.
+- **Technical narration:** EMA 20/50/144/200, alignment/slope/distance, ATR(14), latest volume versus prior 20-candle mean, five-closed-candle return, and recent-vs-prior-20-candle structure are calculated separately from native 1m/5m/15m/1h candles. Values remain unavailable where lookback is insufficient.
+- **Funding and OI:** sourced from Bybit ticker snapshots/updates. OI notional is an approximation (open interest in BTC × mark price in USDT/BTC); the funding interval is not assumed.
+- **Observed liquidation data:** Bybit's public allLiquidation stream reports observed executed size and bankruptcy price. The panel bins these **observed messages by bankruptcy-price bucket** for the trailing hour. These are not predicted liquidation levels for untriggered positions; a bankruptcy price must not be described as an execution price or an account-independent forecast. The in-memory history is bounded, so older messages can be dropped.
+- **Cross-venue quote comparison:** raw Delta BTCUSD vs Bybit BTCUSDT price difference is displayed with an explicit caveat. It is not an executable arbitrage spread because contract design, quote/collateral basis, fees, funding, latency and slippage differ.
+
+The feed is public/read-only and requires no API credentials. No order-management or private account endpoints are used. For market-data REST requests, the adapter tries Bybit's documented mainnet hosts `api.bybit.com` and `api.bytick.com`; this host fallback does not bypass regional or service-access restrictions. The UI exposes the active REST host, per-timeframe history status and errors. If both hosts reject requests (including regional HTTP 403 responses), the app clearly flags incomplete historical warm-up; live WebSocket candles are not falsely treated as a replacement for historical coverage.
+
+Official references: [Bybit public linear WebSocket route](https://bybit-exchange.github.io/docs/v5/ws/connect), [orderbook snapshot/delta rules](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook), [public trades](https://bybit-exchange.github.io/docs/v5/websocket/public/trade), [all liquidation stream](https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation), [native klines](https://bybit-exchange.github.io/docs/v5/market/kline), [ticker fields](https://bybit-exchange.github.io/docs/v5/market/tickers).
+
+## Independent OKX historical candle reference
+
+When Bybit's historical REST endpoints are unavailable (for example, return HTTP 403), the app also queries the public OKX V5 market-candles endpoint for BTC-USDT-SWAP as a **separate reference source**.
+
+- Fetches up to 300 bars per native timeframe (1m, 5m, 15m, 1h) from OKX public REST, refreshed in the background every 60 seconds.
+- Uses OKX's explicit candle confirmation field; the current uncompleted candle is not used in EMA/ATR calculations.
+- Displays its own completed 1m chart, independent EMA 20/50/144/200 alignment, ATR(14), volume ratio, closed-bar return and 20-bar structure calculations for each available timeframe.
+- Shows the active public REST host, the exact host used for each timeframe, last successful poll, per-timeframe bar counts, update time and errors. If both configured official REST hosts fail, the panel stays unavailable/stale and reports the failure.
+- OKX candle data is not mixed into Bybit candles or Delta BTCUSD candles, and cannot alter the Delta-specific signal engine, frozen evaluator, Gate 3 evidence or live-trading status. The OKX panel does not claim to provide live order book, public trades, funding or liquidation data.
+
+For OKX linear swaps, the normalizer preserves reported contract volume, base-currency volume and quote turnover as separate fields. Technical volume ratios use the documented base-BTC volume; the source's prices and candles remain labeled as OKX data.
+
+Official references: [OKX public market candles and candle confirmation](https://www.okx.com/docs-v5/en/) and [OKX REST-domain guidance](https://www.okx.com/docs-v5/log_en/). Regional API domains can depend on user registration and applicable access rules; the adapter does not attempt to bypass such restrictions.
+
+## AI narration inputs
+
+For each question, the analyst receives the same configured Delta market-structure calculations used by the dashboard—current UTC-session range and its loaded-candle coverage, swing/equal-high-low candidates, derived supply/demand zones, measured sweep/reclaim fields, buy/sell exhaustion measurements and the rolling aggressor-flow window. It also receives the separate Bybit-native 1m/5m/15m/1h indicator table. The answer budget allows longer step-by-step responses; unavailable inputs remain unavailable rather than being filled with estimates.
