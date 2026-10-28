@@ -307,12 +307,18 @@ jobs:
                   funding_age = None if funding_time is None else max(0.0, now - float(funding_time))
                   book_time = latest.get("book_updated_at")
                   book_age = None if book_time is None else max(0.0, now - float(book_time))
+                  ticker_time = (latest.get("channel_last_seen") or {}).get("bookTicker")
+                  ticker_age = None if ticker_time is None else max(0.0, now - float(ticker_time))
+                  candle_sets = latest.get("candles_by_interval") or {}
+                  populated_timeframes = {tf for tf, rows in candle_sets.items() if rows}
                   checks = {
                       "public_socket_connected": latest.get("public_connection") == "connected",
                       "market_socket_connected": latest.get("market_connection") == "connected",
                       "fresh_trade": latest.get("last_price") is not None and trade_age is not None and trade_age <= 6,
                       "fresh_mark_and_funding": latest.get("mark_price") is not None
                           and latest.get("funding_rate") is not None and funding_age is not None and funding_age <= 10,
+                      "fresh_book_ticker": ticker_age is not None and ticker_age <= 6,
+                      "native_klines_all_timeframes": {"1m", "5m", "15m", "1h"}.issubset(populated_timeframes),
                       "fresh_snapshot_synced_book": bool(latest.get("book_synced"))
                           and latest.get("book_update_id") is not None and book_age is not None and book_age <= 3,
                   }
@@ -328,6 +334,8 @@ jobs:
               print("trade_age_seconds=" + str(trade_age))
               print("funding_age_seconds=" + str(funding_age))
               print("book_age_seconds=" + str(book_age))
+              print("book_ticker_age_seconds=" + str(ticker_age))
+              print("native_candle_counts=" + repr({tf: len(rows) for tf, rows in (latest.get("candles_by_interval") or {}).items()}))
               print("book_sync_state=" + str(latest.get("book_sync_state")))
               print("snapshot_update_id=" + str(latest.get("book_snapshot_update_id")))
               print("book_update_id=" + str(latest.get("book_update_id")))
@@ -340,15 +348,17 @@ jobs:
                   print("BINANCE_PUBLIC_FEED_SMOKE_OK")
               elif "451" in last_rest_error or "403" in last_rest_error:
                   # A region/network denial is not a live order-book pass; report any separate market-stream checks.
-                  if (
-                      checks.get("public_socket_connected")
-                      and checks.get("market_socket_connected")
-                      and checks.get("fresh_trade")
-                      and checks.get("fresh_mark_and_funding")
-                  ):
-                      print("BINANCE_MARKET_STREAMS_SMOKE_OK; ORDER_BOOK_UNAVAILABLE_HTTP403_451: depth snapshot remains unverified.")
+                  if all(checks.get(name) for name in (
+                      "public_socket_connected",
+                      "market_socket_connected",
+                      "fresh_trade",
+                      "fresh_mark_and_funding",
+                      "fresh_book_ticker",
+                      "native_klines_all_timeframes",
+                  )):
+                      print("BINANCE_PUBLIC_AND_MARKET_STREAMS_SMOKE_OK; DEPTH_SNAPSHOT_UNAVAILABLE_HTTP403_451: live order book remains unverified.")
                   else:
-                      print("BINANCE_FEED_PARTIAL_UNAVAILABLE_HTTP403_451: feed remains incomplete from this runner.")
+                      print("BINANCE_FEED_PARTIAL_UNAVAILABLE_HTTP403_451: some streams remain unverified from this runner.")
                   raise SystemExit(0)
               else:
                   print("BINANCE_PUBLIC_FEED_SMOKE_INCOMPLETE: no complete live market-data set received.")
