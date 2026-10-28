@@ -2573,7 +2573,7 @@ def render_diagnostics_panel() -> None:
         "- This client checks order-book sequence continuity and CRC32 on book messages that include a checksum. Any gap or mismatch triggers a book resubscription.\n"
         "- Market-data timestamps/ages measure when this client receives messages; they do **not** prove zero network or exchange latency.\n"
         "- This app is read-only: it cannot place, edit, or cancel orders. Public market data does not require API credentials.\n"
-        "- The app cannot establish that an exchange is manipulation-free. Cross-venue comparison would be a separate data feed and is not included in this initial build.\n"
+        "- The app cannot establish that an exchange is manipulation-free. The separate Bybit live and OKX historical reference feeds provide cross-venue context only; they do not replace Delta source data or bypass signal-release gates.\n"
         f"- **Session events**: {disconnect_count} disconnect(s), {reconnect_count} reconnect(s)"
     )
 
