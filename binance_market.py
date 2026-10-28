@@ -219,8 +219,10 @@ class BinanceUSDMFeed:
 
         bid, ask = snap.get("bid"), snap.get("ask")
         spread = ask - bid if bid is not None and ask is not None and ask >= bid else None
-        bid_depth = sum(float(q) for q in snap["book_bids"].values())
-        ask_depth = sum(float(q) for q in snap["book_asks"].values())
+        top_bids = sorted(snap["book_bids"].items(), key=lambda item: float(item[0]), reverse=True)[:10]
+        top_asks = sorted(snap["book_asks"].items(), key=lambda item: float(item[0]))[:10]
+        bid_depth = sum(float(q) for _, q in top_bids)
+        ask_depth = sum(float(q) for _, q in top_asks)
         total_depth = bid_depth + ask_depth
         return {
             "source": {
@@ -254,7 +256,7 @@ class BinanceUSDMFeed:
                 "snapshot_update_id": snap.get("book_snapshot_update_id"),
                 "bid_quantity_btc_in_local_book": round(bid_depth, 8),
                 "ask_quantity_btc_in_local_book": round(ask_depth, 8),
-                "top_local_book_imbalance": (bid_depth - ask_depth) / total_depth if total_depth > 0 else None,
+                "top_10_book_imbalance": (bid_depth - ask_depth) / total_depth if total_depth > 0 else None,
                 "initial_snapshot_depth_levels_per_side": 1000,
                 "sequence_gaps": snap.get("book_sequence_gaps"),
                 "resync_count": snap.get("book_resync_count"),
