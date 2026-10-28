@@ -290,20 +290,35 @@ jobs:
           deadline = time.monotonic() + 40
           latest = {}
           try:
-              checks = {}
-              while time.monotonic() < deadline:
-                  latest = feed.snapshot()
-                  checks = {
-                      "trade": latest.get("last_price") is not None,
-                      "mark_and_funding": latest.get("mark_price") is not None
-                          and latest.get("funding_rate") is not None,
-                      "snapshot_synced_book": bool(latest.get("book_synced"))
-                          and latest.get("book_update_id") is not None,
-                  }
-                  if all(checks.values()):
-                      break
-                  time.sleep(0.25)
+              now = time.time()
+              last_trade_time = latest.get("last_trade_time_ms")
+              trade_age = None if last_trade_time is None else max(0.0, now - float(last_trade_time) / 1000.0)
+              funding_time = latest.get("funding_updated_at")
+              funding_age = None if funding_time is None else max(0.0, now - float(funding_time))
+              book_time = latest.get("book_updated_at")
+              book_age = None if book_time is None else max(0.0, now - float(book_time))
+              checks = {
+                  "public_socket_connected": latest.get("public_connection") == "connected",
+                  "market_socket_connected": latest.get("market_connection") == "connected",
+                  "fresh_trade": latest.get("last_price") is not None and trade_age is not None and trade_age <= 6,
+                  "fresh_mark_and_funding": latest.get("mark_price") is not None
+                      and latest.get("funding_rate") is not None and funding_age is not None and funding_age <= 10,
+                  "fresh_snapshot_synced_book": bool(latest.get("book_synced"))
+                      and latest.get("book_update_id") is not None and book_age is not None and book_age <= 3,
+              }
+              if all(checks.values()):
+                  break
+              time.sleep(0.25)
               print("BINANCE_PUBLIC_FEED_CHECKS=" + repr(checks))
+              print("connection=" + str(latest.get("connection")))
+              print("public_connection=" + str(latest.get("public_connection")))
+              print("market_connection=" + str(latest.get("market_connection")))
+              print("public_error=" + str(latest.get("public_error")))
+              print("market_error=" + str(latest.get("market_error")))
+              print("trade_age_seconds=" + str(trade_age))
+              print("funding_age_seconds=" + str(funding_age))
+              print("book_age_seconds=" + str(book_age))
+                            print("BINANCE_PUBLIC_FEED_CHECKS=" + repr(checks))
               print("connection=" + str(latest.get("connection")))
               print("public_connection=" + str(latest.get("public_connection")))
               print("market_connection=" + str(latest.get("market_connection")))
