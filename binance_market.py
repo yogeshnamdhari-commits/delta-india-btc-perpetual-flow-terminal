@@ -123,6 +123,7 @@ class BinanceUSDMFeed:
         self._market_ws: websocket.WebSocketApp | None = None
         self._depth_buffer: deque[dict[str, Any]] = deque(maxlen=MAX_DEPTH_BUFFER)
         self._snapshot_update_id: int | None = None
+        self._book_generation = 0
 
         self.data: dict[str, Any] = {
             "exchange": "Binance USDⓈ-M",
@@ -435,6 +436,7 @@ class BinanceUSDMFeed:
             self._refresh_overall_connection_locked()
 
     def _invalidate_book_locked(self, reason: str, *, count_gap: bool) -> None:
+        self._book_generation += 1
         if count_gap:
             self.data["book_sequence_gaps"] += 1
             self.data["book_resync_count"] += 1
@@ -492,7 +494,12 @@ class BinanceUSDMFeed:
             session.close()
 
     def install_snapshot_payload(
-        self, payload: dict[str, Any], *, rest_host: str = "offline-test", received_at: float | None = None
+        self,
+        payload: dict[str, Any],
+        *,
+        rest_host: str = "offline-test",
+        received_at: float | None = None,
+        expected_generation: int | None = None,
     ) -> bool:
         """Install a supplied snapshot and replay buffered updates; also used in socket-free tests."""
         if not isinstance(payload, dict):
@@ -504,6 +511,9 @@ class BinanceUSDMFeed:
             return False
         now = time.time() if received_at is None else float(received_at)
         with self.lock:
+            if expected_generation is not None:
+                if expected_generation != self._book_generation or self.data.get("public_connection") != "connected":
+                    return False
             self.data["book_bids"] = {price: qty for price, qty in bids if qty > 0}
             self.data["book_asks"] = {price: qty for price, qty in asks if qty > 0}
             self.data["book_synced"] = False
@@ -533,6 +543,7 @@ class BinanceUSDMFeed:
                 with self.lock:
                     if self.data.get("public_connection") != "connected":
                         return
+                    generation = self._book_generation
                     self.data["book_sync_state"] = "fetching REST snapshot"
                 try:
                     snapshot, host = self._fetch_depth_snapshot()
@@ -546,11 +557,15 @@ class BinanceUSDMFeed:
                     retry_delay = min(retry_delay * 1.8, 15.0)
                     continue
 
-                self.install_snapshot_payload(snapshot, rest_host=host)
+                self.install_snapshot_payload(
+                    snapshot,
+                    rest_host=host,
+                    expected_generation=generation,
+                )
                 with self.lock:
                     if self.data.get("public_connection") != "connected" or self._stop_event.is_set():
                         return
-                    if self.data.get("book_sync_state") == "resync requested":
+                    if generation != self._book_generation or self.data.get("book_sync_state") == "resync requested":
                         retry = True
                     else:
                         retry = False
