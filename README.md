@@ -142,7 +142,7 @@ When Bybit's historical REST endpoints are unavailable (for example, return HTTP
 - Fetches up to 300 bars per native timeframe (1m, 5m, 15m, 1h) from OKX public REST, refreshed in the background every 60 seconds.
 - Uses OKX's explicit candle confirmation field; the current uncompleted candle is not used in EMA/ATR calculations.
 - Displays its own completed 1m chart, independent EMA 20/50/144/200 alignment, ATR(14), volume ratio, closed-bar return and 20-bar structure calculations for each available timeframe.
-- Shows the active public REST host, last successful poll, per-timeframe bar counts, update time and errors. If both configured official REST hosts fail, the panel stays unavailable/stale and reports the failure.
+- Shows the active public REST host, the exact host used for each timeframe, last successful poll, per-timeframe bar counts, update time and errors. If both configured official REST hosts fail, the panel stays unavailable/stale and reports the failure.
 - OKX candle data is not mixed into Bybit candles or Delta BTCUSD candles, and cannot alter the Delta-specific signal engine, frozen evaluator, Gate 3 evidence or live-trading status. The OKX panel does not claim to provide live order book, public trades, funding or liquidation data.
 
 For OKX linear swaps, the normalizer preserves reported contract volume, base-currency volume and quote turnover as separate fields. Technical volume ratios use the documented base-BTC volume; the source's prices and candles remain labeled as OKX data.
