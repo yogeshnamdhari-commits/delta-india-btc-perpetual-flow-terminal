@@ -339,8 +339,16 @@ jobs:
               if all(checks.values()):
                   print("BINANCE_PUBLIC_FEED_SMOKE_OK")
               elif "451" in last_rest_error or "403" in last_rest_error:
-                  # A region/network access denial is an availability limitation, not a passing live-feed test.
-                  print("BINANCE_PUBLIC_FEED_UNAVAILABLE_FROM_RUNNER: HTTP 451/403 observed; live data remains UNVERIFIED.")
+                  # A region/network denial is not a live order-book pass; report any separate market-stream checks.
+                  if (
+                      checks.get("public_socket_connected")
+                      and checks.get("market_socket_connected")
+                      and checks.get("fresh_trade")
+                      and checks.get("fresh_mark_and_funding")
+                  ):
+                      print("BINANCE_MARKET_STREAMS_SMOKE_OK; ORDER_BOOK_UNAVAILABLE_HTTP403_451: depth snapshot remains unverified.")
+                  else:
+                      print("BINANCE_FEED_PARTIAL_UNAVAILABLE_HTTP403_451: feed remains incomplete from this runner.")
                   raise SystemExit(0)
               else:
                   print("BINANCE_PUBLIC_FEED_SMOKE_INCOMPLETE: no complete live market-data set received.")
