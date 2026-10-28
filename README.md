@@ -1,6 +1,6 @@
 # Delta India BTC Perpetual Flow Terminal
 
-A read-only local Streamlit dashboard that consumes Delta Exchange India's public WebSocket feed directly. It does **not** place, amend, or cancel orders and does not need API keys.
+A read-only local Streamlit dashboard that consumes Delta Exchange India's public WebSocket feed directly and includes a **separate, read-only Binance USDⓈ-M BTCUSDT reference panel**. It does **not** place, amend, or cancel orders and does not need API keys.
 
 ## Live channels used
 
@@ -15,7 +15,15 @@ A read-only local Streamlit dashboard that consumes Delta Exchange India's publi
 
 WebSocket: `wss://public-socket.india.delta.exchange`
 
-The app fetches a small set of recent historical candles over the public REST API to populate the chart on startup. Market prices/depth/trades then update from WebSocket messages.
+The app fetches a small set of recent historical candles over the public REST API to populate the chart on startup. Delta prices/depth/trades then update from its WebSocket messages.
+
+## Secondary feed — Binance USDⓈ-M (read-only)
+
+A collapsed **Cross-exchange reference** panel subscribes to Binance public BTCUSDT aggregate trades, best bid/ask, partial top-20 depth, mark price/funding and sampled liquidation events, and polls open interest from a public REST endpoint. It shows a session-only aggressor-side CVD proxy and its chart. No API key or private account endpoint is used.
+
+**Keep the venues separate:** Delta BTCUSD is USD-quoted and INR-settled; Binance BTCUSDT is USDT-quoted. Price differences are contextual only, not an executable arbitrage spread. Binance trade flow must not be merged into Delta's historical tape or used to satisfy Delta's OOS data-coverage gate.
+
+The Binance feed's top-20 depth is a partial snapshot, not Delta's sequence/CRC-verified order book. Binance's force-order stream is sampled, not a complete liquidation tape. Session CVD resets when the app restarts. Live feed acceptance still requires visual verification, a disconnect/recovery check, and confirmed freshness in the running app.
 
 ## Run on macOS
 
@@ -44,7 +52,8 @@ Double-click `start_mac.command`. macOS may ask you to confirm that you want to 
 - Incremental order book with sequence and CRC32 status
 - Recent trade tape
 - Session-only signed-volume/CVD proxy
-- Open interest and funding rate, when delivered by the feed
+- Delta open interest and funding rate, when delivered by the feed
+- Separate Binance BTCUSDT price, spread, mark/funding, open interest, partial depth, recent trades, sampled liquidation event and session CVD reference panel
 - Feed age, sequence gaps, checksum failures and reconnect status
 
 ## Safety / interpretation notes
