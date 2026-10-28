@@ -48,6 +48,10 @@ TIMEFRAMES = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 INTERVAL_TO_TIMEFRAME = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h"}
 
 
+class _RegionalAccessDenied(RuntimeError):
+    """An explicit HTTP access denial; do not probe alternate hosts after this."""
+
+
 def _number(value: Any) -> float | None:
     try:
         if value is None:
@@ -387,6 +391,11 @@ class BinanceUSDMFeed:
                         headers={"Accept": "application/json", "User-Agent": "BTCReferenceFeed/2.0"},
                         timeout=self.request_timeout,
                     )
+                    if response.status_code in (403, 451):
+                        raise _RegionalAccessDenied(
+                            f"HTTP {response.status_code} access denied by Binance/this network; "
+                            "stopping REST host fallback rather than probing alternate hosts."
+                        )
                     response.raise_for_status()
                     payload = response.json()
                     if not isinstance(payload, dict) or _integer(payload.get("lastUpdateId")) is None:
@@ -394,9 +403,12 @@ class BinanceUSDMFeed:
                     if _normalise_levels(payload.get("bids")) is None or _normalise_levels(payload.get("asks")) is None:
                         raise ValueError("depth snapshot has malformed levels")
                     return payload, base_url
+                except _RegionalAccessDenied as exc:
+                    errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
+                    break
                 except Exception as exc:
                     errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
-            raise RuntimeError("All configured Binance USDⓈ-M REST hosts failed: " + " | ".join(errors))
+            raise RuntimeError("Binance USDⓈ-M depth snapshot unavailable: " + " | ".join(errors))
         finally:
             session.close()
 
@@ -748,6 +760,11 @@ class BinanceUSDMFeed:
                             headers={"Accept": "application/json", "User-Agent": "BTCReferenceFeed/2.0"},
                             timeout=self.request_timeout,
                         )
+                        if response.status_code in (403, 451):
+                            raise _RegionalAccessDenied(
+                                f"HTTP {response.status_code} access denied by Binance/this network; "
+                                "stopping REST host fallback rather than probing alternate hosts."
+                            )
                         response.raise_for_status()
                         payload = response.json()
                         value = _positive(payload.get("openInterest")) if isinstance(payload, dict) else None
@@ -759,6 +776,9 @@ class BinanceUSDMFeed:
                             self.data["open_interest_error"] = ""
                             self.data["rest_host_active"] = base_url
                         succeeded = True
+                        break
+                    except _RegionalAccessDenied as exc:
+                        errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
                         break
                     except Exception as exc:
                         errors.append(f"{base_url}: {type(exc).__name__}: {exc}")
