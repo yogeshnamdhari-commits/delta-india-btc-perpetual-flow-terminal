@@ -119,7 +119,9 @@ def _render_binance_panel(feed: BinanceUSDMFeed, delta_feed: Any = None) -> None
         d1.metric("Funding rate", "—" if funding is None else f"{funding * 100:.5f}%")
         d2.metric("Open interest", _price(oi, 4) + (" BTC" if oi is not None else ""))
         d3.metric("24h price change", "—" if change_pct is None else f"{change_pct:.3f}%")
-        d4.metric("Session CVD proxy", f"{float(d.get('cvd_btc') or 0):+,.4f} BTC")
+        trade_count = int(d.get("trade_count") or 0)
+        cvd_label = f"{float(d.get('cvd_btc') or 0):+,.4f} BTC" if trade_count > 0 else "— (no trades received)"
+        d4.metric("Session CVD proxy", cvd_label, help="CVD is process-local and resets on restart.")
         if funding is not None and (funding_age is None or funding_age > 10):
             st.warning(f"Binance funding value is stale or its timestamp is unavailable (age: {'—' if funding_age is None else f'{funding_age:.1f}s'}). Treat it as unverified current funding.")
         if oi is not None and (oi_age is None or oi_age > 45):
