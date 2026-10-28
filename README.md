@@ -157,7 +157,7 @@ For each question, the analyst receives the same configured Delta market-structu
 
 A second public-only Binance feed now runs separately from Delta BTCUSD, Bybit BTCUSDT and OKX BTC-USDT-SWAP.
 
-- WebSocket context includes aggregate trades/taker classification, best bid/ask, 24-hour ticker, mark/index/funding, native 1m/5m/15m/1h candles and sampled force-order liquidation observations.
+- WebSocket context uses Binance's current split routes: `/public/stream` for `depth@100ms` and `bookTicker`, and `/market/stream` for aggregate trades, mark/funding, ticker, klines and sampled force-order events. Legacy un-routed URLs are not used. [Official route mapping](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Important-WebSocket-Change-Notice).
 - Public REST polls open interest and obtains a depth snapshot. The app buffers Binance diff-depth events during the snapshot request, bridges update IDs, and requires subsequent previous-update-ID continuity. A sequence gap invalidates and clears the local book until a fresh snapshot is synchronized.
 - The Binance panel displays book freshness, synchronization state, snapshot/current update IDs, sequence gaps/resyncs, top local depth, CVD, closed-candle EMA 20/50/144/200, ATR(14), volume ratio and candle structure by native timeframe. Values remain unavailable when their source/lookback is absent or stale.
 - Binance USDⓈ-M public diff-depth messages do not include a Delta-style CRC32 checksum; the UI says checksum unavailable rather than implying checksum verification. The REST snapshot is limited to 1,000 levels per side, so levels outside its initial range are unknown until streamed changes expose them.
