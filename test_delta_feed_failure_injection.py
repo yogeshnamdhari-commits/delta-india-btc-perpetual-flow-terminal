@@ -61,6 +61,39 @@ class TestRealDeltaFeedClass(unittest.TestCase):
         if checksum is not None: m["cs"]=checksum
         self.feed._handle_book(m)
 
+    def test_ticker_event_log_uses_documented_quote_array_order(self):
+        """Persist best ask, ask size, best bid and bid size in their correct fields."""
+        captured=[]
+        previous_logger=NS["_log_event"]
+        NS["_log_event"]=lambda record, **kwargs: captured.append((dict(record), kwargs)) or True
+        try:
+            message={
+                "type":"ticker",
+                "d":[{
+                    "s":"BTCUSD",
+                    "q":["101.25","12","100.75","9",None],
+                    "m":"101.10",
+                    "oi":["2500","0"],
+                    "ohlc":["99.00","102.00","98.00","101.00"],
+                }],
+            }
+            self.feed._on_message(None, json.dumps(message))
+        finally:
+            NS["_log_event"]=previous_logger
+
+        event=next(record for record, _kwargs in captured
+                   if record.get("channel")=="ticker")
+        self.assertEqual(self.feed.data["ask"],101.25)
+        self.assertEqual(self.feed.data["ask_size"],12.0)
+        self.assertEqual(self.feed.data["bid"],100.75)
+        self.assertEqual(self.feed.data["bid_size"],9.0)
+        self.assertEqual(event["ask"],101.25)
+        self.assertEqual(event["ask_size"],12.0)
+        self.assertEqual(event["bid"],100.75)
+        self.assertEqual(event["bid_size"],9.0)
+        self.assertEqual(event["price"],101.0)  # ticker 24h close / latest traded close
+        self.assertTrue(any(kwargs.get("to_full_log") for _record, kwargs in captured))
+
     def test_disconnect_invalidates_book_sequence_and_checksum(self):
         self.snapshot()
         self.assertTrue(self.feed.data["book_synced"])

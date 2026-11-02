@@ -579,13 +579,19 @@ def _extract_chat_completion_text(payload: dict[str, Any]) -> str:
         return ""
     message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
     content = message.get("content", "") if isinstance(message, dict) else ""
-    if isinstance(content, str):
+    if isinstance(content, str) and content.strip():
         return content.strip()
     # Some OpenAI-compatible providers return content as typed text blocks.
     if isinstance(content, list):
         parts = [block.get("text", "") for block in content
                  if isinstance(block, dict) and isinstance(block.get("text"), str)]
-        return "\n\n".join(part.strip() for part in parts if part.strip())
+        joined = "\n\n".join(part.strip() for part in parts if part.strip())
+        if joined:
+            return joined
+    for key in ("reasoning", "reasoning_content"):
+        reasoning = message.get(key, "") if isinstance(message, dict) else ""
+        if isinstance(reasoning, str) and reasoning.strip():
+            return reasoning.strip()
     return ""
 
 
@@ -619,6 +625,7 @@ def _ask_kilo_free(
                 "stream": False,
                 "temperature": 0.2,
                 "max_tokens": 2600,
+                "reasoning": {"enabled": False},
             },
             timeout=(5, 90),
         )
