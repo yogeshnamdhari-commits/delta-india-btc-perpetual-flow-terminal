@@ -266,10 +266,34 @@ class ShadowTestEngine:
     def track_price(self, last_price: float, ts_utc: datetime) -> List[ShadowTrade]:
         """Check all open shadow trades against a live price update.
 
+        Expiry is evaluated before price-trigger logic: an already-expired
+        trade is valued at the current fresh price and marked EXPIRED rather
+        than being classified as TARGET_HIT or STOP_HIT.
+
         Returns the list of trades that just reached a terminal state.
         """
         just_completed: List[ShadowTrade] = []
         with self._lock:
+            # First, process expirations - an expired trade must not be
+            # re-classified as TARGET_HIT or STOP_HIT by a later price.
+            for sid in list(self._open_trades.keys()):
+                trade = self._open_trades[sid]
+                if trade.state != "OPEN":
+                    continue
+                if trade.expires_ts_utc:
+                    exp = datetime.fromisoformat(trade.expires_ts_utc)
+                    if exp.tzinfo is None:
+                        exp = exp.replace(tzinfo=timezone.utc)
+                    if ts_utc >= exp:
+                        trade.state = "EXPIRED"
+                        trade.exit_price = last_price
+                        trade.exit_ts_utc = ts_utc.isoformat()
+                        trade.exit_reason = "expired"
+                        self._compute_pnl(trade)
+                        just_completed.append(trade)
+                        self._completed_trades.append(trade)
+                        del self._open_trades[sid]
+            # Then check remaining open trades against target/stop/invalidation
             for sid in list(self._open_trades.keys()):
                 trade = self._open_trades[sid]
                 if trade.state != "OPEN":

@@ -259,6 +259,24 @@ class TestShadowTradeCompletion(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertIsNone(completed[0].pnl_r)
 
+    def test_expired_trade_not_reclassified_as_target_hit(self):
+        """An expired trade must not be re-classified as TARGET_HIT by a later price."""
+        res = _make_result("BUY", entry=100.0, stop=99.0, target=102.0)
+        res.expires_at_utc = self.now  # expires at now
+        self.engine.ingest_result(res, {})
+        # First price update after expiry: trade should be EXPIRED, not TARGET_HIT,
+        # even though price 102.0 would otherwise hit target.
+        completed = self.engine.track_price(102.0, self.now)
+        self.assertEqual(len(completed), 1)
+        t = completed[0]
+        self.assertEqual(t.state, "EXPIRED")
+        self.assertEqual(t.exit_reason, "expired")
+        self.assertEqual(t.exit_price, 102.0)
+        self.assertEqual(self.engine.open_trade_count, 0)
+        # Trade should not be re-classified on subsequent price updates
+        completed_again = self.engine.track_price(105.0, self.now)
+        self.assertEqual(len(completed_again), 0)
+
     def tearDown(self):
         self._tmpdir.cleanup()
         os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
@@ -380,15 +398,26 @@ class TestShadowJsonlPersistence(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.shadow_path = Path(self.tempdir.name) / "shadow_trades.jsonl"
         self.decision_path = Path(self.tempdir.name) / "shadow_decisions.jsonl"
+        # Save original environment and set temp paths for test isolation
+        self._orig_shadow_log = os.environ.get("DELTA_SHADOW_LOG_FILE")
+        self._orig_decision_log = os.environ.get("DELTA_SHADOW_DECISION_LOG")
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self.shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self.decision_path)
 
     def tearDown(self):
         self.tempdir.cleanup()
         reset_shadow_engine()
-        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
-        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        # Restore original environment values
+        if self._orig_shadow_log is not None:
+            os.environ["DELTA_SHADOW_LOG_FILE"] = self._orig_shadow_log
+        else:
+            os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        if self._orig_decision_log is not None:
+            os.environ["DELTA_SHADOW_DECISION_LOG"] = self._orig_decision_log
+        else:
+            os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
 
     def test_completed_trade_persisted_to_jsonl(self):
-        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self.shadow_path)
         reset_shadow_engine()
         engine = ShadowTestEngine()
         now = datetime(2026, 11, 3, 1, 10, 0, tzinfo=timezone.utc)
