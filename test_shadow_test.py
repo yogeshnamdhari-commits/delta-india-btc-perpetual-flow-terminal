@@ -14,6 +14,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from dataclasses import asdict
 
 from shadow_test import ShadowTestEngine, ShadowTrade, get_shadow_engine, reset_shadow_engine
 
@@ -94,6 +95,22 @@ class TestShadowSignalNormalization(unittest.TestCase):
         self.engine.ingest_result(_make_result(Signal.SELL), {})
         self.engine.ingest_result(_make_result(Signal.WAIT), {})
         self.assertEqual(self.engine.total_confirmed, 2)
+        self.assertEqual(self.engine.total_wait, 1)
+
+    def test_blocked_decision_preserved_separately(self):
+        """BLOCKED decisions must not be collapsed into WAIT."""
+        self.engine.ingest_result(_make_result("BLOCKED"), {})
+        self.assertEqual(self.engine.total_blocked, 1)
+        self.assertEqual(self.engine.total_wait, 0)
+        self.assertEqual(self.engine.total_confirmed, 0)
+        self.assertEqual(self.engine.open_trade_count, 0)
+
+    def test_blocked_not_counted_as_confirmed(self):
+        self.engine.ingest_result(_make_result("BUY"), {})
+        self.engine.ingest_result(_make_result("BLOCKED"), {})
+        self.engine.ingest_result(_make_result("WAIT"), {})
+        self.assertEqual(self.engine.total_confirmed, 1)
+        self.assertEqual(self.engine.total_blocked, 1)
         self.assertEqual(self.engine.total_wait, 1)
 
 
@@ -242,7 +259,10 @@ class TestShadowTradeExpiry(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0].state, "EXPIRED")
         self.assertEqual(completed[0].exit_reason, "expired")
-        self.assertEqual(completed[0].pnl_r, 0.0)
+        # No price provided → no P&L valuation (pnl_r is None, not zero)
+        self.assertIsNone(completed[0].exit_price)
+        self.assertIsNone(completed[0].pnl_r)
+        self.assertIsNone(completed[0].pnl_contracts)
         self.assertEqual(self.engine.open_trade_count, 0)
 
     def test_trade_without_expiry_never_expires(self):
@@ -351,8 +371,8 @@ class TestShadowJsonlPersistence(unittest.TestCase):
         # Simulate restart: new engine reads same log file
         reset_shadow_engine()
         engine2 = ShadowTestEngine()
-        # Completed count from new engine starts at 0 (log not replayed into memory)
-        self.assertEqual(engine2.completed_holdout_count, 0)
+        # Completed trades are restored from persisted JSONL records
+        self.assertEqual(engine2.completed_holdout_count, 1)
         # But the persisted file still has the record
         self.assertTrue(self.shadow_path.is_file())
 
@@ -385,6 +405,89 @@ class TestShadowEngineSingleton(unittest.TestCase):
         reset_shadow_engine()
         e2 = get_shadow_engine()
         self.assertIsNot(e1, e2)
+
+
+class TestExpiredTradeValuation(unittest.TestCase):
+    """Expired trades must use last known price for consistent P&L."""
+
+    def setUp(self):
+        reset_shadow_engine()
+        self.engine = ShadowTestEngine()
+        self.now = datetime(2026, 11, 3, 1, 10, 0, tzinfo=timezone.utc)
+        self.expires = datetime(2026, 11, 3, 1, 5, 0, tzinfo=timezone.utc)
+        self.now_after = datetime(2026, 11, 3, 1, 5, 1, tzinfo=timezone.utc)
+
+    def test_expired_trade_with_price_computes_pnl(self):
+        res = _make_result("BUY", entry=100.0, stop=99.0, target=102.0)
+        res.expires_at_utc = self.expires
+        self.engine.ingest_result(res, {})
+        completed = self.engine.track_expiry(self.now_after, last_price=101.5)
+        self.assertEqual(len(completed), 1)
+        t = completed[0]
+        self.assertEqual(t.state, "EXPIRED")
+        self.assertEqual(t.exit_price, 101.5)
+        self.assertEqual(t.exit_reason, "expired")
+        # P&L = (101.5 - 100.0) / 1.0 = 1.5 R
+        self.assertEqual(t.pnl_r, 1.5)
+        self.assertEqual(t.pnl_contracts, 1.5)
+
+    def test_expired_trade_sell_with_price_computes_pnl(self):
+        res = _make_result("SELL", entry=100.0, stop=101.0, target=98.0)
+        res.expires_at_utc = self.expires
+        self.engine.ingest_result(res, {})
+        completed = self.engine.track_expiry(self.now_after, last_price=99.0)
+        self.assertEqual(len(completed), 1)
+        t = completed[0]
+        self.assertEqual(t.state, "EXPIRED")
+        self.assertEqual(t.exit_price, 99.0)
+        # P&L = (100.0 - 99.0) / 1.0 = 1.0 R
+        self.assertEqual(t.pnl_r, 1.0)
+
+    def test_expired_trade_without_price_has_no_pnl(self):
+        res = _make_result("BUY", entry=100.0, stop=99.0, target=102.0)
+        res.expires_at_utc = self.expires
+        self.engine.ingest_result(res, {})
+        completed = self.engine.track_expiry(self.now_after)
+        self.assertEqual(len(completed), 1)
+        t = completed[0]
+        self.assertIsNone(t.exit_price)
+        self.assertIsNone(t.pnl_r)
+        self.assertIsNone(t.pnl_contracts)
+
+
+class TestOpenTradeRestoration(unittest.TestCase):
+    """Open trades must be restored from JSONL on restart."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.shadow_path = Path(self.tempdir.name) / "shadow_trades.jsonl"
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+        reset_shadow_engine()
+
+    def test_open_trade_restored_on_restart(self):
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self.shadow_path)
+        reset_shadow_engine()
+        engine1 = ShadowTestEngine()
+        engine1.ingest_result(_make_result("BUY", entry=100.0, stop=99.0, target=102.0, signal_id="open_sig"), {})
+        # Trade is still OPEN - persist it manually to simulate crash mid-life
+        open_trade = engine1.get_open_trades()[0]
+        record = asdict(open_trade)
+        record["logged_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        from shadow_test import ShadowTestEngine as STE
+        STE._append_jsonl(str(self.shadow_path), record)
+
+        # Simulate restart
+        reset_shadow_engine()
+        engine2 = ShadowTestEngine()
+        self.assertEqual(engine2.open_trade_count, 1)
+        restored = engine2.get_open_trades()[0]
+        self.assertEqual(restored.signal_id, "open_sig")
+        self.assertEqual(restored.state, "OPEN")
+        self.assertEqual(restored.entry, 100.0)
+        self.assertEqual(restored.stop_loss, 99.0)
+        self.assertEqual(restored.take_profit, 102.0)
 
 
 if __name__ == "__main__":

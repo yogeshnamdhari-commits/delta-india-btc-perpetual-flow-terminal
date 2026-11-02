@@ -119,6 +119,81 @@ class ShadowTestEngine:
         self._shadow_decision_path = os.environ.get(
             "DELTA_SHADOW_DECISION_LOG", SHADOW_DECISION_LOG
         )
+        # Crash-safe restoration: reload open and completed trades from
+        # existing JSONL records so state survives application restart.
+        self._restore_from_jsonl()
+
+    # -- crash-safe restoration ---------------------------------------------
+
+    def _restore_from_jsonl(self) -> None:
+        """Rebuild open and completed shadow trades from persisted JSONL.
+
+        Reads DELTA_SHADOW_LOG_FILE (or default) if it exists, restoring
+        terminal-state trades into _completed_trades and still-open trades
+        into _open_trades. Counters are recomputed from restored state.
+        """
+        if not self._shadow_log_path or not os.path.exists(self._shadow_log_path):
+            return
+        try:
+            with open(self._shadow_log_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    state = record.get("state", "")
+                    trade = self._record_to_shadow_trade(record)
+                    if trade is None:
+                        continue
+                    if state in ("TARGET_HIT", "STOP_HIT", "INVALIDATED", "EXPIRED"):
+                        self._completed_trades.append(trade)
+                    elif state == "OPEN":
+                        self._open_trades[trade.signal_id] = trade
+        except OSError:
+            return
+        # Recompute counters from restored state
+        self.total_confirmed = len(self._completed_trades) + len(self._open_trades)
+        self.total_signals_evaluated = self.total_confirmed
+        # total_wait and total_blocked cannot be recovered from trade records
+        # alone (they require decision-log replay); they remain zero.
+
+    @staticmethod
+    def _record_to_shadow_trade(record: Dict[str, Any]) -> Optional[ShadowTrade]:
+        """Convert a persisted JSONL record back into a ShadowTrade."""
+        try:
+            return ShadowTrade(
+                signal_id=str(record.get("signal_id", "")),
+                direction=str(record.get("direction", "BUY")),
+                setup_tf=str(record.get("setup_tf", "")),
+                setup_ts_utc=str(record.get("setup_ts_utc", "")),
+                entry=float(record.get("entry") or 0.0),
+                stop_loss=float(record.get("stop_loss") or 0.0),
+                take_profit=float(record.get("take_profit") or 0.0),
+                invalidation_price=float(record.get("invalidation_price") or 0.0),
+                risk_distance=record.get("risk_distance"),
+                reward_distance=record.get("reward_distance"),
+                risk_reward_ratio=record.get("risk_reward_ratio"),
+                trigger_ts_utc=record.get("trigger_ts_utc"),
+                created_ts_utc=str(record.get("created_ts_utc", "")),
+                expires_ts_utc=record.get("expires_ts_utc"),
+                swept_level=float(record.get("swept_level") or 0.0),
+                ob_top=float(record.get("ob_top") or 0.0),
+                ob_bottom=float(record.get("ob_bottom") or 0.0),
+                structure_ref=float(record.get("structure_ref") or 0.0),
+                reason_codes=list(record.get("reason_codes") or []),
+                human_readable=str(record.get("human_readable", "")),
+                state=str(record.get("state", "OPEN")),
+                exit_price=record.get("exit_price"),
+                exit_ts_utc=record.get("exit_ts_utc"),
+                exit_reason=record.get("exit_reason"),
+                pnl_contracts=record.get("pnl_contracts"),
+                pnl_r=record.get("pnl_r"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     # -- signal ingestion ----------------------------------------------------
 
@@ -132,6 +207,10 @@ class ShadowTestEngine:
             self.total_signals_evaluated += 1
             sig = result.signal
             sig_value = sig.value if hasattr(sig, "value") else str(sig)
+            # Preserve BLOCKED as a separate decision category; do not
+            # collapse it into WAIT. app.py sets decision_raw when the
+            # original decision was BLOCKED.
+            sig_value = getattr(result, "decision_raw", sig_value) or sig_value
             if sig_value in ("BUY", "SELL"):
                 self.total_confirmed += 1
                 self._create_shadow_trade(result, market_snapshot, sig_value)
@@ -196,8 +275,15 @@ class ShadowTestEngine:
                     del self._open_trades[sid]
         return just_completed
 
-    def track_expiry(self, ts_utc: datetime) -> List[ShadowTrade]:
-        """Expire any open shadow trades whose expires_ts has passed."""
+    def track_expiry(self, ts_utc: datetime,
+                     last_price: Optional[float] = None) -> List[ShadowTrade]:
+        """Expire any open shadow trades whose expires_ts has passed.
+
+        If ``last_price`` is provided, P&L is computed against that price so
+        expired trades receive a consistent, documented exit valuation rather
+        than an automatic zero result. If no price is available, the trade is
+        marked EXPIRED with no P&L (pnl_r remains None).
+        """
         just_completed: List[ShadowTrade] = []
         with self._lock:
             for sid in list(self._open_trades.keys()):
@@ -210,11 +296,15 @@ class ShadowTestEngine:
                         exp = exp.replace(tzinfo=timezone.utc)
                     if ts_utc >= exp:
                         trade.state = "EXPIRED"
-                        trade.exit_price = None
                         trade.exit_ts_utc = ts_utc.isoformat()
                         trade.exit_reason = "expired"
-                        trade.pnl_contracts = 0.0
-                        trade.pnl_r = 0.0
+                        if last_price is not None:
+                            trade.exit_price = float(last_price)
+                            self._compute_pnl(trade)
+                        else:
+                            trade.exit_price = None
+                            trade.pnl_contracts = None
+                            trade.pnl_r = None
                         just_completed.append(trade)
                         self._completed_trades.append(trade)
                         del self._open_trades[sid]

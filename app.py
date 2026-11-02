@@ -3098,9 +3098,13 @@ def _render_signal_panel() -> None:
         def __init__(self, rec: dict) -> None:
             er = rec.get("engine_result") or {}
             self.signal_id = rec.get("signal_id") or er.get("signal_id") or ""
-            self.signal = Signal.BUY if rec.get("decision") == "BUY" else (
-                Signal.SELL if rec.get("decision") == "SELL" else Signal.WAIT
+            decision_value = rec.get("decision", "WAIT")
+            self.signal = Signal.BUY if decision_value == "BUY" else (
+                Signal.SELL if decision_value == "SELL" else Signal.WAIT
             )
+            # Preserve BLOCKED as a separate decision category; do not
+            # collapse it into WAIT.
+            self.decision_raw = decision_value
             self.state = type("St", (), {"name": er.get("state", "WAIT")})()
             self.generated_at_utc = datetime.fromisoformat(er["generated_at_utc"]) if er.get("generated_at_utc") else datetime.now(timezone.utc)
             self.expires_at_utc = datetime.fromisoformat(er["expires_at_utc"]) if er.get("expires_at_utc") else None
