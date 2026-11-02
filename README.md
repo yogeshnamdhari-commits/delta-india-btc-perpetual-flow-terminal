@@ -2,6 +2,8 @@
 
 A read-only local Streamlit dashboard that consumes Delta Exchange India's public WebSocket feed directly. It does **not** place, amend, or cancel orders and does not need API keys.
 
+See [PROJECT_STATUS_2026-11-02.md](PROJECT_STATUS_2026-11-02.md) for the current research disposition and remaining release gates.
+
 ## Live channels used
 
 - `ob_updates`: incremental L2 order book, sequence continuity and CRC32 checks
@@ -32,9 +34,27 @@ python -m streamlit run app.py --server.port 8502
 
 Open `http://localhost:8502` in your browser if it does not open automatically.
 
-### Option B — Double-click launcher
+### Option B — Launcher script
 
-Double-click `start_mac.command`. macOS may ask you to confirm that you want to run a downloaded command file. The launcher creates a local virtual environment, installs the listed Python packages, and launches the app.
+The repository includes `start_mac.command`. From the project directory, make it executable once and run it:
+
+```bash
+chmod +x start_mac.command
+./start_mac.command
+```
+
+The launcher creates a local virtual environment when needed, installs the listed Python packages, and launches the app on port 8502. Set `STREAMLIT_SERVER_PORT` before running it to use a different local port.
+
+## Run automated tests
+
+Install the development/test dependencies in the project environment, then run the full suite:
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
+The test suite covers deterministic parser, signal-contract, feed-fault, logging, and replay-mechanics behavior. It does not prove profitability or replace the real-feed acceptance steps below.
 
 ## What you should see
 
