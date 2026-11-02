@@ -142,7 +142,7 @@ def _evaluate_signal_decision(
         "score": score,
         "confidence": confidence,
         "blocking_reason": effective_blocking_reason,
-        "feed_fresh": feed_state.get("connection") == "connected",
+        "feed_fresh": feed_age is not None and feed_age <= CHANNEL_STALE_SECONDS.get("ticker", 8),
         "book_synced": feed_state.get("book_synced", False),
         "sequence_valid": feed_state.get("book_synced", False),  # Implicit: if synced, sequence is valid
         "crc_valid": feed_state.get("checksum_ok", True),  # CURRENT verification state
