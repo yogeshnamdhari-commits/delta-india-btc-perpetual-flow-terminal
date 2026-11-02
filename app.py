@@ -3130,15 +3130,18 @@ def _render_signal_panel() -> None:
     shadow.ingest_result(shadow_result, snapshot_for_shadow)
 
     # Track live prices against open shadow trades (prospective validation)
+    # Only use price when feed freshness is verified — stale prices must not
+    # complete hypothetical trades or value expirations.
     last_price = data.get("last_price")
+    feed_fresh = bool(snapshot_for_shadow.get("feed_fresh", False))
     now_utc = datetime.now(timezone.utc)
-    if last_price is not None:
+    if last_price is not None and feed_fresh:
         just_completed = shadow.track_price(float(last_price), now_utc)
         # Persist each newly completed shadow trade
         for completed in just_completed:
             shadow._persist_shadow_trade(completed)
     # Expire any shadow trades whose expiry has passed
-    if last_price is not None:
+    if last_price is not None and feed_fresh:
         expired = shadow.track_expiry(now_utc, last_price=float(last_price))
     else:
         expired = shadow.track_expiry(now_utc)

@@ -19,15 +19,6 @@ from dataclasses import asdict
 from shadow_test import ShadowTestEngine, ShadowTrade, get_shadow_engine, reset_shadow_engine
 
 
-def _clear_default_shadow_log():
-    """Remove the default shadow log file so tests start from clean state."""
-    default_log = "/Users/targetmobile/Downloads/delta-live-recovery/shadow_trades.jsonl"
-    try:
-        os.remove(default_log)
-    except OSError:
-        pass
-
-
 def _make_result(sig_value, entry=100.0, stop=99.0, target=102.0, inv=98.5,
                  signal_id="test_123", state_name="CONFIRMED"):
     """Build a mock SignalResult-like object."""
@@ -63,7 +54,11 @@ class TestShadowSignalNormalization(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
-        _clear_default_shadow_log()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shadow_path = Path(self._tmpdir.name) / "shadow_trades.jsonl"
+        self._decision_path = Path(self._tmpdir.name) / "shadow_decisions.jsonl"
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self._shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self._decision_path)
         self.engine = ShadowTestEngine()
 
     def test_buy_signal_is_confirmed(self):
@@ -123,13 +118,23 @@ class TestShadowSignalNormalization(unittest.TestCase):
         self.assertEqual(self.engine.total_blocked, 1)
         self.assertEqual(self.engine.total_wait, 1)
 
+    def tearDown(self):
+        self._tmpdir.cleanup()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        reset_shadow_engine()
+
 
 class TestShadowTradeCreation(unittest.TestCase):
     """Shadow trade creation from confirmed signal results."""
 
     def setUp(self):
         reset_shadow_engine()
-        _clear_default_shadow_log()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shadow_path = Path(self._tmpdir.name) / "shadow_trades.jsonl"
+        self._decision_path = Path(self._tmpdir.name) / "shadow_decisions.jsonl"
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self._shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self._decision_path)
         self.engine = ShadowTestEngine()
 
     def test_buy_trade_created_with_correct_levels(self):
@@ -166,13 +171,23 @@ class TestShadowTradeCreation(unittest.TestCase):
         self.engine.ingest_result(_make_result("BUY", signal_id="sig_2"), {})
         self.assertEqual(self.engine.open_trade_count, 2)
 
+    def tearDown(self):
+        self._tmpdir.cleanup()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        reset_shadow_engine()
+
 
 class TestShadowTradeCompletion(unittest.TestCase):
     """Shadow trade terminal states and P&L computation."""
 
     def setUp(self):
         reset_shadow_engine()
-        _clear_default_shadow_log()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shadow_path = Path(self._tmpdir.name) / "shadow_trades.jsonl"
+        self._decision_path = Path(self._tmpdir.name) / "shadow_decisions.jsonl"
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self._shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self._decision_path)
         self.engine = ShadowTestEngine()
         self.now = datetime(2026, 11, 3, 1, 10, 0, tzinfo=timezone.utc)
 
@@ -244,13 +259,23 @@ class TestShadowTradeCompletion(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertIsNone(completed[0].pnl_r)
 
+    def tearDown(self):
+        self._tmpdir.cleanup()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        reset_shadow_engine()
+
 
 class TestShadowTradeExpiry(unittest.TestCase):
     """Shadow trade expiry when expires_ts is reached."""
 
     def setUp(self):
         reset_shadow_engine()
-        _clear_default_shadow_log()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shadow_path = Path(self._tmpdir.name) / "shadow_trades.jsonl"
+        self._decision_path = Path(self._tmpdir.name) / "shadow_decisions.jsonl"
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self._shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self._decision_path)
         self.engine = ShadowTestEngine()
         self.expires = datetime(2026, 11, 3, 1, 5, 0, tzinfo=timezone.utc)
         self.now_before = datetime(2026, 11, 3, 1, 4, 59, tzinfo=timezone.utc)
@@ -286,13 +311,23 @@ class TestShadowTradeExpiry(unittest.TestCase):
         self.assertEqual(len(completed), 0)
         self.assertEqual(self.engine.open_trade_count, 1)
 
+    def tearDown(self):
+        self._tmpdir.cleanup()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        reset_shadow_engine()
+
 
 class TestHoldoutCounter(unittest.TestCase):
     """Holdout counter counts only eligible completed trades."""
 
     def setUp(self):
         reset_shadow_engine()
-        _clear_default_shadow_log()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shadow_path = Path(self._tmpdir.name) / "shadow_trades.jsonl"
+        self._decision_path = Path(self._tmpdir.name) / "shadow_decisions.jsonl"
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self._shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self._decision_path)
         self.engine = ShadowTestEngine()
         self.now = datetime(2026, 11, 3, 1, 10, 0, tzinfo=timezone.utc)
 
@@ -330,6 +365,12 @@ class TestHoldoutCounter(unittest.TestCase):
         self.engine.track_price(102.0, self.now)  # completes only "open" trade at its target
         self.assertEqual(self.engine.open_trade_count, 1)  # "closed" still open
         self.assertEqual(self.engine.completed_holdout_count, 1)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        reset_shadow_engine()
 
 
 class TestShadowJsonlPersistence(unittest.TestCase):
@@ -409,10 +450,17 @@ class TestShadowEngineSingleton(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
-        _clear_default_shadow_log()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shadow_path = Path(self._tmpdir.name) / "shadow_trades.jsonl"
+        self._decision_path = Path(self._tmpdir.name) / "shadow_decisions.jsonl"
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self._shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self._decision_path)
 
     def tearDown(self):
         reset_shadow_engine()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        self._tmpdir.cleanup()
 
     def test_get_shadow_engine_returns_singleton(self):
         e1 = get_shadow_engine()
@@ -431,11 +479,21 @@ class TestExpiredTradeValuation(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
-        _clear_default_shadow_log()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._shadow_path = Path(self._tmpdir.name) / "shadow_trades.jsonl"
+        self._decision_path = Path(self._tmpdir.name) / "shadow_decisions.jsonl"
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self._shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self._decision_path)
         self.engine = ShadowTestEngine()
         self.now = datetime(2026, 11, 3, 1, 10, 0, tzinfo=timezone.utc)
         self.expires = datetime(2026, 11, 3, 1, 5, 0, tzinfo=timezone.utc)
         self.now_after = datetime(2026, 11, 3, 1, 5, 1, tzinfo=timezone.utc)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        reset_shadow_engine()
 
     def test_expired_trade_with_price_computes_pnl(self):
         res = _make_result("BUY", entry=100.0, stop=99.0, target=102.0)
