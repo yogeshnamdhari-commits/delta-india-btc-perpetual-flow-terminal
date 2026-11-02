@@ -1012,9 +1012,11 @@ class DeltaFeed:
                         _log_event({
                             "event": "channel_message",
                             "channel": "ticker",
-                            "price": _f(quotes[0]),
+                            # Delta's compact ticker q order is:
+                            # [best_ask, ask_size, best_bid, bid_size, impact_mid_price].
+                            "price": _f(ohlc[3]) if len(ohlc) > 3 else None,
                             "bid": _f(quotes[2]),
-                            "ask": _f(quotes[1]),
+                            "ask": _f(quotes[0]),
                             "bid_size": _f(quotes[3]),
                             "ask_size": _f(quotes[1]),
                             "mark_price": _f(row.get("m")),
