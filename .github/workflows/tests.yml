@@ -20,7 +20,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
       - name: Run unit and integration-contract tests
         env:
           DELTA_EVENT_LOG_FILE: /tmp/delta-feed-events.jsonl
