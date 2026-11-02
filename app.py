@@ -110,9 +110,10 @@ def _evaluate_signal_decision(
         "total_reconnects": feed_state.get("total_reconnects", 0),
     }
 
-    last_msg = feed_state.get("last_any_message_at")
-    if last_msg is not None and isinstance(last_msg, (int, float)) and last_msg > 0:
-        feed_age = now - last_msg
+    channel_last_seen = feed_state.get("channel_last_seen", {}) or {}
+    ticker_ts = channel_last_seen.get("ticker")
+    if ticker_ts is not None and isinstance(ticker_ts, (int, float)) and ticker_ts > 0:
+        feed_age = now - ticker_ts
     else:
         feed_age = None
 
@@ -128,7 +129,7 @@ def _evaluate_signal_decision(
     if feed_state.get("checksum_ok") is False:
         is_blocked = True
         block_reasons.append("crc_verification_failed")
-    if feed_age is not None and feed_age > CHANNEL_STALE_SECONDS.get("ticker", 8):
+    if feed_age is None or feed_age > CHANNEL_STALE_SECONDS.get("ticker", 8):
         is_blocked = True
         block_reasons.append("channel_stale")
 
@@ -2490,7 +2491,7 @@ def render_flow_panel() -> None:
                 )
             else:
                 st.caption("No level currently exceeds the adaptive significance threshold.")
-            thr = d.get("book_liq_threshold")
+            thr = liq.get("threshold") if liq else d.get("book_liq_threshold")
             st.caption(
                 f"Adaptive threshold: {'— (not enough bands yet)' if thr is None else f'{thr:,.0f} contracts (p{int(liq_percentile)} of banded depth)'} · "
                 f"bands aggregate within ±{BOOK_TICK * 2:.1f} price points · durations measured since first observed. "
