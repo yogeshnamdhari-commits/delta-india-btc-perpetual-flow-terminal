@@ -10,13 +10,14 @@ This status note consolidates the repository state and the operator-reported loc
 
 The repository contains the Delta India BTCUSD public-feed Streamlit dashboard, its signal and order-flow research components, AI narration integrations, Bybit/Binance/OKX reference adapters, historical-data tools, release-safety checks, and OOS replay tooling.
 
-The last recorded main-branch CI run reviewed for this note was commit `528f3e1986d8821d17651e71108e71803b267d35` on 2026-10-28. The recorded run completed successfully for:
+The project-readiness patch was merged to `main` on 2026-11-02 as commit `7b7ce9323a55a62889837ac0f74e060efac32437` (PR #16). It fixes the persisted Delta ticker quote mapping, adds an actual-`DeltaFeed` regression test, adds a macOS launcher, separates development dependencies, and updates the run/acceptance instructions. No strategy or evaluator logic was changed.
+
+The merge-triggered main-branch CI run 168 completed successfully on that commit. All six jobs passed:
 - Python 3.11 and 3.12 test jobs;
 - macOS Streamlit startup smoke test on port 8502;
-- Bybit, Binance and OKX public-data smoke tests;
-- Kilo Gateway free-model response smoke test.
+- Bybit, Binance and OKX public-data smoke tests.
 
-Hosted CI success is evidence of automated software checks only. It does not establish that the user's Mac currently receives a healthy live feed.
+The Python test jobs also passed the live Kilo Gateway response smoke test. Hosted CI success is evidence of automated software checks only. It does not establish that the user's Mac currently receives a healthy live feed.
 
 ## Historical data and diagnostic replay
 
