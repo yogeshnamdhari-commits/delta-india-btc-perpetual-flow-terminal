@@ -19,6 +19,15 @@ from dataclasses import asdict
 from shadow_test import ShadowTestEngine, ShadowTrade, get_shadow_engine, reset_shadow_engine
 
 
+def _clear_default_shadow_log():
+    """Remove the default shadow log file so tests start from clean state."""
+    default_log = "/Users/targetmobile/Downloads/delta-live-recovery/shadow_trades.jsonl"
+    try:
+        os.remove(default_log)
+    except OSError:
+        pass
+
+
 def _make_result(sig_value, entry=100.0, stop=99.0, target=102.0, inv=98.5,
                  signal_id="test_123", state_name="CONFIRMED"):
     """Build a mock SignalResult-like object."""
@@ -54,6 +63,7 @@ class TestShadowSignalNormalization(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
+        _clear_default_shadow_log()
         self.engine = ShadowTestEngine()
 
     def test_buy_signal_is_confirmed(self):
@@ -119,6 +129,7 @@ class TestShadowTradeCreation(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
+        _clear_default_shadow_log()
         self.engine = ShadowTestEngine()
 
     def test_buy_trade_created_with_correct_levels(self):
@@ -161,6 +172,7 @@ class TestShadowTradeCompletion(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
+        _clear_default_shadow_log()
         self.engine = ShadowTestEngine()
         self.now = datetime(2026, 11, 3, 1, 10, 0, tzinfo=timezone.utc)
 
@@ -238,6 +250,7 @@ class TestShadowTradeExpiry(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
+        _clear_default_shadow_log()
         self.engine = ShadowTestEngine()
         self.expires = datetime(2026, 11, 3, 1, 5, 0, tzinfo=timezone.utc)
         self.now_before = datetime(2026, 11, 3, 1, 4, 59, tzinfo=timezone.utc)
@@ -279,6 +292,7 @@ class TestHoldoutCounter(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
+        _clear_default_shadow_log()
         self.engine = ShadowTestEngine()
         self.now = datetime(2026, 11, 3, 1, 10, 0, tzinfo=timezone.utc)
 
@@ -329,6 +343,8 @@ class TestShadowJsonlPersistence(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
         reset_shadow_engine()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
 
     def test_completed_trade_persisted_to_jsonl(self):
         os.environ["DELTA_SHADOW_LOG_FILE"] = str(self.shadow_path)
@@ -342,8 +358,10 @@ class TestShadowJsonlPersistence(unittest.TestCase):
 
         self.assertTrue(self.shadow_path.is_file())
         lines = [l for l in self.shadow_path.read_text(encoding="utf-8").splitlines() if l.strip()]
-        self.assertEqual(len(lines), 1)
-        record = json.loads(lines[0])
+        # Two records: OPEN (created immediately) + COMPLETED (persisted on completion)
+        self.assertEqual(len(lines), 2)
+        # Last record should be the completed trade
+        record = json.loads(lines[-1])
         self.assertEqual(record["state"], "TARGET_HIT")
         self.assertEqual(record["exit_price"], 102.0)
         self.assertEqual(record["pnl_r"], 2.0)
@@ -391,6 +409,7 @@ class TestShadowEngineSingleton(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
+        _clear_default_shadow_log()
 
     def tearDown(self):
         reset_shadow_engine()
@@ -412,6 +431,7 @@ class TestExpiredTradeValuation(unittest.TestCase):
 
     def setUp(self):
         reset_shadow_engine()
+        _clear_default_shadow_log()
         self.engine = ShadowTestEngine()
         self.now = datetime(2026, 11, 3, 1, 10, 0, tzinfo=timezone.utc)
         self.expires = datetime(2026, 11, 3, 1, 5, 0, tzinfo=timezone.utc)
@@ -465,6 +485,8 @@ class TestOpenTradeRestoration(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
         reset_shadow_engine()
+        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
 
     def test_open_trade_restored_on_restart(self):
         os.environ["DELTA_SHADOW_LOG_FILE"] = str(self.shadow_path)

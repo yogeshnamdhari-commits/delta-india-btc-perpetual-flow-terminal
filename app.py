@@ -3138,7 +3138,10 @@ def _render_signal_panel() -> None:
         for completed in just_completed:
             shadow._persist_shadow_trade(completed)
     # Expire any shadow trades whose expiry has passed
-    expired = shadow.track_expiry(now_utc)
+    if last_price is not None:
+        expired = shadow.track_expiry(now_utc, last_price=float(last_price))
+    else:
+        expired = shadow.track_expiry(now_utc)
     for expired_trade in expired:
         shadow._persist_shadow_trade(expired_trade)
 

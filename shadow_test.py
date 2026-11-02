@@ -135,6 +135,7 @@ class ShadowTestEngine:
         if not self._shadow_log_path or not os.path.exists(self._shadow_log_path):
             return
         try:
+            latest_by_signal: Dict[str, Dict[str, Any]] = {}
             with open(self._shadow_log_path, "r", encoding="utf-8") as handle:
                 for line in handle:
                     line = line.strip()
@@ -144,14 +145,22 @@ class ShadowTestEngine:
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    state = record.get("state", "")
-                    trade = self._record_to_shadow_trade(record)
-                    if trade is None:
+                    sid = record.get("signal_id", "")
+                    if not sid:
                         continue
-                    if state in ("TARGET_HIT", "STOP_HIT", "INVALIDATED", "EXPIRED"):
-                        self._completed_trades.append(trade)
-                    elif state == "OPEN":
-                        self._open_trades[trade.signal_id] = trade
+                    created = record.get("created_ts_utc", "")
+                    existing = latest_by_signal.get(sid)
+                    if existing is None or created >= existing.get("created_ts_utc", ""):
+                        latest_by_signal[sid] = record
+            for record in latest_by_signal.values():
+                state = record.get("state", "")
+                trade = self._record_to_shadow_trade(record)
+                if trade is None:
+                    continue
+                if state in ("TARGET_HIT", "STOP_HIT", "INVALIDATED", "EXPIRED"):
+                    self._completed_trades.append(trade)
+                elif state == "OPEN":
+                    self._open_trades[trade.signal_id] = trade
         except OSError:
             return
         # Recompute counters from restored state
@@ -249,6 +258,8 @@ class ShadowTestEngine:
             state="OPEN",
         )
         self._open_trades[trade.signal_id] = trade
+        # Persist OPEN trade immediately so it survives application restart.
+        self._persist_shadow_trade(trade)
 
     # -- price tracking ------------------------------------------------------
 
@@ -440,8 +451,14 @@ class ShadowTestEngine:
 
     @property
     def completed_holdout_count(self) -> int:
-        """Number of shadow trades that have reached a terminal state."""
-        return len(self._completed_trades)
+        """Number of shadow trades that reached a terminal state AND have an
+        economically measurable P&L (pnl_r is not None).
+
+        Expired trades without a market price at expiry are excluded: they
+        cannot contribute to profitability statistics or the 100-trade
+        holdout threshold.
+        """
+        return sum(1 for t in self._completed_trades if t.pnl_r is not None)
 
     @property
     def open_trade_count(self) -> int:
@@ -459,11 +476,11 @@ class ShadowTestEngine:
         return list(self._open_trades.values())
 
     def get_summary(self) -> Dict[str, Any]:
-        completed = self._completed_trades
-        wins = sum(1 for t in completed if t.pnl_r is not None and t.pnl_r > 0)
-        losses = sum(1 for t in completed if t.pnl_r is not None and t.pnl_r < 0)
-        breakeven = sum(1 for t in completed if t.pnl_r is not None and t.pnl_r == 0)
-        total_r = sum((t.pnl_r or 0.0) for t in completed)
+        completed = [t for t in self._completed_trades if t.pnl_r is not None]
+        wins = sum(1 for t in completed if t.pnl_r > 0)
+        losses = sum(1 for t in completed if t.pnl_r < 0)
+        breakeven = sum(1 for t in completed if t.pnl_r == 0)
+        total_r = sum(t.pnl_r for t in completed)
         win_rate = (wins / len(completed) * 100.0) if completed else 0.0
         return {
             "total_signals_evaluated": self.total_signals_evaluated,
