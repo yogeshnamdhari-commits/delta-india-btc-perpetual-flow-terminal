@@ -112,6 +112,13 @@ class ShadowTestEngine:
         self.total_confirmed = 0
         self.total_wait = 0
         self.total_blocked = 0
+        # Read log paths at init time so environment overrides take effect
+        self._shadow_log_path = os.environ.get(
+            "DELTA_SHADOW_LOG_FILE", SHADOW_LOG_FILE
+        )
+        self._shadow_decision_path = os.environ.get(
+            "DELTA_SHADOW_DECISION_LOG", SHADOW_DECISION_LOG
+        )
 
     # -- signal ingestion ----------------------------------------------------
 
@@ -124,22 +131,24 @@ class ShadowTestEngine:
         with self._lock:
             self.total_signals_evaluated += 1
             sig = result.signal
-            if sig == Signal.BUY or sig == Signal.SELL:
+            sig_value = sig.value if hasattr(sig, "value") else str(sig)
+            if sig_value in ("BUY", "SELL"):
                 self.total_confirmed += 1
-                self._create_shadow_trade(result, market_snapshot)
-            elif sig == Signal.WAIT:
+                self._create_shadow_trade(result, market_snapshot, sig_value)
+            elif sig_value == "WAIT":
                 self.total_wait += 1
             else:
                 self.total_blocked += 1
 
-            self._persist_decision(result, market_snapshot)
+            self._persist_decision(result, market_snapshot, sig_value)
 
     def _create_shadow_trade(self, result: SignalResult,
-                             market_snapshot: Dict[str, Any]) -> None:
+                             market_snapshot: Dict[str, Any],
+                             sig_value: str) -> None:
         """Create a ShadowTrade from a confirmed SignalResult."""
         trade = ShadowTrade(
             signal_id=result.signal_id or "",
-            direction=result.signal.value,
+            direction=sig_value,
             setup_tf=result.setup_timeframe or "",
             setup_ts_utc=result.setup_candle_timestamp.isoformat() if result.setup_candle_timestamp else "",
             entry=float(result.proposed_entry) if result.proposed_entry is not None else 0.0,
@@ -216,20 +225,22 @@ class ShadowTestEngine:
         """Check if a shadow trade has hit target, stop, or invalidation."""
         # For a BUY: target is above entry, stop/invalidation below
         # For a SELL: target is below entry, stop/invalidation above
+        # Invalidation is checked before stop: a structural breach takes
+        # precedence over a risk exit when both levels are touched at once.
         if trade.direction == "BUY":
             if price >= trade.take_profit:
                 return ("TARGET_HIT", trade.take_profit, "target_hit")
-            if price <= trade.stop_loss:
-                return ("STOP_HIT", trade.stop_loss, "stop_hit")
             if price <= trade.invalidation_price:
                 return ("INVALIDATED", trade.invalidation_price, "invalidated")
+            if price <= trade.stop_loss:
+                return ("STOP_HIT", trade.stop_loss, "stop_hit")
         elif trade.direction == "SELL":
             if price <= trade.take_profit:
                 return ("TARGET_HIT", trade.take_profit, "target_hit")
-            if price >= trade.stop_loss:
-                return ("STOP_HIT", trade.stop_loss, "stop_hit")
             if price >= trade.invalidation_price:
                 return ("INVALIDATED", trade.invalidation_price, "invalidated")
+            if price >= trade.stop_loss:
+                return ("STOP_HIT", trade.stop_loss, "stop_hit")
         return None
 
     def _compute_pnl(self, trade: ShadowTrade) -> None:
@@ -253,14 +264,15 @@ class ShadowTestEngine:
     # -- persistence ---------------------------------------------------------
 
     def _persist_decision(self, result: SignalResult,
-                          market_snapshot: Dict[str, Any]) -> None:
+                          market_snapshot: Dict[str, Any],
+                          sig_value: str) -> None:
         """Persist the full decision record with market conditions."""
         record = {
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "signal_id": result.signal_id or "",
-            "signal": result.signal.value,
+            "signal": sig_value,
             "state": result.state.name,
-            "decision": result.signal.value,
+            "decision": sig_value,
             "score": None,
             "confidence": 1.0,
             "blocking_reason": None,
@@ -274,7 +286,7 @@ class ShadowTestEngine:
             "total_reconnects": market_snapshot.get("total_reconnects", 0),
             "channel_last_seen": market_snapshot.get("channel_last_seen", {}),
             "engine_result": {
-                "signal": result.signal.value,
+                "signal": sig_value,
                 "state": result.state.name,
                 "signal_id": result.signal_id or "",
                 "generated_at_utc": result.generated_at_utc.isoformat(),
@@ -314,13 +326,13 @@ class ShadowTestEngine:
             "completed_holdout_count": self.completed_holdout_count,
         }
         self._all_signals.append(record)
-        self._append_jsonl(SHADOW_DECISION_LOG, record)
+        self._append_jsonl(self._shadow_decision_path, record)
 
     def _persist_shadow_trade(self, trade: ShadowTrade) -> None:
         """Append a completed shadow trade to the shadow trade log."""
         record = asdict(trade)
         record["logged_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        self._append_jsonl(SHADOW_LOG_FILE, record)
+        self._append_jsonl(self._shadow_log_path, record)
 
     @staticmethod
     def _append_jsonl(path: str, record: Dict[str, Any]) -> None:

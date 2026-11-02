@@ -3060,7 +3060,7 @@ def _render_signal_panel() -> None:
     except Exception as exc:
         data, feed_state = {}, {}
         st.warning(f"Feed snapshot unavailable ({type(exc).__name__}); entry is blocked.")
-    from signal_engine import SignalEngine
+    from signal_engine import Signal, SignalEngine
     engine = st.session_state.get("_delta_signal_engine")
     if engine is None:
         engine = SignalEngine()
@@ -3098,7 +3098,9 @@ def _render_signal_panel() -> None:
         def __init__(self, rec: dict) -> None:
             er = rec.get("engine_result") or {}
             self.signal_id = rec.get("signal_id") or er.get("signal_id") or ""
-            self.signal = type("S", (), {"value": rec.get("decision", "WAIT")})()
+            self.signal = Signal.BUY if rec.get("decision") == "BUY" else (
+                Signal.SELL if rec.get("decision") == "SELL" else Signal.WAIT
+            )
             self.state = type("St", (), {"name": er.get("state", "WAIT")})()
             self.generated_at_utc = datetime.fromisoformat(er["generated_at_utc"]) if er.get("generated_at_utc") else datetime.now(timezone.utc)
             self.expires_at_utc = datetime.fromisoformat(er["expires_at_utc"]) if er.get("expires_at_utc") else None
