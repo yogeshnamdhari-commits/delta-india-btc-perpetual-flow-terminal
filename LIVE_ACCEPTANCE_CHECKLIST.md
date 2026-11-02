@@ -4,9 +4,10 @@ Run these steps on the Mac **after** installing the patch and passing the local 
 
 ## 1. Local automated tests
 
-From the project directory with the project virtual environment active:
+From the project directory with the project virtual environment active, install the development/test dependencies and run the suite:
 
 ```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q
 ```
 
