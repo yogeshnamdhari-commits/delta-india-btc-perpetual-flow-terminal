@@ -32,9 +32,16 @@ python -m streamlit run app.py --server.port 8502
 
 Open `http://localhost:8502` in your browser if it does not open automatically.
 
-### Option B — Double-click launcher
+### Option B — Launcher script
 
-Double-click `start_mac.command`. macOS may ask you to confirm that you want to run a downloaded command file. The launcher creates a local virtual environment, installs the listed Python packages, and launches the app.
+The repository includes `start_mac.command`. From the project directory, make it executable once and run it:
+
+```bash
+chmod +x start_mac.command
+./start_mac.command
+```
+
+The launcher creates a local virtual environment when needed, installs the listed Python packages, and launches the app on port 8502. Set `STREAMLIT_SERVER_PORT` before running it to use a different local port.
 
 ## What you should see
 
