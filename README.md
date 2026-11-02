@@ -2,6 +2,8 @@
 
 A read-only local Streamlit dashboard that consumes Delta Exchange India's public WebSocket feed directly. It does **not** place, amend, or cancel orders and does not need API keys.
 
+See [PROJECT_STATUS_2026-11-02.md](PROJECT_STATUS_2026-11-02.md) for the current research disposition and remaining release gates.
+
 ## Live channels used
 
 - `ob_updates`: incremental L2 order book, sequence continuity and CRC32 checks
