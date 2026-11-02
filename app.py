@@ -20,6 +20,7 @@ import websocket
 
 import orderflow
 from signal_integration_bridge import evaluate_feed_snapshot
+from shadow_test import get_shadow_engine, ShadowTestEngine
 from ai_analyst import render_ai_analyst
 from bybit_panel import render_bybit_cross_venue_panel
 from okx_history_panel import render_okx_history_panel
@@ -28,6 +29,8 @@ from binance_panel import render_binance_cross_venue_panel
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
 DECISION_LOG_FILE = os.environ.get("DELTA_DECISION_LOG_FILE", "/Users/targetmobile/Downloads/signal_decisions.jsonl")
+SHADOW_LOG_FILE = os.environ.get("DELTA_SHADOW_LOG_FILE", "/Users/targetmobile/Downloads/delta-live-recovery/shadow_trades.jsonl")
+SHADOW_DECISION_LOG = os.environ.get("DELTA_SHADOW_DECISION_LOG", "/Users/targetmobile/Downloads/delta-live-recovery/shadow_decisions.jsonl")
 _event_lock = threading.Lock()
 _diagnostic_reconnect_triggered = False
 
@@ -3062,11 +3065,77 @@ def _render_signal_panel() -> None:
     if engine is None:
         engine = SignalEngine()
         st.session_state["_delta_signal_engine"] = engine
+    # Initialize shadow test engine (prospective validation, read-only)
+    shadow = st.session_state.get("_delta_shadow_engine")
+    if shadow is None:
+        shadow = get_shadow_engine()
+        st.session_state["_delta_shadow_engine"] = shadow
     decision_record = evaluate_feed_snapshot(data, feed_state=feed_state, engine=engine,
                                               history_path=EVENT_LOG_FILE)
     log_ok = _log_event(decision_record, is_decision=True)
     decision = decision_record.get("decision", "BLOCKED")
     result = decision_record.get("engine_result") or {}
+
+    # --- Shadow test ingestion ---------------------------------------------
+    # Feed every decision result into the shadow engine so confirmed signals
+    # become hypothetical shadow trades tracked against live market data.
+    snapshot_for_shadow = {
+        "last_price": data.get("last_price"),
+        "bid": data.get("bid"),
+        "ask": data.get("ask"),
+        "book_synced": decision_record.get("book_synced", False),
+        "crc_valid": decision_record.get("crc_valid", False),
+        "feed_fresh": decision_record.get("feed_fresh", False),
+        "feed_age_seconds": decision_record.get("feed_age_seconds"),
+        "no_unresolved_sequence_gap": decision_record.get("no_unresolved_sequence_gap", False),
+        "orderbook_integrity_ok": decision_record.get("orderbook_integrity_ok", False),
+        "total_disconnects": decision_record.get("total_disconnects", 0),
+        "total_reconnects": decision_record.get("total_reconnects", 0),
+        "channel_last_seen": decision_record.get("feed_state", {}).get("channel_last_seen", {}),
+    }
+    # Reconstruct a SignalResult-like object from the decision record for shadow ingestion.
+    class _ShadowSignalResult:
+        def __init__(self, rec: dict) -> None:
+            er = rec.get("engine_result") or {}
+            self.signal_id = rec.get("signal_id") or er.get("signal_id") or ""
+            self.signal = type("S", (), {"value": rec.get("decision", "WAIT")})()
+            self.state = type("St", (), {"name": er.get("state", "WAIT")})()
+            self.generated_at_utc = datetime.fromisoformat(er["generated_at_utc"]) if er.get("generated_at_utc") else datetime.now(timezone.utc)
+            self.expires_at_utc = datetime.fromisoformat(er["expires_at_utc"]) if er.get("expires_at_utc") else None
+            self.proposed_entry = er.get("proposed_entry")
+            self.stop_loss = er.get("stop_loss")
+            self.take_profit = er.get("take_profit")
+            self.invalidation_price = er.get("invalidation_price")
+            self.risk_distance = er.get("risk_distance")
+            self.reward_distance = er.get("reward_distance")
+            self.risk_reward_ratio = er.get("risk_reward_ratio")
+            self.setup_timeframe = er.get("setup_timeframe")
+            self.setup_candle_timestamp = datetime.fromisoformat(er["setup_candle_timestamp"]) if er.get("setup_candle_timestamp") else None
+            self.reason_codes = list(er.get("reason_codes") or [])
+            self.confirmation_conditions_passed = list(er.get("confirmation_conditions_passed") or [])
+            self.confirmation_conditions_failed = list(er.get("confirmation_conditions_failed") or [])
+            self.human_readable_explanation = er.get("human_readable_explanation") or ""
+            self.input_candle_timestamps = er.get("input_candle_timestamps") or {}
+            self.data_quality_gate_results = dict(er.get("data_quality_gate_results") or {})
+            self.duplicate_suppressed = bool(er.get("duplicate_suppressed", False))
+            self.superseded_signal_id = er.get("superseded_signal_id")
+            self.lifecycle_transitions = list(er.get("lifecycle_transitions") or [])
+    shadow_result = _ShadowSignalResult(decision_record)
+    shadow.ingest_result(shadow_result, snapshot_for_shadow)
+
+    # Track live prices against open shadow trades (prospective validation)
+    last_price = data.get("last_price")
+    now_utc = datetime.now(timezone.utc)
+    if last_price is not None:
+        just_completed = shadow.track_price(float(last_price), now_utc)
+        # Persist each newly completed shadow trade
+        for completed in just_completed:
+            shadow._persist_shadow_trade(completed)
+    # Expire any shadow trades whose expiry has passed
+    expired = shadow.track_expiry(now_utc)
+    for expired_trade in expired:
+        shadow._persist_shadow_trade(expired_trade)
+
     if decision == "BUY":
         st.success("CONFIRMED BUY · Analysis only — no order has been placed")
     elif decision == "SELL":
@@ -3109,6 +3178,52 @@ if show_signal_panel:
     st.markdown("---")
     st.subheader("Live confirmed-entry signal")
     _render_signal_panel()
+
+# --- Shadow test status panel (prospective validation) --------------------
+shadow = st.session_state.get("_delta_shadow_engine")
+if shadow is not None:
+    st.markdown("---")
+    st.subheader("Prospective Shadow Test (read-only validation)")
+    summary = shadow.get_summary()
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Signals evaluated", summary["total_signals_evaluated"])
+    s2.metric("Confirmed signals", summary["total_confirmed"])
+    s3.metric("Open shadow trades", summary["open_shadow_trades"])
+    s4.metric("Completed holdout trades", f"{summary['completed_holdout_trades']} / 100")
+    s5, s6, s7, s8 = st.columns(4)
+    s5.metric("Wins", summary["wins"])
+    s6.metric("Losses", summary["losses"])
+    s7.metric("Win rate", f"{summary['win_rate_percent']:.1f}%")
+    s8.metric("Total R", f"{summary['total_r']:.4f}")
+    threshold_met = summary["threshold_met"]
+    if threshold_met:
+        st.success("100-trade holdout threshold MET — eligible for independent profitability review")
+    else:
+        remaining = 100 - summary["completed_holdout_trades"]
+        st.info(f"Holdout progress: {remaining} more completed trades needed for threshold")
+    # Show recent completed trades
+    completed = shadow.get_completed_trades()
+    if completed:
+        with st.expander(f"Completed shadow trades ({len(completed)})", expanded=False):
+            for t in completed[-10:]:
+                cols = st.columns(6)
+                cols[0].write(f"{t.direction} · {t.signal_id[:8]}")
+                cols[1].write(f"Entry: {t.entry:.2f}")
+                cols[2].write(f"Exit: {t.exit_price:.2f}" if t.exit_price else "—")
+                cols[3].write(f"State: {t.state}")
+                cols[4].write(f"P&L: {t.pnl_r:.4f} R" if t.pnl_r is not None else "—")
+                cols[5].write(t.exit_reason or "")
+    open_trades = shadow.get_open_trades()
+    if open_trades:
+        with st.expander(f"Open shadow trades ({len(open_trades)})", expanded=False):
+            for t in open_trades:
+                cols = st.columns(6)
+                cols[0].write(f"{t.direction} · {t.signal_id[:8]}")
+                cols[1].write(f"Entry: {t.entry:.2f}")
+                cols[2].write(f"Stop: {t.stop_loss:.2f}")
+                cols[3].write(f"Target: {t.take_profit:.2f}")
+                cols[4].write(f"State: {t.state}")
+                cols[5].write("OPEN")
 
 with st.expander("Feed diagnostics and limitations", expanded=False):
     render_diagnostics_panel()

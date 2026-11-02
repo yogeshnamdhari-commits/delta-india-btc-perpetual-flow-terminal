@@ -24,6 +24,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from signal_integration_bridge import evaluate_feed_snapshot
+from shadow_test import get_shadow_engine, ShadowTestEngine
 
 PROJECT = Path(__file__).resolve().parent
 APP_SOURCE = (PROJECT / "app.py").read_text(encoding="utf-8")
@@ -102,6 +103,8 @@ _NS = {
     "EVENT_LOG_FILE_FULL": "",
     "DECISION_LOG_FILE": "",
     "evaluate_feed_snapshot": evaluate_feed_snapshot,
+    "get_shadow_engine": get_shadow_engine,
+    "ShadowTestEngine": ShadowTestEngine,
 }
 for _name, _kind in (
     ("_f", ast.FunctionDef),
