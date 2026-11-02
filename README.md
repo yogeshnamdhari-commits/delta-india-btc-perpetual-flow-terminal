@@ -43,6 +43,17 @@ chmod +x start_mac.command
 
 The launcher creates a local virtual environment when needed, installs the listed Python packages, and launches the app on port 8502. Set `STREAMLIT_SERVER_PORT` before running it to use a different local port.
 
+## Run automated tests
+
+Install the development/test dependencies in the project environment, then run the full suite:
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
+The test suite covers deterministic parser, signal-contract, feed-fault, logging, and replay-mechanics behavior. It does not prove profitability or replace the real-feed acceptance steps below.
+
 ## What you should see
 
 - BTCUSD last-trade price, mark price and index price
