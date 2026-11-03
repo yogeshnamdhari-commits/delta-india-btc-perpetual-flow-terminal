@@ -568,15 +568,27 @@ class TestOpenTradeRestoration(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.shadow_path = Path(self.tempdir.name) / "shadow_trades.jsonl"
+        self.decision_path = Path(self.tempdir.name) / "shadow_decisions.jsonl"
+        # Save original environment and set temp paths for test isolation
+        self._orig_shadow_log = os.environ.get("DELTA_SHADOW_LOG_FILE")
+        self._orig_decision_log = os.environ.get("DELTA_SHADOW_DECISION_LOG")
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self.shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self.decision_path)
 
     def tearDown(self):
         self.tempdir.cleanup()
         reset_shadow_engine()
-        os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
-        os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
+        # Restore original environment values
+        if self._orig_shadow_log is not None:
+            os.environ["DELTA_SHADOW_LOG_FILE"] = self._orig_shadow_log
+        else:
+            os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        if self._orig_decision_log is not None:
+            os.environ["DELTA_SHADOW_DECISION_LOG"] = self._orig_decision_log
+        else:
+            os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
 
     def test_open_trade_restored_on_restart(self):
-        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self.shadow_path)
         reset_shadow_engine()
         engine1 = ShadowTestEngine()
         engine1.ingest_result(_make_result("BUY", entry=100.0, stop=99.0, target=102.0, signal_id="open_sig"), {})
