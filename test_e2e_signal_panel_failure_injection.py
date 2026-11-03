@@ -24,7 +24,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from signal_integration_bridge import evaluate_feed_snapshot
-from shadow_test import get_shadow_engine, ShadowTestEngine
+from shadow_test import get_shadow_engine, ShadowTestEngine, reset_shadow_engine
 
 PROJECT = Path(__file__).resolve().parent
 APP_SOURCE = (PROJECT / "app.py").read_text(encoding="utf-8")
@@ -177,6 +177,15 @@ class TestEndToEndSignalPanelFailureRecovery(unittest.TestCase):
         _NS["EVENT_LOG_FILE"] = str(root / "events.jsonl")
         _NS["EVENT_LOG_FILE_FULL"] = str(root / "events_full.jsonl")
         _NS["DECISION_LOG_FILE"] = str(root / "decisions.jsonl")
+        # Redirect shadow logs to temp paths and reset singleton so no
+        # production shadow-trade or decision log is touched during tests.
+        self._orig_shadow_log = os.environ.get("DELTA_SHADOW_LOG_FILE")
+        self._orig_decision_log = os.environ.get("DELTA_SHADOW_DECISION_LOG")
+        self._shadow_path = Path(self.tempdir.name) / "shadow_trades.jsonl"
+        self._shadow_decision_path = Path(self.tempdir.name) / "shadow_decisions.jsonl"
+        os.environ["DELTA_SHADOW_LOG_FILE"] = str(self._shadow_path)
+        os.environ["DELTA_SHADOW_DECISION_LOG"] = str(self._shadow_decision_path)
+        reset_shadow_engine()
         _NS["_event_lock"] = threading.RLock()
         self.ui = _FakeStreamlit()
         self.feed = _healthy_feed(time.time())
@@ -186,6 +195,16 @@ class TestEndToEndSignalPanelFailureRecovery(unittest.TestCase):
 
     def tearDown(self):
         self.tempdir.cleanup()
+        reset_shadow_engine()
+        # Restore original environment values
+        if self._orig_shadow_log is not None:
+            os.environ["DELTA_SHADOW_LOG_FILE"] = self._orig_shadow_log
+        else:
+            os.environ.pop("DELTA_SHADOW_LOG_FILE", None)
+        if self._orig_decision_log is not None:
+            os.environ["DELTA_SHADOW_DECISION_LOG"] = self._orig_decision_log
+        else:
+            os.environ.pop("DELTA_SHADOW_DECISION_LOG", None)
 
     def render_and_read_record(self):
         previous_count = len([1 for label, _ in self.ui.metrics if label == "Decision"])
