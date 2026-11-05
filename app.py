@@ -2556,7 +2556,7 @@ def render_tape_cvd_panel() -> None:
         oi_history, current_oi, now_ts=now_ts, window_seconds=86_400
     )
     ws_turnover_usd = (d.get("ticker_24h") or {}).get("turnover_usd")
-    volume_contracts = ticker_metrics.get("volume_contracts")
+    volume = ticker_metrics.get("volume")
     turnover_usd = ticker_metrics.get("turnover_usd")
     if turnover_usd is None:
         turnover_usd = ws_turnover_usd
@@ -2577,12 +2577,12 @@ def render_tape_cvd_panel() -> None:
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric(
         "Latest daily candle volume",
-        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} contracts",
+        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} API units",
         help=f"BTCUSD 1d candle timestamp: {latest_daily_volume_time}. The newest candle may still be forming.",
     )
     m2.metric(
         "Ticker session volume",
-        "—" if volume_contracts is None else f"{float(volume_contracts):,.0f} contracts",
+        "—" if volume is None else f"{float(volume):,.0f} API units",
     )
     m3.metric(
         "Ticker turnover (USD)",
@@ -2606,10 +2606,10 @@ def render_tape_cvd_panel() -> None:
         daily_volume_df["Daily candle (UTC)"] = pd.to_datetime(
             daily_volume_df["time"], unit="s", utc=True
         ).dt.strftime("%Y-%m-%d")
-        daily_volume_df = daily_volume_df.rename(columns={"volume": "BTCUSD volume (contracts)"})
+        daily_volume_df = daily_volume_df.rename(columns={"volume": "BTCUSD volume (API units)"})
         st.dataframe(
-            daily_volume_df[["Daily candle (UTC)", "BTCUSD volume (contracts)"]].style.format(
-                {"BTCUSD volume (contracts)": "{:,.0f}"}
+            daily_volume_df[["Daily candle (UTC)", "BTCUSD volume (API units)"]].style.format(
+                {"BTCUSD volume (API units)": "{:,.0f}"}
             ),
             hide_index=True,
             use_container_width=True,
