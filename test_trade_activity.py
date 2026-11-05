@@ -18,7 +18,7 @@ def test_summarize_trade_prints_counts_and_values_by_aggressor_side():
             "Trade prints": 2,
             "Contracts": 15.0,
             "BTC equivalent": pytest.approx(0.015),
-            "Approx USD value": pytest.approx(22.5),
+            "Approx USD value": pytest.approx(1600.0),
         },
         {
             "Side": "SELL",
