@@ -40,7 +40,7 @@ def test_demand_zone_uses_origin_candle_tape_and_bid_depth():
     assert result["ask"]["contracts"] == pytest.approx(10)
     assert result["aligned_side"] == "BID"
     assert result["aligned_levels"] == 2
-    assert result["aligned_opposing_usd_ratio"] == pytest.approx(3.0)
+    assert result["aligned_opposing_usd_ratio"] == pytest.approx(3.1 / 1.062)
 
 
 def test_supply_zone_uses_ask_depth_as_aligned_liquidity():
