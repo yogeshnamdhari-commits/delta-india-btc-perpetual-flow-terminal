@@ -98,6 +98,7 @@ _NS = {
     "WS_URL": "wss://test.invalid",
     "SYMBOL": "BTCUSD",
     "INDEX_SYMBOL": ".DEXBTUSD",
+    "CONTRACT_VALUE_BTC": 0.001,
     "TZ_IST": ZoneInfo("Asia/Kolkata"),
     "EVENT_LOG_FILE": "",
     "EVENT_LOG_FILE_FULL": "",
