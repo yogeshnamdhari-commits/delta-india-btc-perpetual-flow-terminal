@@ -1022,7 +1022,8 @@ class DeltaFeed:
                             flow = self.data["trade_flow_minutes"].setdefault(
                                 minute_bucket,
                                 {"buy_count": 0, "sell_count": 0,
-                                 "buy_contracts": 0.0, "sell_contracts": 0.0},
+                                 "buy_contracts": 0.0, "sell_contracts": 0.0,
+                                 "buy_usd": 0.0, "sell_usd": 0.0},
                             )
                             flow[f"{side_norm}_count"] += 1
                             flow[f"{side_norm}_contracts"] += size
