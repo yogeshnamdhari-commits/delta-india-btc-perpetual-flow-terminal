@@ -70,10 +70,26 @@ def measure_zone_strength(
         raise ValueError("zone must contain finite ordered bottom/top prices")
 
     formation_volume = None
-    formation_index = zone.get("_mi")
-    if isinstance(formation_index, int) and not isinstance(formation_index, bool):
-        if candles and 0 <= formation_index < len(candles):
-            formation_volume = _finite_nonnegative(candles[formation_index].get("volume"))
+    # Detector indices are relative to its shortened lookback window. Match
+    # formation_time against the full closed-candle list first to avoid reading
+    # an unrelated candle when the dashboard has a longer history loaded.
+    formation_time = _finite_nonnegative(zone.get("formation_time"))
+    origin_candle = None
+    if formation_time is not None and candles:
+        origin_candle = next(
+            (
+                candle for candle in candles
+                if _finite_nonnegative(candle.get("time")) == formation_time
+            ),
+            None,
+        )
+    if origin_candle is None:
+        formation_index = zone.get("_mi")
+        if isinstance(formation_index, int) and not isinstance(formation_index, bool):
+            if candles and 0 <= formation_index < len(candles):
+                origin_candle = candles[formation_index]
+    if origin_candle is not None:
+        formation_volume = _finite_nonnegative(origin_candle.get("volume"))
 
     buy = _empty_flow()
     sell = _empty_flow()
