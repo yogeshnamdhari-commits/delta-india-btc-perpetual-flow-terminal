@@ -160,4 +160,24 @@ class TestRealDeltaFeedClass(unittest.TestCase):
         self.assertFalse(state["sequence_gap_unresolved"])
         self.assertEqual(len(sock.sent),2)
 
+
+    def test_trade_message_updates_side_minute_notional_without_touching_signal_paths(self):
+        message = {
+            "type": "trades",
+            "sy": "BTCUSD",
+            "p": "100000",
+            "s": "10",
+            "r": "t",
+            "t": 1200,
+            "ts": 1200,
+        }
+        self.feed._on_message(None, json.dumps(message))
+        minute = 1200 // 60 * 60
+        flow = self.feed.data["trade_flow_minutes"][minute]
+        self.assertEqual(flow["buy_count"], 1)
+        self.assertEqual(flow["buy_contracts"], 10.0)
+        self.assertEqual(flow["buy_usd"], 1000.0)
+        self.assertEqual(flow["sell_count"], 0)
+        self.assertEqual(flow["sell_usd"], 0.0)
+
 if __name__ == "__main__": unittest.main()
