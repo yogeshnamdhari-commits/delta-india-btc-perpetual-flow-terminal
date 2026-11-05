@@ -2910,11 +2910,32 @@ def _build_ai_market_structure_context(data: dict[str, Any]) -> dict[str, Any]:
         default=None,
     )
 
+    ob_update_ts = _f((data.get("channel_last_seen") or {}).get("ob_updates"))
+    ob_update_age = max(0.0, now - ob_update_ts) if ob_update_ts is not None else None
+    zone_book_valid = (
+        bool(data.get("book_synced"))
+        and not bool(data.get("sequence_gap_unresolved", True))
+        and data.get("checksum_ok") is True
+        and bool(data.get("bids"))
+        and bool(data.get("asks"))
+        and ob_update_age is not None
+        and ob_update_age <= CHANNEL_STALE_SECONDS.get("ob_updates", 3)
+    )
+
     zones = []
     for zone in (pa.get("zones") or [])[-12:]:
         top, bottom = _f(zone.get("top")), _f(zone.get("bottom"))
         if top is None or bottom is None or top < bottom:
             continue
+        strength = measure_zone_strength(
+            zone,
+            closed,
+            data.get("trade_log", []),
+            data.get("bids", {}),
+            data.get("asks", {}),
+            book_valid=zone_book_valid,
+            contract_value_btc=CONTRACT_VALUE_BTC,
+        )
         zones.append({
             "classification": "DEMAND" if zone.get("direction") == "bullish" else "SUPPLY",
             "direction": zone.get("direction"),
@@ -2927,6 +2948,19 @@ def _build_ai_market_structure_context(data: dict[str, Any]) -> dict[str, Any]:
             "formation_time_utc": utc_time(zone.get("formation_time")),
             "confirmation_time_utc": utc_time(zone.get("confirmed_time")),
             "reference_swing_price": _f(zone.get("swing_price")),
+            "formation_candle_volume_reported": strength["formation_volume"],
+            "executed_buy_inside_zone": strength["buy"],
+            "executed_sell_inside_zone": strength["sell"],
+            "aligned_resting_liquidity": strength["aligned"],
+            "opposing_resting_liquidity": strength["opposing"],
+            "aligned_resting_side": strength["aligned_side"],
+            "aligned_to_opposing_usd_depth_ratio": strength["aligned_opposing_usd_ratio"],
+            "resting_book_measurement_available": strength["book_available"],
+            "measurement_limits": (
+                "Trade figures cover the retained in-memory execution tape; L2 counts are aggregate price levels, "
+                "not individual orders. Resting liquidity is unavailable unless the book is synchronized, "
+                "CRC-valid, gap-free and fresh."
+            ),
         })
 
     sweeps = []
