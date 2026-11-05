@@ -28,7 +28,7 @@ def parse_ticker_payload(payload: Any, symbol: str = "BTCUSD") -> dict[str, Any]
     """Normalize the public REST ticker response without inventing missing fields."""
     empty = {
         "symbol": symbol,
-        "volume_contracts": None,
+        "volume": None,
         "turnover_usd": None,
         "open_interest_contracts": None,
         "open_interest_value_usd": None,
@@ -56,7 +56,7 @@ def parse_ticker_payload(payload: Any, symbol: str = "BTCUSD") -> dict[str, Any]
 
     return {
         "symbol": symbol,
-        "volume_contracts": volume if volume is not None and volume >= 0 else None,
+        "volume": volume if volume is not None and volume >= 0 else None,
         "turnover_usd": turnover_usd if turnover_usd is not None and turnover_usd >= 0 else None,
         "open_interest_contracts": oi if oi is not None and oi >= 0 else None,
         "open_interest_value_usd": (
