@@ -1,6 +1,7 @@
 import pytest
 
 from daily_metrics import (
+    parse_daily_volume_candles,
     parse_ticker_payload,
     summarize_aggressor_flow,
     summarize_open_interest_24h,
@@ -124,3 +125,25 @@ def test_summarize_open_interest_24h_avoids_percentage_division_by_zero():
     )
     assert result["change_contracts"] == 10
     assert result["change_pct"] is None
+
+
+def test_parse_daily_volume_candles_sorts_and_discards_invalid_rows():
+    rows = parse_daily_volume_candles({
+        "result": [
+            {"time": 300, "volume": "30"},
+            {"time": 100, "volume": "10"},
+            {"time": 200, "volume": "20"},
+            {"time": 400, "volume": "nan"},
+            {"time": -1, "volume": 10},
+        ]
+    })
+    assert rows == [
+        {"time": 100, "volume": 10.0},
+        {"time": 200, "volume": 20.0},
+        {"time": 300, "volume": 30.0},
+    ]
+
+
+def test_parse_daily_volume_candles_handles_empty_or_unexpected_payload():
+    assert parse_daily_volume_candles({}) == []
+    assert parse_daily_volume_candles({"result": "bad"}) == []
