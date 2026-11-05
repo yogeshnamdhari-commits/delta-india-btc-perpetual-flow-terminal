@@ -234,7 +234,8 @@ jobs:
               feed.stop()
           PY
   macos-app-smoke:
-    runs-on: macos-14
+    # macos-14 was retired on 2026-11-02; use the supported Intel image for target-machine parity.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
