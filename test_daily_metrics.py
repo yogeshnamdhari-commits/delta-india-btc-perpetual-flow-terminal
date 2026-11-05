@@ -54,7 +54,7 @@ def test_parse_ticker_payload_does_not_invent_missing_or_invalid_values():
 def test_summarize_aggressor_flow_uses_only_rolling_24h_buckets():
     now = 200_000.0
     flow = {
-        113_940: {"buy_count": 9, "buy_contracts": 900, "buy_usd": 9000},
+        113_520: {"buy_count": 9, "buy_contracts": 900, "buy_usd": 9000},
         114_000: {"buy_count": 2, "sell_count": 1, "buy_contracts": 20,
                   "sell_contracts": 10, "buy_usd": 200, "sell_usd": 100},
         199_980: {"buy_count": 1, "sell_count": 2, "buy_contracts": 3,
@@ -120,7 +120,7 @@ def test_summarize_open_interest_24h_marks_stale_baseline_unavailable():
 
 def test_summarize_open_interest_24h_avoids_percentage_division_by_zero():
     result = summarize_open_interest_24h(
-        [{"time": 100_000, "close": 0}], 10, now_ts=200_000
+        [{"time": 113_000, "close": 0}], 10, now_ts=200_000
     )
     assert result["change_contracts"] == 10
     assert result["change_pct"] is None
