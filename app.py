@@ -2653,7 +2653,7 @@ def render_tape_cvd_panel() -> None:
         else f"{flow_24h['capture_hours']:.1f} hours since this process started (maximum 24 hours)"
     )
     st.caption(
-        "The exchange 24h volume/turnover above is Delta's rolling ticker total. "
+        "Latest daily volume is the newest BTCUSD 1d candle (which may still be forming); ticker session volume/turnover are separate live ticker fields. "
         f"BUY/SELL distribution is calculated from captured public aggressor-side trades; capture span: {capture_text}. "
         "It is not backfilled before this process starts and any feed outage creates missing observations. "
         "Shares are percentages of captured, classified BUY+SELL contract volume, not percentages of the exchange's full 24h total. "
