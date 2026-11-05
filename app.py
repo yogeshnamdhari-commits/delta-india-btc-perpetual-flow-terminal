@@ -26,6 +26,7 @@ from bybit_panel import render_bybit_cross_venue_panel
 from okx_history_panel import render_okx_history_panel
 from binance_panel import render_binance_cross_venue_panel
 from trade_activity import summarize_trade_prints
+from zone_strength import measure_zone_strength
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -2477,6 +2478,17 @@ def render_flow_panel() -> None:
         and d.get("checksum_ok") is True
     )
     book_ready = book_integrity_ok and bool(d["asks"]) and bool(d["bids"])
+    ob_update_ts = _f((d.get("channel_last_seen") or {}).get("ob_updates"))
+    ob_update_age = (
+        max(0.0, now - ob_update_ts) if ob_update_ts is not None else None
+    )
+    # Zone resting-depth measurements are withheld unless the L2 book is
+    # synchronized, CRC-valid, gap-free, and the ob_updates channel is fresh.
+    zone_book_valid = (
+        book_ready
+        and ob_update_age is not None
+        and ob_update_age <= CHANNEL_STALE_SECONDS.get("ob_updates", 3)
+    )
     pa = None
     closed = _closed_candles(d)
     if closed:
@@ -2610,7 +2622,7 @@ def render_flow_panel() -> None:
                 "A confirmed price sweep is a stop-hunt candidate, not proof that stop orders actually existed or were triggered. "
                 "Overshoot and reclaim timing are measured from completed candles."
             )
-    with st.expander("Supply / demand zones (price-action-derived)", expanded=True):
+    with st.expander("Supply / demand zones — measured volume and resting liquidity", expanded=True):
         zones = (pa or {}).get("zones", [])
         last_price = _f(d.get("last_price"))
         zone_rows = []
@@ -2622,12 +2634,58 @@ def render_flow_panel() -> None:
             midpoint = (top + bottom) / 2.0
             distance = (midpoint - last_price) if last_price is not None else None
             displacement = _f(z.get("displacement_x_atr"))
+            strength = measure_zone_strength(
+                z,
+                closed,
+                d.get("trade_log", []),
+                d.get("bids", {}),
+                d.get("asks", {}),
+                book_valid=zone_book_valid,
+                contract_value_btc=CONTRACT_VALUE_BTC,
+            )
+
+            def execution_strength_text(flow: dict[str, Any]) -> str:
+                return (
+                    f'{int(flow["prints"]):,} prints · '
+                    f'{float(flow["contracts"]):,.0f} contracts · '
+                    f'${float(flow["usd"]):,.0f}'
+                )
+
+            def resting_strength_text(
+                side_name: str,
+                flow: dict[str, Any] | None,
+                levels: int | None,
+            ) -> str:
+                if flow is None or levels is None:
+                    return "UNAVAILABLE — book not fresh/verified"
+                return (
+                    f'{side_name}: {levels:,} levels · '
+                    f'{float(flow["contracts"]):,.0f} contracts · '
+                    f'${float(flow["usd"]):,.0f}'
+                )
+
+            aligned = strength["aligned"]
+            opposing = strength["opposing"]
+            ratio = strength["aligned_opposing_usd_ratio"]
+            aligned_text = resting_strength_text(
+                strength["aligned_side"], aligned, strength["aligned_levels"]
+            )
+            opposing_side = "ASK" if strength["aligned_side"] == "BID" else "BID"
+            opposing_text = resting_strength_text(
+                opposing_side, opposing, strength["opposing_levels"]
+            )
             zone_rows.append({
                 "Zone": "DEMAND" if z.get("direction") == "bullish" else "SUPPLY",
                 "Lower": bottom,
                 "Upper": top,
                 "Midpoint": midpoint,
                 "Width (pts)": top - bottom,
+                "Formation candle volume": strength["formation_volume"],
+                "Executed BUY in zone": execution_strength_text(strength["buy"]),
+                "Executed SELL in zone": execution_strength_text(strength["sell"]),
+                "Aligned resting depth": aligned_text,
+                "Opposing resting depth": opposing_text,
+                "Aligned / opposing USD depth": ratio,
                 "Displacement (x ATR)": displacement,
                 "Distance to mid (pts)": distance,
                 "Status": str(z.get("status", "unknown")).upper(),
@@ -2645,17 +2703,25 @@ def render_flow_panel() -> None:
                     "Upper": "{:,.1f}",
                     "Midpoint": "{:,.1f}",
                     "Width (pts)": "{:,.1f}",
+                    "Formation candle volume": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+                    "Aligned / opposing USD depth": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
                     "Displacement (x ATR)": "{:.2f}",
                     "Distance to mid (pts)": "{:+,.1f}",
                 }, na_rep="—"),
-                hide_index=True, use_container_width=True, height=300,
+                hide_index=True, use_container_width=True, height=360,
             )
         else:
             st.caption("No confirmed supply/demand zones in the current completed-candle lookback.")
         st.caption(
-            "Demand = bullish order-block candidates; supply = bearish order-block candidates. "
-            "Displacement (x ATR) quantifies the confirming price move, not resting order size or a probability. "
-            "Zone boundaries are derived from completed candles and do not prove institutional orders exist there."
+            "Formation volume is the exchange candle's reported volume field for the origin candle. "
+            "Executed BUY/SELL figures count retained classified public trade prints and contracts inside the zone "
+            "(up to 20,000 captured prints; process restart resets this in-memory window). "
+            "Resting depth is the current synchronized L2 snapshot inside the zone: each count is a visible price level, "
+            "not an individual order because the public book aggregates size by price. "
+            "USD notional = contracts × 0.001 BTC/contract × observed execution or resting price. "
+            "Aligned depth means BID liquidity for DEMAND and ASK liquidity for SUPPLY; the ratio compares its USD notional "
+            "with the opposing side. The book columns are withheld when the L2 feed is stale, unsynchronized, gap-affected "
+            "or CRC-invalid. Resting orders can be cancelled or moved; none of these measures is a probability or guarantee."
         )
 
     with st.expander("Buy / sell exhaustion (1-minute candle + observed tape)", expanded=True):
