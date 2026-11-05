@@ -117,3 +117,24 @@ def test_invalid_or_outside_trades_and_levels_are_ignored():
 def test_invalid_zone_boundaries_are_rejected(zone):
     with pytest.raises(ValueError):
         measure_zone_strength(zone, [], [], {}, {}, book_valid=True)
+
+
+
+def test_formation_volume_uses_formation_timestamp_not_lookback_relative_index():
+    zone = {
+        "direction": "bearish",
+        "bottom": 100.0,
+        "top": 110.0,
+        "_mi": 1,  # This index belongs to a shortened detector window.
+        "formation_time": 300.0,
+    }
+    candles = [
+        {"time": 100.0, "volume": 10},
+        {"time": 200.0, "volume": 20},
+        {"time": 300.0, "volume": 300},
+        {"time": 400.0, "volume": 40},
+    ]
+
+    result = measure_zone_strength(zone, candles, [], {}, {}, book_valid=True)
+
+    assert result["formation_volume"] == 300
