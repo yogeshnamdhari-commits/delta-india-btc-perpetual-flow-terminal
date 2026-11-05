@@ -27,7 +27,7 @@ from okx_history_panel import render_okx_history_panel
 from binance_panel import render_binance_cross_venue_panel
 from trade_activity import summarize_trade_prints
 from zone_strength import measure_zone_strength
-from daily_metrics import parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
+from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -334,6 +334,25 @@ def load_open_interest_history() -> list[dict[str, Any]]:
         return [dict(row) for row in result if isinstance(row, dict)]
     except (requests.RequestException, ValueError, TypeError):
         _logger.warning("Historical OI REST snapshot unavailable", exc_info=True)
+        return []
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_daily_volume_history() -> list[dict[str, int | float]]:
+    """Fetch recent BTCUSD daily candles; the latest candle may still be forming."""
+    end = int(time.time())
+    start = end - 7 * 86_400
+    try:
+        response = requests.get(
+            REST_URL,
+            params={"resolution": "1d", "symbol": SYMBOL, "start": start, "end": end},
+            headers={"Accept": "application/json", "User-Agent": "DeltaIndiaBTCFlowTerminal/1.0"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        return parse_daily_volume_candles(response.json())
+    except (requests.RequestException, ValueError, TypeError):
+        _logger.warning("Daily BTCUSD candle volume unavailable", exc_info=True)
         return []
 
 
@@ -2521,6 +2540,7 @@ def render_tape_cvd_panel() -> None:
     st.subheader("24-hour volume distribution and open interest")
     now_ts = time.time()
     ticker_metrics = load_daily_ticker_metrics()
+    daily_volume_history = load_daily_volume_history()
     oi_history = load_open_interest_history()
     flow_24h = summarize_aggressor_flow(
         d.get("trade_flow_minutes", {}),
@@ -2549,31 +2569,54 @@ def render_tape_cvd_panel() -> None:
         if pct is not None:
             oi_change_text += f" ({float(pct):+.2f}%)"
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    latest_daily_volume = daily_volume_history[-1] if daily_volume_history else None
+    latest_daily_volume_time = (
+        pd.to_datetime(latest_daily_volume["time"], unit="s", utc=True).strftime("%Y-%m-%d UTC")
+        if latest_daily_volume else "—"
+    )
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric(
-        "24h exchange volume",
-        "—" if volume_contracts is None else f"{float(volume_contracts):,.0f} contracts",
+        "Latest daily candle volume",
+        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} contracts",
+        help=f"BTCUSD 1d candle timestamp: {latest_daily_volume_time}. The newest candle may still be forming.",
     )
     m2.metric(
-        "24h turnover (USD)",
-        "—" if turnover_usd is None else f"${float(turnover_usd):,.0f}",
+        "Ticker session volume",
+        "—" if volume_contracts is None else f"{float(volume_contracts):,.0f} contracts",
     )
     m3.metric(
+        "Ticker turnover (USD)",
+        "—" if turnover_usd is None else f"${float(turnover_usd):,.0f}",
+    )
+    m4.metric(
         "Current open interest",
         "—" if current_oi is None else f"{float(current_oi):,.0f} contracts",
     )
-    m4.metric(
+    m5.metric(
         "OI change (24h)",
         oi_change_text,
     )
-    m5.metric(
+    m6.metric(
         "OI value (USD)",
         "—" if oi_value_usd is None else f"${float(oi_value_usd):,.0f}",
-        delta=(
-            None if oi_24h.get("change_pct") is None
-            else f"{float(oi_24h['change_pct']):+.2f}% vs 24h ago"
-        ),
     )
+
+    if daily_volume_history:
+        daily_volume_df = pd.DataFrame(daily_volume_history[-7:]).sort_values("time", ascending=False)
+        daily_volume_df["Daily candle (UTC)"] = pd.to_datetime(
+            daily_volume_df["time"], unit="s", utc=True
+        ).dt.strftime("%Y-%m-%d")
+        daily_volume_df = daily_volume_df.rename(columns={"volume": "BTCUSD volume (contracts)"})
+        st.dataframe(
+            daily_volume_df[["Daily candle (UTC)", "BTCUSD volume (contracts)"]].style.format(
+                {"BTCUSD volume (contracts)": "{:,.0f}"}
+            ),
+            hide_index=True,
+            use_container_width=True,
+            height=190,
+        )
+    else:
+        st.info("BTCUSD daily-candle volume history is unavailable; the live ticker session volume is shown separately.")
 
     direction_rows = [
         {
@@ -2647,7 +2690,7 @@ def render_tape_cvd_panel() -> None:
         "Open interest is aggregate outstanding contracts. It is not split into BUY-side and SELL-side OI: "
         "every open contract has both a long and a short counterparty. The directional table above is taker-aggressor traded volume, not long/short positioning. "
         "The exchange WebSocket also reports a separate 6-hour OI-value change in the contract settlement currency: "
-        + ("—" if d.get("open_interest_change_6h_settlement") is None else f"${float(d['open_interest_change_6h_settlement']):+,.0f}")
+        + ("—" if d.get("open_interest_change_6h_settlement") is None else f"{float(d['open_interest_change_6h_settlement']):+,.0f} settlement units")
     )
 
 
