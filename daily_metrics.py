@@ -66,6 +66,28 @@ def parse_ticker_payload(payload: Any, symbol: str = "BTCUSD") -> dict[str, Any]
     }
 
 
+def parse_daily_volume_candles(payload: Any) -> list[dict[str, int | float]]:
+    """Normalize BTCUSD 1d candles; volume follows the exchange candle window."""
+    if not isinstance(payload, Mapping):
+        return []
+    result = payload.get("result")
+    if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):
+        return []
+    rows: dict[int, float] = {}
+    for row in result:
+        if not isinstance(row, Mapping):
+            continue
+        timestamp = _epoch_seconds(row.get("time"))
+        volume = _number(row.get("volume"))
+        if timestamp is None or volume is None or volume < 0:
+            continue
+        rows[timestamp] = volume
+    return [
+        {"time": timestamp, "volume": volume}
+        for timestamp, volume in sorted(rows.items())
+    ]
+
+
 def summarize_aggressor_flow(
     flow_minutes: Mapping[Any, Any] | None,
     *,
