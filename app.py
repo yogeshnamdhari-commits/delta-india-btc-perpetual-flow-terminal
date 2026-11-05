@@ -367,7 +367,7 @@ class DeltaFeed:
             "funding_interval_seconds": None,
             "next_funding_at": None,
             "open_interest_contracts": None,
-            "open_interest_change_6h_usd": None,
+            "open_interest_change_6h_settlement": None,
             "ticker_24h": {},
             "asks": {},
             "bids": {},
@@ -1055,7 +1055,7 @@ class DeltaFeed:
                         if oi:
                             self.data["open_interest_contracts"] = _f(oi[0], self.data["open_interest_contracts"])
                         if len(oi) > 1:
-                            self.data["open_interest_change_6h_usd"] = _f(oi[1], self.data["open_interest_change_6h_usd"])
+                            self.data["open_interest_change_6h_settlement"] = _f(oi[1], self.data["open_interest_change_6h_settlement"])
                         turnover = row.get("to") or []
                         ohlc = row.get("ohlc") or []
                         self.data["ticker_24h"] = {
@@ -2646,8 +2646,8 @@ def render_tape_cvd_panel() -> None:
     st.caption(
         "Open interest is aggregate outstanding contracts. It is not split into BUY-side and SELL-side OI: "
         "every open contract has both a long and a short counterparty. The directional table above is taker-aggressor traded volume, not long/short positioning. "
-        "The exchange WebSocket also reports a separate 6-hour OI-value change in USD: "
-        + ("—" if d.get("open_interest_change_6h_usd") is None else f"${float(d['open_interest_change_6h_usd']):+,.0f}")
+        "The exchange WebSocket also reports a separate 6-hour OI-value change in the contract settlement currency: "
+        + ("—" if d.get("open_interest_change_6h_settlement") is None else f"${float(d['open_interest_change_6h_settlement']):+,.0f}")
     )
 
 
