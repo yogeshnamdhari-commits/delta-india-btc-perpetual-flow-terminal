@@ -24,7 +24,7 @@ def test_parse_ticker_payload_normalizes_official_24h_fields():
 
     assert result == {
         "symbol": "BTCUSD",
-        "volume_contracts": 123456.0,
+        "volume": 123456.0,
         "turnover_usd": 987654321.0,
         "open_interest_contracts": 250000.0,
         "open_interest_value_usd": 1250000000.0,
@@ -40,14 +40,14 @@ def test_parse_ticker_payload_selects_requested_symbol_from_list():
         ]
     }
     result = parse_ticker_payload(payload)
-    assert result["volume_contracts"] == 10
+    assert result["volume"] == 10
     assert result["turnover_usd"] == 20
     assert result["open_interest_contracts"] == 30
 
 
 def test_parse_ticker_payload_does_not_invent_missing_or_invalid_values():
     result = parse_ticker_payload({"result": {"symbol": "BTCUSD", "volume": "nan", "oi": -1}})
-    assert result["volume_contracts"] is None
+    assert result["volume"] is None
     assert result["open_interest_contracts"] is None
     assert result["turnover_usd"] is None
 
