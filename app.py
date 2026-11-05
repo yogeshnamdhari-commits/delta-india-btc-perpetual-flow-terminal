@@ -27,6 +27,7 @@ from okx_history_panel import render_okx_history_panel
 from binance_panel import render_binance_cross_venue_panel
 from trade_activity import summarize_trade_prints
 from zone_strength import measure_zone_strength
+from daily_metrics import parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -198,6 +199,7 @@ _logger.propagate = False
 # Public, read-only Delta Exchange India market-data endpoint.
 WS_URL = "wss://public-socket.india.delta.exchange"
 REST_URL = "https://api.india.delta.exchange/v2/history/candles"
+TICKER_REST_URL = "https://api.india.delta.exchange/v2/tickers"
 SYMBOL = "BTCUSD"              # Delta India BTC perpetual, INR-settled
 INDEX_SYMBOL = ".DEXBTUSD"    # Delta's BTCUSD underlying index symbol
 TZ_IST = ZoneInfo("Asia/Kolkata")
@@ -293,6 +295,48 @@ def load_initial_candles() -> list[dict[str, float | int]]:
         return []
 
 
+@st.cache_data(ttl=20, show_spinner=False)
+def load_daily_ticker_metrics() -> dict[str, Any]:
+    """Fetch Delta's official rolling-24h ticker totals and current OI."""
+    try:
+        response = requests.get(
+            f"{TICKER_REST_URL}/{SYMBOL}",
+            headers={"Accept": "application/json", "User-Agent": "DeltaIndiaBTCFlowTerminal/1.0"},
+            timeout=6,
+        )
+        response.raise_for_status()
+        return parse_ticker_payload(response.json(), SYMBOL)
+    except (requests.RequestException, ValueError, TypeError):
+        _logger.warning("Daily ticker REST snapshot unavailable", exc_info=True)
+        return parse_ticker_payload({}, SYMBOL)
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def load_open_interest_history() -> list[dict[str, Any]]:
+    """Fetch hourly OI candles used to establish a genuine 24h comparison baseline."""
+    end = int(time.time())
+    start = end - 28 * 60 * 60
+    try:
+        response = requests.get(
+            REST_URL,
+            params={
+                "resolution": "1h",
+                "symbol": f"OI:{SYMBOL}",
+                "start": start,
+                "end": end,
+            },
+            headers={"Accept": "application/json", "User-Agent": "DeltaIndiaBTCFlowTerminal/1.0"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result", []) if isinstance(payload, dict) else []
+        return [dict(row) for row in result if isinstance(row, dict)]
+    except (requests.RequestException, ValueError, TypeError):
+        _logger.warning("Historical OI REST snapshot unavailable", exc_info=True)
+        return []
+
+
 class DeltaFeed:
     """Read-only Delta India WebSocket consumer with sequence and CRC32 book checks."""
 
@@ -323,6 +367,7 @@ class DeltaFeed:
             "funding_interval_seconds": None,
             "next_funding_at": None,
             "open_interest_contracts": None,
+            "open_interest_change_6h_usd": None,
             "ticker_24h": {},
             "asks": {},
             "bids": {},
@@ -981,6 +1026,7 @@ class DeltaFeed:
                             )
                             flow[f"{side_norm}_count"] += 1
                             flow[f"{side_norm}_contracts"] += size
+                            flow[f"{side_norm}_usd"] += size * CONTRACT_VALUE_BTC * price
                     if side_norm != "unknown":
                         threshold = self.data.get("large_trade_threshold")
                         if threshold is not None and size >= threshold:
@@ -1007,6 +1053,9 @@ class DeltaFeed:
                         oi = row.get("oi") or []
                         if oi:
                             self.data["open_interest_contracts"] = _f(oi[0], self.data["open_interest_contracts"])
+                        if len(oi) > 1:
+                            self.data["open_interest_change_6h_usd"] = _f(oi[1], self.data["open_interest_change_6h_usd"])
+                        turnover = row.get("to") or []
                         ohlc = row.get("ohlc") or []
                         self.data["ticker_24h"] = {
                             "open": _f(ohlc[0]) if len(ohlc) > 0 else None,
@@ -1014,6 +1063,8 @@ class DeltaFeed:
                             "low": _f(ohlc[2]) if len(ohlc) > 2 else None,
                             "close": _f(ohlc[3]) if len(ohlc) > 3 else None,
                             "mark_change_pct": _f(row.get("m24hc")),
+                            "turnover_settlement": _f(turnover[0]) if len(turnover) > 0 else None,
+                            "turnover_usd": _f(turnover[1]) if len(turnover) > 1 else None,
                         }
                         _log_event({
                             "event": "channel_message",
@@ -2464,6 +2515,140 @@ def render_tape_cvd_panel() -> None:
         c2.metric("Sell-aggressor contracts", _fmt(d["sell_contracts"], 0))
         c3.metric("Net session delta", _fmt(d["cvd_value"], 0))
         st.caption("CVD is a client-side proxy collected since this dashboard started. It resets on restart and should not be treated as a verified exchange-calculated metric.")
+
+    st.divider()
+    st.subheader("24-hour volume distribution and open interest")
+    now_ts = time.time()
+    ticker_metrics = load_daily_ticker_metrics()
+    oi_history = load_open_interest_history()
+    flow_24h = summarize_aggressor_flow(
+        d.get("trade_flow_minutes", {}),
+        now_ts=now_ts,
+        feed_started_at=d.get("started_at"),
+        contract_value_btc=CONTRACT_VALUE_BTC,
+        window_seconds=86_400,
+    )
+    current_oi = ticker_metrics.get("open_interest_contracts")
+    if current_oi is None:
+        current_oi = d.get("open_interest_contracts")
+    oi_24h = summarize_open_interest_24h(
+        oi_history, current_oi, now_ts=now_ts, window_seconds=86_400
+    )
+    ws_turnover_usd = (d.get("ticker_24h") or {}).get("turnover_usd")
+    volume_contracts = ticker_metrics.get("volume_contracts")
+    turnover_usd = ticker_metrics.get("turnover_usd")
+    if turnover_usd is None:
+        turnover_usd = ws_turnover_usd
+    oi_value_usd = ticker_metrics.get("open_interest_value_usd")
+    oi_change_text = "Unavailable"
+    if oi_24h.get("change_contracts") is not None:
+        change = float(oi_24h["change_contracts"])
+        pct = oi_24h.get("change_pct")
+        oi_change_text = f"{change:+,.0f} contracts"
+        if pct is not None:
+            oi_change_text += f" ({float(pct):+.2f}%)"
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric(
+        "24h exchange volume",
+        "—" if volume_contracts is None else f"{float(volume_contracts):,.0f} contracts",
+    )
+    m2.metric(
+        "24h turnover (USD)",
+        "—" if turnover_usd is None else f"${float(turnover_usd):,.0f}",
+    )
+    m3.metric(
+        "Current open interest",
+        "—" if current_oi is None else f"{float(current_oi):,.0f} contracts",
+    )
+    m4.metric(
+        "OI change (24h)",
+        oi_change_text,
+    )
+    m5.metric(
+        "OI value (USD)",
+        "—" if oi_value_usd is None else f"${float(oi_value_usd):,.0f}",
+        delta=(
+            None if oi_24h.get("change_pct") is None
+            else f"{float(oi_24h['change_pct']):+.2f}% vs 24h ago"
+        ),
+    )
+
+    direction_rows = [
+        {
+            "Aggressor": "BUY taker",
+            "Prints": flow_24h["buy_count"],
+            "Contracts": flow_24h["buy_contracts"],
+            "BTC equivalent": flow_24h["buy_btc"],
+            "Approx USD notional": flow_24h["buy_usd"],
+            "Captured volume share": flow_24h["buy_share_pct"],
+        },
+        {
+            "Aggressor": "SELL taker",
+            "Prints": flow_24h["sell_count"],
+            "Contracts": flow_24h["sell_contracts"],
+            "BTC equivalent": flow_24h["sell_btc"],
+            "Approx USD notional": flow_24h["sell_usd"],
+            "Captured volume share": flow_24h["sell_share_pct"],
+        },
+    ]
+    direction_df = pd.DataFrame(direction_rows)
+    st.dataframe(
+        direction_df.style.format({
+            "Prints": "{:,.0f}",
+            "Contracts": "{:,.0f}",
+            "BTC equivalent": "{:,.4f}",
+            "Approx USD notional": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
+            "Captured volume share": "{:.2f}%",
+        }),
+        hide_index=True,
+        use_container_width=True,
+    )
+    capture_text = (
+        "not available" if flow_24h.get("capture_hours") is None
+        else f"{flow_24h['capture_hours']:.1f} hours since this process started (maximum 24 hours)"
+    )
+    st.caption(
+        "The exchange 24h volume/turnover above is Delta's rolling ticker total. "
+        f"BUY/SELL distribution is calculated from captured public aggressor-side trades; capture span: {capture_text}. "
+        "It is not backfilled before this process starts and any feed outage creates missing observations. "
+        "Shares are percentages of captured, classified BUY+SELL contract volume, not percentages of the exchange's full 24h total. "
+        "Approximate USD notional = contracts × 0.001 BTC × execution price."
+    )
+
+    oi_chart_rows = oi_24h.get("history") or []
+    if len(oi_chart_rows) >= 2:
+        oi_chart_df = pd.DataFrame(oi_chart_rows)
+        oi_chart_df["Time (IST)"] = pd.to_datetime(
+            oi_chart_df["time"], unit="s", utc=True
+        ).dt.tz_convert("Asia/Kolkata")
+        oi_fig = go.Figure()
+        oi_fig.add_trace(go.Scatter(
+            x=oi_chart_df["Time (IST)"],
+            y=oi_chart_df["open_interest_contracts"],
+            mode="lines",
+            name="Open interest",
+        ))
+        oi_fig.update_layout(
+            height=250,
+            margin=dict(l=8, r=8, t=12, b=8),
+            template="plotly_dark",
+            xaxis_title="Time (IST)",
+            yaxis_title="Open interest (contracts)",
+            showlegend=False,
+        )
+        oi_fig.update_xaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
+        oi_fig.update_yaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
+        st.plotly_chart(oi_fig, use_container_width=True, key="btcusd_oi_24h_chart")
+    else:
+        st.info("24-hour OI history is unavailable from Delta at the moment; current OI is shown when the ticker is available.")
+    st.caption(
+        "Open interest is aggregate outstanding contracts. It is not split into BUY-side and SELL-side OI: "
+        "every open contract has both a long and a short counterparty. The directional table above is taker-aggressor traded volume, not long/short positioning. "
+        "The exchange WebSocket also reports a separate 6-hour OI-value change in USD: "
+        + ("—" if d.get("open_interest_change_6h_usd") is None else f"${float(d['open_interest_change_6h_usd']):+,.0f}")
+    )
+
 
 
 @st.fragment(run_every=2.0)
