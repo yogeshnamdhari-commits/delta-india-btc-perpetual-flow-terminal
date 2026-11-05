@@ -31,6 +31,7 @@ NS = {
     "websocket": SimpleNamespace(WebSocketApp=FakeWebSocketApp),
     "_logger": DummyLogger(), "_log_event": lambda *a, **k: True,
     "WS_URL": "wss://test.invalid", "SYMBOL": "BTCUSD", "INDEX_SYMBOL": ".DEXBTUSD",
+    "CONTRACT_VALUE_BTC": 0.001,
     "TZ_IST": ZoneInfo("Asia/Kolkata"),
     "_f": lambda value, default=None: default if value is None else float(value),
     "_ts_seconds": lambda value: int(value),
@@ -92,6 +93,8 @@ class TestRealDeltaFeedClass(unittest.TestCase):
         self.assertEqual(event["bid"],100.75)
         self.assertEqual(event["bid_size"],9.0)
         self.assertEqual(event["price"],101.0)  # ticker 24h close / latest traded close
+        self.assertEqual(self.feed.data["open_interest_contracts"], 2500.0)
+        self.assertEqual(self.feed.data["open_interest_change_6h_settlement"], 0.0)
         self.assertTrue(any(kwargs.get("to_full_log") for _record, kwargs in captured))
 
     def test_disconnect_invalidates_book_sequence_and_checksum(self):
@@ -156,5 +159,25 @@ class TestRealDeltaFeedClass(unittest.TestCase):
         self.assertTrue(state["book_synced"])
         self.assertFalse(state["sequence_gap_unresolved"])
         self.assertEqual(len(sock.sent),2)
+
+
+    def test_trade_message_updates_side_minute_notional_without_touching_signal_paths(self):
+        message = {
+            "type": "trades",
+            "sy": "BTCUSD",
+            "p": "100000",
+            "s": "10",
+            "r": "t",
+            "t": 1200,
+            "ts": 1200,
+        }
+        self.feed._on_message(None, json.dumps(message))
+        minute = 1200 // 60 * 60
+        flow = self.feed.data["trade_flow_minutes"][minute]
+        self.assertEqual(flow["buy_count"], 1)
+        self.assertEqual(flow["buy_contracts"], 10.0)
+        self.assertEqual(flow["buy_usd"], 1000.0)
+        self.assertEqual(flow["sell_count"], 0)
+        self.assertEqual(flow["sell_usd"], 0.0)
 
 if __name__ == "__main__": unittest.main()
