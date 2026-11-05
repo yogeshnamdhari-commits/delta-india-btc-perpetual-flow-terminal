@@ -25,6 +25,7 @@ from ai_analyst import render_ai_analyst
 from bybit_panel import render_bybit_cross_venue_panel
 from okx_history_panel import render_okx_history_panel
 from binance_panel import render_binance_cross_venue_panel
+from trade_activity import summarize_trade_prints
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -2401,13 +2402,41 @@ def render_tape_cvd_panel() -> None:
     d = feed.snapshot()
     tape_col, cvd_col = st.columns([1, 1], gap="large")
     with tape_col:
+        st.subheader("Executed BUY / SELL activity")
+        activity_df = pd.DataFrame(
+            summarize_trade_prints(d.get("trade_log", []), CONTRACT_VALUE_BTC)
+        )
+        st.dataframe(
+            activity_df.style.format({
+                "Trade prints": "{:,.0f}",
+                "Contracts": "{:,.0f}",
+                "BTC equivalent": "{:,.4f}",
+                "Approx USD value": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
+            }),
+            hide_index=True, use_container_width=True, height=105,
+        )
+        st.caption(
+            "Counts are classified public execution prints, not unique parent orders. "
+            "Totals cover the retained in-memory tape (up to 20,000 prints) and reset "
+            "when the feed process restarts. Approx. USD value = contracts × 0.001 BTC × execution price."
+        )
+
         st.subheader("Recent executed trades")
         trades = d["trades"]
         if trades:
             tape_df = pd.DataFrame(trades)
-            tape_df = tape_df[["time", "side", "price", "size"]]
+            tape_df = tape_df[["time", "side", "price", "size"]].copy()
+            tape_df["Value (USD)"] = (
+                pd.to_numeric(tape_df["price"], errors="coerce")
+                * pd.to_numeric(tape_df["size"], errors="coerce")
+                * CONTRACT_VALUE_BTC
+            )
             st.dataframe(
-                tape_df.style.format({"price": "{:,.2f}", "size": "{:,.0f}"}),
+                tape_df.style.format({
+                    "price": "{:,.2f}",
+                    "size": "{:,.0f}",
+                    "Value (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
+                }),
                 hide_index=True, use_container_width=True, height=360,
             )
         else:
