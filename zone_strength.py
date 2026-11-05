@@ -27,7 +27,7 @@ def _book_side_in_zone(
     upper: float,
     contract_value_btc: float,
 ) -> dict[str, float | int]:
-    result = _empty_flow()
+    result: dict[str, float | int] = {"levels": 0, "contracts": 0.0, "btc": 0.0, "usd": 0.0}
     if not isinstance(book, Mapping):
         return result
     for raw_price, raw_size in book.items():
@@ -36,7 +36,7 @@ def _book_side_in_zone(
         if price is None or size is None or price <= 0 or size <= 0:
             continue
         if lower <= price <= upper:
-            result["prints"] += 1  # Here this field represents visible price levels.
+            result["levels"] += 1
             result["contracts"] += size
             result["btc"] += size * contract_value_btc
             result["usd"] += size * contract_value_btc * price
@@ -103,8 +103,8 @@ def measure_zone_strength(
     if book_valid:
         bid = _book_side_in_zone(bids, lower, upper, contract_btc)
         ask = _book_side_in_zone(asks, lower, upper, contract_btc)
-        bid_levels = int(bid["prints"])
-        ask_levels = int(ask["prints"])
+        bid_levels = int(bid["levels"])
+        ask_levels = int(ask["levels"])
     else:
         bid = ask = None
         bid_levels = ask_levels = None
