@@ -94,7 +94,7 @@ class TestRealDeltaFeedClass(unittest.TestCase):
         self.assertEqual(event["bid_size"],9.0)
         self.assertEqual(event["price"],101.0)  # ticker 24h close / latest traded close
         self.assertEqual(self.feed.data["open_interest_contracts"], 2500.0)
-        self.assertEqual(self.feed.data["open_interest_change_6h_usd"], 0.0)
+        self.assertEqual(self.feed.data["open_interest_change_6h_settlement"], 0.0)
         self.assertTrue(any(kwargs.get("to_full_log") for _record, kwargs in captured))
 
     def test_disconnect_invalidates_book_sequence_and_checksum(self):
