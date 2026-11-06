@@ -164,8 +164,8 @@ def _render_perpetual_taker_values(data: dict[str, Any]) -> None:
     )
 
     shares = st.columns(3)
-    shares[0].metric("BUY share / size (%)", _pct(latest.get("buy_ratio_pct")))
-    shares[1].metric("SELL share / size (%)", _pct(latest.get("sell_ratio_pct")))
+    shares[0].metric("BUY volume share (%)", _pct(latest.get("buy_ratio_pct")))
+    shares[1].metric("SELL volume share (%)", _pct(latest.get("sell_ratio_pct")))
     shares[2].metric("BUY / SELL value ratio", f"{latest['buy_sell_ratio']:.3f}" if latest.get("buy_sell_ratio") is not None else "—")
 
     st.caption(
@@ -186,8 +186,8 @@ def _render_perpetual_taker_values(data: dict[str, Any]) -> None:
         "taker_sell_usd": "SELL value / volume (USD)",
         "taker_total_usd": "Total volume (USD)",
         "net_taker_usd": "Net taker value (USD)",
-        "buy_ratio_pct": "BUY share / size (%)",
-        "sell_ratio_pct": "SELL share / size (%)",
+        "buy_ratio_pct": "BUY volume share (%)",
+        "sell_ratio_pct": "SELL volume share (%)",
         "buy_sell_ratio": "BUY / SELL ratio",
         "perpetual_index_close_usd": "Perpetual index close (USD)",
     })
@@ -195,7 +195,7 @@ def _render_perpetual_taker_values(data: dict[str, Any]) -> None:
         "UTC interval",
         "BUY quantity (BTC est.)", "SELL quantity (BTC est.)", "Total quantity (BTC est.)",
         "BUY value / volume (USD)", "SELL value / volume (USD)", "Total volume (USD)",
-        "Net taker value (USD)", "BUY share / size (%)", "SELL share / size (%)",
+        "Net taker value (USD)", "BUY volume share (%)", "SELL volume share (%)",
         "BUY / SELL ratio", "Perpetual index close (USD)",
     ]
     st.dataframe(
