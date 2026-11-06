@@ -465,8 +465,7 @@ def build_liquidity_effectiveness(
             side_candidates.sort(key=lambda item: item["Age (bars)"])
             side_candidates = side_candidates[-limit_per_side:]
         for item in side_candidates:
-            item.pop("_kind", None)
-            output.append(item)
+            output.append({key: value for key, value in item.items() if key != "_kind"})
 
     return {
         "levels": output,
