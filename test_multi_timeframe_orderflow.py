@@ -61,7 +61,10 @@ def test_completed_periods_are_utc_aligned_and_exclude_current_partial_bar():
     assert row["net_delta_contracts"] == pytest.approx(20)
     assert row["buy_share_pct"] == pytest.approx(60)
     assert row["classification"] == "BUYER DOMINANCE"
+    assert row["buy_btc"] == pytest.approx(0.06)
+    assert row["sell_btc"] == pytest.approx(0.04)
     assert row["total_btc"] == pytest.approx(0.1)
+    assert row["dominance_ratio"] == pytest.approx(1.5)
     assert row["total_usd"] == pytest.approx(10_000)
 
 
