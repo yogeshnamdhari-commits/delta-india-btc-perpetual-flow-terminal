@@ -214,6 +214,23 @@ def _true_range(current: Mapping[str, Any], previous_close: float) -> float:
     return max(high - low, abs(high - previous_close), abs(low - previous_close))
 
 
+
+def _has_contiguous_candles(
+    candles: Sequence[Mapping[str, Any]],
+    *,
+    start_index: int,
+    end_index: int,
+    duration_seconds: int,
+) -> bool:
+    """Reject a signal when any candle needed for its range/ATR/acceptance is missing."""
+    if end_index - start_index <= 1:
+        return True
+    return all(
+        int(candles[index]["time"]) - int(candles[index - 1]["time"]) == duration_seconds
+        for index in range(start_index + 1, end_index)
+    )
+
+
 def _atr_before(
     candles: Sequence[Mapping[str, Any]],
     index: int,
@@ -504,7 +521,25 @@ def detect_multi_timeframe_breakouts(
         candidates: list[tuple[int, str, float, float, float | None, float]] = []
         latest_sweep: tuple[int, str, float, float, float | None] | None = None
 
+        latest_context_start = max(0, len(candles) - max(range_lookback, atr_period) - 1)
+        latest_context_end = len(candles)
+        latest_context_contiguous = _has_contiguous_candles(
+            candles,
+            start_index=latest_context_start,
+            end_index=latest_context_end,
+            duration_seconds=duration,
+        )
+
         for index in range(start_index, len(candles)):
+            context_start = max(0, index - max(range_lookback, atr_period))
+            context_end = min(len(candles), index + 2)
+            if not _has_contiguous_candles(
+                candles,
+                start_index=context_start,
+                end_index=context_end,
+                duration_seconds=duration,
+            ):
+                continue
             atr = _atr_before(candles, index, atr_period)
             if atr is None or atr <= 0:
                 continue
@@ -569,7 +604,7 @@ def detect_multi_timeframe_breakouts(
             results.append({**base, **evaluated})
             continue
 
-        if latest_sweep is not None:
+        if latest_sweep is not None and latest_context_contiguous:
             index, direction, level, atr, relative_volume = latest_sweep
             candle = candles[index]
             flow = _flow_for_bar(
@@ -603,7 +638,11 @@ def detect_multi_timeframe_breakouts(
         latest = candles[-1]
         results.append({
             **base,
-            "classification": "NO RECENT BREAKOUT",
+            "classification": (
+                "INSUFFICIENT — CANDLE HISTORY GAP"
+                if not latest_context_contiguous
+                else "NO RECENT BREAKOUT"
+            ),
             "direction": None,
             "latest_close": float(latest["close"]),
             "latest_candle_time": int(latest["time"]),
