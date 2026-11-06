@@ -439,7 +439,50 @@ def test_breakout_explanation_keeps_unavailable_trade_data_unverified():
     explanation = build_breakout_explanation(item)
     results = {check["Condition"]: check["Result"] for check in explanation["checks"]}
 
-    assert explanation["primary_reason"] == "INSUFFICIENT_CLASSIFIED_PRINTS"
+    assert explanation["primary_reason"] == "INSUFFICIENT_ACTIVE_MINUTE_COVERAGE"
     assert results["Trade-feed capture quality"] == "UNVERIFIED"
     assert results["Same-direction taker dominance"] == "UNVERIFIED"
     assert results["Classified trade prints"] == "INSUFFICIENT"
+
+
+
+def test_breakout_explanation_prioritizes_capture_start_after_historical_event():
+    from breakout_confirmation import build_breakout_explanation
+
+    duration = 60
+    rows = _valid_bullish_history(duration)
+    breakout_start = rows[27]["time"]
+    now = rows[-1]["time"] + duration + 5
+    item = detect_multi_timeframe_breakouts(
+        {"1m": rows}, {},
+        **_args(now, breakout_start + 1),
+        timeframes=(("1m", duration),),
+    )["windows"][0]
+
+    explanation = build_breakout_explanation(item)
+
+    assert explanation["primary_reason"] == "CAPTURE_STARTED_AFTER_EVENT"
+    assert "APP STARTED AFTER BREAKOUT BAR BEGAN" in explanation["failure_reason"]
+
+
+def test_breakout_explanation_marks_missing_relative_volume_unverified():
+    from breakout_confirmation import build_breakout_explanation
+
+    explanation = build_breakout_explanation({
+        "direction": "BUY",
+        "classification": "PRICE ACCEPTED — VOLUME NOT CONFIRMED",
+        "level": 100.0,
+        "atr": 2.0,
+        "breakout_close": 101.0,
+        "confirmation_close": 101.2,
+        "price_accepted": True,
+        "breakout_buffer_points": 0.2,
+        "acceptance_buffer_points": 0.1,
+        "relative_volume": None,
+        "relative_volume_multiple_required": 1.5,
+        "flow": {"capture_eligible": False, "capture_status": "UNVERIFIED — NO TAPE DATA"},
+    })
+
+    assert explanation["primary_reason"] == "VOLUME_UNVERIFIED"
+    volume = next(check for check in explanation["checks"] if check["Condition"] == "Breakout-candle relative volume")
+    assert volume["Result"] == "UNVERIFIED"
