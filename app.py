@@ -30,6 +30,7 @@ from zone_strength import measure_zone_strength
 from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
 from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
+from multi_timeframe_orderflow import summarize_aligned_taker_flow
 from exchange_flow_panel import render_exchange_flow_panel
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
@@ -420,8 +421,9 @@ class DeltaFeed:
             # --- order-flow tracking (added 2026-10-13 upgrade) ---
             "book_version": 0,            # bumped on every applied book message (render cache key)
             "trade_log": deque(maxlen=20000),     # (exchange_ts, price, contracts, buy/sell)
-            # Per-minute aggressor aggregates retain candle-level flow after individual
-            # prints roll out of trade_log. Kept in memory for 48 hours; never persisted.
+            # Per-minute aggressor aggregates retain timestamp-aligned flow after
+            # individual prints roll out of trade_log. Bounded to 30 days in memory;
+            # never persisted or backfilled.
             "trade_flow_minutes": {},              # minute epoch -> side counts + summed contracts
             "trade_flow_latest_minute": None,
             "trade_sizes": deque(maxlen=3000),    # rolling sizes for the percentile threshold
@@ -1034,7 +1036,7 @@ class DeltaFeed:
                         latest_minute = self.data.get("trade_flow_latest_minute")
                         if latest_minute is None or minute_bucket > latest_minute:
                             self.data["trade_flow_latest_minute"] = minute_bucket
-                            cutoff = minute_bucket - 48 * 60 * 60
+                            cutoff = minute_bucket - 30 * 24 * 60 * 60
                             flow_minutes = self.data["trade_flow_minutes"]
                             for old_minute in list(flow_minutes):
                                 if old_minute < cutoff:
@@ -2872,6 +2874,79 @@ def render_flow_panel() -> None:
         "USD values are approximate (contracts × 0.001 BTC × execution price). "
         "These are taker-side executions from the retained public tape, not proof of every L2 depth reduction; "
         "counts are trade prints, not unique parent orders. The tape resets when the process restarts."
+    )
+    st.markdown("**Timestamp-aligned completed-bar taker flow (UTC boundaries; timestamps shown in IST)**")
+    aligned_flow = summarize_aligned_taker_flow(
+        d.get("trade_flow_minutes", {}),
+        now_ts=now,
+        feed_started_at=d.get("started_at"),
+        connection_status=str(d.get("connection", "unknown")),
+        trade_channel_last_seen=(d.get("channel_last_seen", {}) or {}).get("trades"),
+        contract_value_btc=CONTRACT_VALUE_BTC,
+        min_prints=10,
+        dominance_share_pct=60.0,
+        relative_volume_lookback=20,
+        max_trade_age_seconds=float(CHANNEL_STALE_SECONDS.get("trades") or 20),
+    )
+    aligned_rows = []
+    for item in aligned_flow["windows"]:
+        start_label = datetime.fromtimestamp(
+            item["period_start"], timezone.utc
+        ).astimezone(TZ_IST).strftime("%d %b %H:%M")
+        end_label = datetime.fromtimestamp(
+            item["period_end"], timezone.utc
+        ).astimezone(TZ_IST).strftime("%d %b %H:%M")
+        relative_volume = item.get("relative_volume")
+        aligned_rows.append({
+            "Timeframe": item["timeframe"],
+            "Completed window (IST)": f"{start_label}–{end_label}",
+            "Classified prints": item["classified_prints"],
+            "BUY taker (contracts)": item["buy_contracts"],
+            "SELL taker (contracts)": item["sell_contracts"],
+            "Net delta (contracts)": item["net_delta_contracts"],
+            "BUY share": item["buy_share_pct"],
+            "SELL share": item["sell_share_pct"],
+            "BUY volume (BTC eq.)": item["buy_btc"],
+            "SELL volume (BTC eq.)": item["sell_btc"],
+            "Total volume (BTC eq.)": item["total_btc"],
+            "BUY/SELL ratio": item["dominance_ratio"],
+            "BUY notional (USD)": item["buy_usd"],
+            "SELL notional (USD)": item["sell_usd"],
+            "Relative volume vs 20": relative_volume,
+            "Order-flow classification": f'{item["intensity"]} · {item["classification"]}',
+            "Capture status": item["capture_status"],
+        })
+    if aligned_rows:
+        st.dataframe(
+            pd.DataFrame(aligned_rows).style.format({
+                "Classified prints": "{:,.0f}",
+                "BUY taker (contracts)": "{:,.0f}",
+                "SELL taker (contracts)": "{:,.0f}",
+                "Net delta (contracts)": "{:+,.0f}",
+                "BUY share": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+                "SELL share": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+                "BUY volume (BTC eq.)": "{:,.4f}",
+                "SELL volume (BTC eq.)": "{:,.4f}",
+                "Total volume (BTC eq.)": "{:,.4f}",
+                "BUY/SELL ratio": lambda value: "One-sided" if pd.isna(value) else f"{value:.2f}x",
+                "BUY notional (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.0f}",
+                "SELL notional (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.0f}",
+                "Relative volume vs 20": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
+            }, na_rep="—"),
+            hide_index=True,
+            use_container_width=True,
+        )
+    st.caption(
+        "Each row is the last completed fixed UTC-aligned interval; the in-progress bar is excluded. "
+        "BUY/SELL share is based only on classified public taker contracts. The existing display "
+        "rules remain unchanged: at least 10 classified prints, 60% directional dominance, and "
+        "STRONG at 70% or above. Relative volume compares captured contracts with the prior 20 "
+        "completed bars of the same duration and is withheld until all 20 are available. "
+        "Minute aggregates are retained in memory for up to 30 days, reset on restart, and are "
+        "not backfilled. 'Process window covered · feed fresh' does not prove uninterrupted delivery: "
+        "Delta public trade messages do not expose a per-trade sequence number. These rows are "
+        "monitoring measurements, not breakout detection or strategy entry signals. "
+        + aligned_flow["limitations"]
     )
     with st.expander("Liquidity levels — historical effectiveness", expanded=True):
         effectiveness = build_liquidity_effectiveness(
