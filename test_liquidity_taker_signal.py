@@ -123,7 +123,7 @@ def test_one_five_and_fifteen_minute_contexts_are_returned():
 
     assert [item["window"] for item in result["windows"]] == ["1m", "5m", "15m"]
     assert result["primary"]["window"] == "5m"
-    assert result["timeframe_alignment"] in ("ALIGNED", "MIXED", "NO CONFIRMATION")
+    assert result["timeframe_alignment"] in ("ALIGNED", "PARTIAL", "MIXED", "NO CONFIRMATION")
 
 
 @pytest.mark.parametrize(
