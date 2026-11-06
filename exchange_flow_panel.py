@@ -138,41 +138,65 @@ def _render_perpetual_taker_values(data: dict[str, Any]) -> None:
     rows = data.get("taker_rows") or []
     if data.get("taker_error"):
         st.warning(str(data["taker_error"]))
+    if data.get("taker_price_error"):
+        st.caption("BTC-equivalent quantity conversion unavailable: " + str(data["taker_price_error"]))
     if not rows:
         if not data.get("taker_error"):
             st.info("No perpetual taker buy/sell records were returned for the selected window.")
         return
 
     latest = rows[-1]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Perpetual taker BUY value", _usd(latest.get("taker_buy_usd")))
-    c2.metric("Perpetual taker SELL value", _usd(latest.get("taker_sell_usd")))
+    st.caption(f"Latest provider interval: {latest.get('time', '—')} UTC")
+    q1, q2, q3 = st.columns(3)
+    q1.metric("BUY quantity (BTC equivalent)", _btc(latest.get("taker_buy_btc_est")))
+    q2.metric("SELL quantity (BTC equivalent)", _btc(latest.get("taker_sell_btc_est")))
+    q3.metric("Total traded quantity (BTC equivalent)", _btc(latest.get("taker_total_btc_est")))
+
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("BUY value / volume (USD)", _usd(latest.get("taker_buy_usd")))
+    v2.metric("SELL value / volume (USD)", _usd(latest.get("taker_sell_usd")))
+    v3.metric("Total traded volume (USD)", _usd(latest.get("taker_total_usd")))
     net = latest.get("net_taker_usd")
-    c3.metric(
-        "Net taker value",
+    v4.metric(
+        "Net taker value (USD)",
         _usd(net),
         delta="BUY takers dominant" if net is not None and net > 0 else ("SELL takers dominant" if net is not None and net < 0 else None),
     )
-    c4.metric("BUY share", _pct(latest.get("buy_ratio_pct")))
+
+    shares = st.columns(3)
+    shares[0].metric("BUY share / size (%)", _pct(latest.get("buy_ratio_pct")))
+    shares[1].metric("SELL share / size (%)", _pct(latest.get("sell_ratio_pct")))
+    shares[2].metric("BUY / SELL value ratio", f"{latest['buy_sell_ratio']:.3f}" if latest.get("buy_sell_ratio") is not None else "—")
 
     st.caption(
-        f"Latest provider interval: {latest.get('time', '—')} UTC. "
-        "CryptoQuant defines these as executed perpetual-swap taker trades and normalizes volumes to USD. "
-        "They are not on-chain deposits/withdrawals and do not include spot-market trades."
+        f"Reference price: {_usd(latest.get('perpetual_index_close_usd'))} "
+        "(matching-period CryptoQuant all-exchange perpetual BTC index close). "
+        "BTC quantities are USD notional ÷ reference price estimates, not exact BTC settlement quantities."
+    )
+    st.info(
+        "Average trade/order size and trade count are not supplied by CryptoQuant's aggregated taker-volume endpoint. "
+        "They are shown as unavailable rather than estimated from daily totals."
     )
     table = pd.DataFrame(rows).rename(columns={
         "time": "UTC interval",
-        "taker_buy_usd": "Taker BUY (USD)",
-        "taker_sell_usd": "Taker SELL (USD)",
-        "net_taker_usd": "Net taker (USD)",
-        "buy_ratio_pct": "BUY share (%)",
-        "sell_ratio_pct": "SELL share (%)",
+        "taker_buy_btc_est": "BUY quantity (BTC est.)",
+        "taker_sell_btc_est": "SELL quantity (BTC est.)",
+        "taker_total_btc_est": "Total quantity (BTC est.)",
+        "taker_buy_usd": "BUY value / volume (USD)",
+        "taker_sell_usd": "SELL value / volume (USD)",
+        "taker_total_usd": "Total volume (USD)",
+        "net_taker_usd": "Net taker value (USD)",
+        "buy_ratio_pct": "BUY share / size (%)",
+        "sell_ratio_pct": "SELL share / size (%)",
         "buy_sell_ratio": "BUY / SELL ratio",
+        "perpetual_index_close_usd": "Perpetual index close (USD)",
     })
     columns = [
-        "UTC interval", "Taker BUY (USD)", "Taker SELL (USD)",
-        "Net taker (USD)", "BUY share (%)", "SELL share (%)",
-        "BUY / SELL ratio",
+        "UTC interval",
+        "BUY quantity (BTC est.)", "SELL quantity (BTC est.)", "Total quantity (BTC est.)",
+        "BUY value / volume (USD)", "SELL value / volume (USD)", "Total volume (USD)",
+        "Net taker value (USD)", "BUY share / size (%)", "SELL share / size (%)",
+        "BUY / SELL ratio", "Perpetual index close (USD)",
     ]
     st.dataframe(
         table[[name for name in columns if name in table.columns]].tail(14),
