@@ -134,6 +134,7 @@ def _flow_for_bar(
     min_active_minute_coverage_pct: float,
     max_trade_age_seconds: float,
     contract_value_btc: float,
+    min_taker_share_pct: float,
 ) -> dict[str, Any]:
     minutes, prefixes = flow_index
     left = bisect_left(minutes, start_ts)
@@ -175,9 +176,9 @@ def _flow_for_bar(
 
     if not capture_eligible:
         flow_direction = "UNVERIFIED"
-    elif buy_share is not None and buy_share >= DEFAULT_MIN_TAKER_SHARE_PCT:
+    elif buy_share is not None and buy_share >= min_taker_share_pct:
         flow_direction = "BUY"
-    elif sell_share is not None and sell_share >= DEFAULT_MIN_TAKER_SHARE_PCT:
+    elif sell_share is not None and sell_share >= min_taker_share_pct:
         flow_direction = "SELL"
     else:
         flow_direction = "BALANCED"
@@ -267,6 +268,7 @@ def _evaluate_candidate(
         min_active_minute_coverage_pct=min_active_minute_coverage_pct,
         max_trade_age_seconds=max_trade_age_seconds,
         contract_value_btc=contract_value_btc,
+        min_taker_share_pct=min_taker_share_pct,
     )
 
     acceptance_buffer = atr * acceptance_buffer_atr
@@ -498,7 +500,7 @@ def detect_multi_timeframe_breakouts(
             })
             continue
 
-        start_index = max(range_lookback, len(candles) - event_lookback_bars - 1)
+        start_index = max(range_lookback, len(candles) - event_lookback_bars)
         candidates: list[tuple[int, str, float, float, float | None, float]] = []
         latest_sweep: tuple[int, str, float, float, float | None] | None = None
 
@@ -583,6 +585,7 @@ def detect_multi_timeframe_breakouts(
                 min_active_minute_coverage_pct=min_active_minute_coverage_pct,
                 max_trade_age_seconds=max_trade_age_seconds,
                 contract_value_btc=contract_value_btc,
+                min_taker_share_pct=min_taker_share_pct,
             )
             results.append({
                 **base,
