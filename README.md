@@ -169,6 +169,10 @@ CryptoQuant plan access matters: BTC on-chain exchange inflow/outflow metrics re
 - **Net exchange flow:** inflow minus outflow, in BTC and estimated USD. Positive means net inflow; negative means net outflow.
 - **Perpetual taker BUY / SELL:** CryptoQuant's separate executed perpetual-swap taker buy and sell values, denominated in USD, with net taker value and buy share. The venue can be filtered separately from the on-chain exchange group.
 
+- **Daily taker BUY / SELL quantity and volume:** the panel shows per-side USD notional/value, total USD volume, per-side BTC-equivalent quantity, total BTC-equivalent volume, net taker value, and BUY/SELL share/ratio. CryptoQuant normalizes taker volume to USD across heterogeneous perpetual contracts. BTC equivalents are calculated by dividing each side's USD notional by the matching UTC interval's all-exchange perpetual BTC index close; they are estimates, not exact contract counts or BTC settlement quantity.
+- **Average trade/order size:** shown as unavailable because the aggregated taker-volume endpoint supplies volume and ratios, but not trade counts. The dashboard does not infer trade count or average size from aggregate daily volume.
+- Daily windows are exchange-provider UTC day buckets. The table retains the latest returned intervals; daily mode is the default.
+
 USD wallet-flow values are calculated using the CryptoQuant BTC spot-index close for the **same reported time interval**. If a matching price point is missing, the USD value is shown unavailable; the app does not multiply historical transfers by today's BTC price. These are estimates, not exchange-reported fiat transfer amounts.
 
 **Critical interpretation:** An on-chain deposit is potential sell-side inventory pressure, not proof that the BTC was sold. A withdrawal may reflect custody or wallet movement, not proof of buying. Actual executed BUY/SELL values are shown separately and refer to perpetual taker flow, not spot trades. These CryptoQuant observations remain separate from Delta's live trade tape, the frozen signal engine, the historical evaluator and release gates.
