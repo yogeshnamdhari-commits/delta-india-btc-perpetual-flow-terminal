@@ -104,7 +104,12 @@ def _reaction_outcome(
 
     target = reaction_atr * atr_value
     acceptance_buffer = breakout_atr * atr_value
-    previous_accepted = False
+    touch_close = _finite(candles[touch_index].get("close"))
+    previous_accepted = (
+        touch_close is not None
+        and (touch_close >= level + acceptance_buffer if kind == "high"
+             else touch_close <= level - acceptance_buffer)
+    )
 
     for index in range(touch_index + 1, end_index + 1):
         candle = candles[index]
@@ -424,7 +429,7 @@ def build_liquidity_effectiveness(
             "Level type": candidate["level_type"],
             "Price": candidate["price"],
             "Distance (points)": distance,
-            "Distance (%)": distance / price * 100.0 if distance is not None and price else None,
+            "Distance (%)": distance / price if distance is not None and price else None,
             "Pivot touches": candidate["pivot_count"],
             "Retest attempts": stats["attempts"],
             "Sweeps / reclaims": stats["sweeps"],
