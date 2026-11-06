@@ -2857,9 +2857,10 @@ def render_flow_panel() -> None:
             f"Historical method: {effectiveness.get('history_bars', 0):,} loaded completed 1-minute candles. "
             "A level is first confirmed using 5 candles on each side; only later retests are evaluated. "
             "A successful reaction moves at least 0.5 ATR away within 10 candles before two consecutive closes "
-            "accept 0.25 ATR beyond the level. Side effectiveness is pooled across historical confirmed swing "
-            "highs or swing lows (minimum 5 decisive outcomes); it is not a probability for an individual level. "
-            "Ambiguous, neutral and unfinished cases are excluded from the percentage and remain separately unscored. "
+            "accept 0.25 ATR beyond the level. Level effectiveness is calculated per displayed level only "
+            "when it has at least 5 decisive retest outcomes. Side effectiveness is a pooled historical baseline "
+            "across swing highs or swing lows (minimum 5 decisive outcomes), not an individual-level probability. "
+            "Ambiguous, neutral and unfinished cases are excluded from percentages and remain separately unscored. "
             "This measures candle-price reaction, not verified resting stops or market-wide liquidations."
         )
     with st.expander("Price-action liquidity pools (derived)", expanded=False):
