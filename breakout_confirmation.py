@@ -752,13 +752,29 @@ def build_breakout_explanation(item: Mapping[str, Any]) -> dict[str, Any]:
 
     if direction not in ("BUY", "SELL"):
         no_event_status = "INSUFFICIENT" if "INSUFFICIENT" in classification else "NO EVENT"
+        no_event_reason = str(item.get("reason") or "No directional breakout candidate is available.")
         add_check(
             "Breakout event detection",
             no_event_status,
             classification,
             "A completed candle must close beyond the prior 20-candle range plus the ATR buffer",
-            str(item.get("reason") or "No directional breakout candidate is available."),
+            no_event_reason,
         )
+        no_event_code = (
+            "NO_RECENT_BREAKOUT"
+            if "NO RECENT BREAKOUT" in classification
+            else "INSUFFICIENT_PRICE_HISTORY"
+            if "INSUFFICIENT" in classification
+            else "NO_DIRECTIONAL_BREAKOUT"
+        )
+        return {
+            "primary_reason": no_event_code,
+            "success_reason": "Not applicable — no directional breakout candidate is available.",
+            "failure_reason": no_event_reason,
+            "secondary_failures": "",
+            "short_summary": no_event_reason,
+            "checks": checks,
+        }
     elif is_sweep:
         wick_value = item.get("breakout_high") if direction == "BUY" else item.get("breakout_low")
         close_text = fmt(breakout_close)
