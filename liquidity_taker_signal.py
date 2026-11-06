@@ -208,21 +208,24 @@ def calculate_liquidity_taker_signal(
     short = by_seconds.get(60)
     broad = by_seconds.get(900)
 
+    directional_codes = ("BUYERS_TAKING_ASK", "SELLERS_TAKING_BID")
     context_signals = [
         item["signal_code"]
         for item in (short, broad)
-        if item is not None and item["signal_code"] in (
-            "BUYERS_TAKING_ASK", "SELLERS_TAKING_BID"
-        )
+        if item is not None and item["signal_code"] in directional_codes
     ]
-    alignment = (
-        "ALIGNED"
-        if context_signals and all(signal == primary["signal_code"] for signal in context_signals)
-        and primary["signal_code"] in ("BUYERS_TAKING_ASK", "SELLERS_TAKING_BID")
-        else "MIXED"
-        if context_signals and primary["signal_code"] in ("BUYERS_TAKING_ASK", "SELLERS_TAKING_BID")
-        else "NO CONFIRMATION"
-    )
+    if primary["signal_code"] not in directional_codes:
+        alignment = "MIXED" if context_signals else "NO CONFIRMATION"
+    elif len(context_signals) == 2 and all(
+        signal == primary["signal_code"] for signal in context_signals
+    ):
+        alignment = "ALIGNED"
+    elif any(signal != primary["signal_code"] for signal in context_signals):
+        alignment = "MIXED"
+    elif context_signals:
+        alignment = "PARTIAL"
+    else:
+        alignment = "NO CONFIRMATION"
 
     return {
         "primary": primary,
