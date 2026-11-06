@@ -51,6 +51,7 @@ def _valid_bullish_history(duration=60, count=30):
     rows[27].update({"open": 101, "high": 105, "low": 100.5, "close": 104, "volume": 200})
     # Bar 28 accepts above the broken range, then price continues.
     rows[28].update({"open": 104, "high": 106, "low": 103, "close": 105, "volume": 120})
+    rows[29].update({"open": 105, "high": 106, "low": 104, "close": 105.5, "volume": 110})
     return rows
 
 
@@ -88,6 +89,7 @@ def test_genuine_bearish_breakout_requires_price_volume_and_sell_flow():
     rows = _candles(duration, 30, base=100, volume=100)
     rows[27].update({"open": 99, "high": 99.5, "low": 95, "close": 96, "volume": 200})
     rows[28].update({"open": 96, "high": 97, "low": 94, "close": 95, "volume": 120})
+    rows[29].update({"open": 95, "high": 96, "low": 94, "close": 95, "volume": 110})
     breakout_start = rows[27]["time"]
     flow = _flow(
         breakout_start, 1, buy=2, sell=18,
@@ -104,7 +106,7 @@ def test_genuine_bearish_breakout_requires_price_volume_and_sell_flow():
 
     assert item["classification"].startswith("GENUINE SELL BREAKOUT")
     assert item["flow"]["sell_share_pct"] == pytest.approx(90.0)
-    assert item["net_delta_contracts"] if "net_delta_contracts" in item else item["flow"]["net_delta_contracts"] < 0
+    assert item["flow"]["net_delta_contracts"] < 0
 
 
 def test_price_and_volume_breakout_is_not_genuine_when_taker_flow_is_unverified():
@@ -181,6 +183,7 @@ def test_flow_capture_requires_start_before_bar_and_minute_coverage():
     rows = _candles(duration, 30, base=100, volume=100)
     rows[27].update({"open": 101, "high": 105, "low": 100.5, "close": 104, "volume": 200})
     rows[28].update({"open": 104, "high": 106, "low": 103, "close": 105, "volume": 120})
+    rows[29].update({"open": 105, "high": 106, "low": 104, "close": 105.5, "volume": 110})
     start = rows[27]["time"]
     complete_flow = _flow(start, 5)
 
@@ -198,6 +201,7 @@ def test_low_active_minute_coverage_blocks_genuine_label():
     rows = _candles(duration, 30, base=100, volume=100)
     rows[27].update({"open": 101, "high": 105, "low": 100.5, "close": 104, "volume": 200})
     rows[28].update({"open": 104, "high": 106, "low": 103, "close": 105, "volume": 120})
+    rows[29].update({"open": 105, "high": 106, "low": 104, "close": 105.5, "volume": 110})
     start = rows[27]["time"]
     flow = _flow(start, 4)  # 4 of 5 minutes = 80%
 
@@ -289,3 +293,67 @@ def test_candle_gap_in_required_range_window_blocks_breakout_confirmation():
         "NO RECENT BREAKOUT",
     )
     assert not str(item["classification"]).startswith("GENUINE ")
+
+
+def test_low_relative_volume_prevents_genuine_breakout_classification():
+    duration = 60
+    rows = _valid_bullish_history(duration)
+    rows[27]["volume"] = 149  # Must reach 1.50x; 1.49x is insufficient.
+    breakout_start = rows[27]["time"]
+    flow = _flow(breakout_start, 1, buy=18, sell=2, buy_contracts=180, sell_contracts=20)
+    now = rows[-1]["time"] + duration + 5
+
+    item = detect_multi_timeframe_breakouts(
+        {"1m": rows}, flow,
+        **_args(now, rows[0]["time"] - 1),
+        timeframes=(("1m", duration),),
+    )["windows"][0]
+
+    assert item["relative_volume"] == pytest.approx(1.49)
+    assert item["volume_confirmed"] is False
+    assert item["classification"] == "PRICE ACCEPTED — VOLUME NOT CONFIRMED"
+
+
+def test_successful_retest_is_reported_separately_from_initial_confirmation():
+    duration = 60
+    rows = _valid_bullish_history(duration)
+    rows[29].update({"open": 102, "high": 103, "low": 101.4, "close": 102, "volume": 100})
+    start = rows[27]["time"]
+    flow = _flow(start, 1, buy=18, sell=2, buy_contracts=180, sell_contracts=20)
+    now = rows[-1]["time"] + duration + 5
+
+    item = detect_multi_timeframe_breakouts(
+        {"1m": rows}, flow,
+        **_args(now, rows[0]["time"] - 1),
+        timeframes=(("1m", duration),),
+    )["windows"][0]
+
+    assert item["classification"] == "GENUINE BUY BREAKOUT — RETEST HELD"
+    assert item["retest_status"].startswith("HELD")
+
+
+@pytest.mark.parametrize(
+    "timeframe,duration",
+    [("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600), ("4h", 14400), ("1d", 86400)],
+)
+def test_confirmation_engine_supports_each_native_timeframe(timeframe, duration):
+    rows = _valid_bullish_history(duration)
+    breakout_start = rows[27]["time"]
+    flow = _flow(
+        breakout_start,
+        duration // 60,
+        buy=15,
+        sell=5,
+        buy_contracts=180,
+        sell_contracts=20,
+    )
+    now = rows[-1]["time"] + duration + 5
+
+    item = detect_multi_timeframe_breakouts(
+        {timeframe: rows}, flow,
+        **_args(now, rows[0]["time"] - 1),
+        timeframes=((timeframe, duration),),
+    )["windows"][0]
+
+    assert item["classification"].startswith("GENUINE BUY BREAKOUT")
+    assert item["flow"]["active_minute_coverage_pct"] == pytest.approx(100.0)
