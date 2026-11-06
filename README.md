@@ -140,6 +140,41 @@ All levels and labels are monitoring context, not trade guarantees. These UI add
 
 Delta API references: [WebSocket public channels](https://docs.delta.exchange/) and [private order updates](https://docs.delta.exchange/).
 
+## Exchange wallet flow and perpetual BUY/SELL values
+
+The dashboard includes an optional **Exchange wallet flows & perpetual BUY/SELL values (CryptoQuant)** panel under **Order flow & liquidity**. It uses public CryptoQuant market/on-chain metrics through a user-supplied API key; it does not connect to an exchange account and does not place orders.
+
+### Configure the data source
+
+Set `CRYPTOQUANT_API_KEY` locally as an environment variable:
+
+```bash
+export CRYPTOQUANT_API_KEY="your_cryptoquant_api_key"
+```
+
+Or store it in the local Streamlit secrets file `.streamlit/secrets.toml`:
+
+```toml
+CRYPTOQUANT_API_KEY = "your_cryptoquant_api_key"
+```
+
+Never commit the key, paste it into chat, or put it in a tracked project file. Without the key the panel remains inactive and the rest of the dashboard continues to work.
+
+CryptoQuant plan access matters: BTC on-chain exchange inflow/outflow metrics require **Professional or higher**. Daily on-chain flow is the default; hourly on-chain flow requires **Premium**. The separate perpetual taker BUY/SELL endpoint may have its own plan, credit and resolution limits. The panel reports provider errors rather than fabricating values.
+
+### What the panel displays
+
+- **Exchange inflow:** BTC transferred into labelled exchange wallets, plus estimated USD value.
+- **Exchange outflow:** BTC transferred out of labelled exchange wallets, plus estimated USD value.
+- **Net exchange flow:** inflow minus outflow, in BTC and estimated USD. Positive means net inflow; negative means net outflow.
+- **Perpetual taker BUY / SELL:** CryptoQuant's separate executed perpetual-swap taker buy and sell values, denominated in USD, with net taker value and buy share. The venue can be filtered separately from the on-chain exchange group.
+
+USD wallet-flow values are calculated using the CryptoQuant BTC spot-index close for the **same reported time interval**. If a matching price point is missing, the USD value is shown unavailable; the app does not multiply historical transfers by today's BTC price. These are estimates, not exchange-reported fiat transfer amounts.
+
+**Critical interpretation:** An on-chain deposit is potential sell-side inventory pressure, not proof that the BTC was sold. A withdrawal may reflect custody or wallet movement, not proof of buying. Actual executed BUY/SELL values are shown separately and refer to perpetual taker flow, not spot trades. These CryptoQuant observations remain separate from Delta's live trade tape, the frozen signal engine, the historical evaluator and release gates.
+
+Official references: [CryptoQuant API documentation](https://userguide.cryptoquant.com/) and [API access / plan information](https://cryptoquant.com/).
+
 ## Active alternative exchange: Bybit V5 Linear BTCUSDT
 
 The dashboard currently uses Bybit's public V5 linear BTCUSDT perpetual market-data endpoints as its active cross-venue feed. It runs beside Delta India BTCUSD; it does not replace Delta's feed and does not change the Delta signal engine, frozen evaluator, or Gate 3 release criteria.

@@ -30,6 +30,7 @@ from zone_strength import measure_zone_strength
 from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
 from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
+from exchange_flow_panel import render_exchange_flow_panel
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -3232,6 +3233,7 @@ if show_flow_panel:
         "Order blocks, equal highs/lows and sweeps are price-action-derived from completed candles - not verified "
         "institutional activity. A large executed trade indicates size only, not measured market impact or institutional identity.")
     render_flow_panel()
+    render_exchange_flow_panel()
 
 
 from datetime import datetime, timezone
