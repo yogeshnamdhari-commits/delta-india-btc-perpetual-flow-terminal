@@ -8,6 +8,7 @@ fixed UTC boundary and excludes the currently forming interval.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -36,47 +37,66 @@ def _number(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
-def _aggregate_period(
+def _build_minute_index(
     flow_minutes: Mapping[Any, Any],
+) -> tuple[list[int], dict[str, list[float]]]:
+    """Build one sorted minute index and prefix sums for O(log n) range queries."""
+    fields = (
+        "buy_prints",
+        "sell_prints",
+        "buy_contracts",
+        "sell_contracts",
+        "buy_usd",
+        "sell_usd",
+        "active_trade_minutes",
+    )
+    normalized: dict[int, dict[str, float]] = {}
+
+    for raw_minute, raw_flow in flow_minutes.items():
+        minute_value = _number(raw_minute)
+        if minute_value is None or not isinstance(raw_flow, Mapping):
+            continue
+        minute = int(minute_value)
+        row = normalized.setdefault(minute, {field: 0.0 for field in fields})
+        minute_active = False
+        for side in ("buy", "sell"):
+            count = max(0, int(_number(raw_flow.get(f"{side}_count")) or 0.0))
+            contracts = max(0.0, _number(raw_flow.get(f"{side}_contracts")) or 0.0)
+            usd = max(0.0, _number(raw_flow.get(f"{side}_usd")) or 0.0)
+            row[f"{side}_prints"] += count
+            row[f"{side}_contracts"] += contracts
+            row[f"{side}_usd"] += usd
+            if count > 0 or contracts > 0:
+                minute_active = True
+        if minute_active:
+            row["active_trade_minutes"] = 1.0
+
+    minutes = sorted(normalized)
+    prefixes = {field: [0.0] for field in fields}
+    for minute in minutes:
+        row = normalized[minute]
+        for field in fields:
+            prefixes[field].append(prefixes[field][-1] + row[field])
+    return minutes, prefixes
+
+
+def _aggregate_period(
+    minute_index: tuple[list[int], dict[str, list[float]]],
     *,
     start_ts: int,
     end_ts: int,
 ) -> dict[str, Any]:
-    """Sum compact minute aggregates over the half-open UTC interval."""
+    """Sum minute aggregates in a half-open UTC interval using prefix sums."""
+    minutes, prefixes = minute_index
+    left = bisect_left(minutes, start_ts)
+    right = bisect_left(minutes, end_ts)
+
     totals: dict[str, Any] = {
-        "buy_prints": 0,
-        "sell_prints": 0,
-        "buy_contracts": 0.0,
-        "sell_contracts": 0.0,
-        "buy_usd": 0.0,
-        "sell_usd": 0.0,
-        "active_trade_minutes": 0,
+        field: prefixes[field][right] - prefixes[field][left]
+        for field in prefixes
     }
-
-    for raw_minute, raw_flow in flow_minutes.items():
-        minute = _number(raw_minute)
-        if minute is None:
-            continue
-        minute_ts = int(minute)
-        if minute_ts < start_ts or minute_ts >= end_ts or not isinstance(raw_flow, Mapping):
-            continue
-
-        minute_has_classified_prints = False
-        for side in ("buy", "sell"):
-            count = _number(raw_flow.get(f"{side}_count")) or 0.0
-            contracts = _number(raw_flow.get(f"{side}_contracts")) or 0.0
-            usd = _number(raw_flow.get(f"{side}_usd")) or 0.0
-            count = max(0, int(count))
-            contracts = max(0.0, contracts)
-            usd = max(0.0, usd)
-            totals[f"{side}_prints"] += count
-            totals[f"{side}_contracts"] += contracts
-            totals[f"{side}_usd"] += usd
-            if count > 0 or contracts > 0:
-                minute_has_classified_prints = True
-
-        if minute_has_classified_prints:
-            totals["active_trade_minutes"] += 1
+    for key in ("buy_prints", "sell_prints", "active_trade_minutes"):
+        totals[key] = int(round(totals[key]))
 
     buy_contracts = totals["buy_contracts"]
     sell_contracts = totals["sell_contracts"]
@@ -207,6 +227,7 @@ def summarize_aligned_taker_flow(
         raise ValueError("timeframe names must be unique")
 
     minute_map = flow_minutes if isinstance(flow_minutes, Mapping) else {}
+    minute_index = _build_minute_index(minute_map)
     rows: list[dict[str, Any]] = []
 
     for name, duration in clean_timeframes:
@@ -215,7 +236,7 @@ def summarize_aligned_taker_flow(
         period_end = int(now // duration) * duration
         period_start = period_end - duration
         current = _aggregate_period(
-            minute_map, start_ts=period_start, end_ts=period_end
+            minute_index, start_ts=period_start, end_ts=period_end
         )
         current["buy_btc"] = current["buy_contracts"] * contract_btc
         current["sell_btc"] = current["sell_contracts"] * contract_btc
@@ -280,7 +301,7 @@ def summarize_aligned_taker_flow(
                 prior_end = period_start - (index - 1) * duration
                 prior_start = prior_end - duration
                 prior = _aggregate_period(
-                    minute_map, start_ts=prior_start, end_ts=prior_end
+                    minute_index, start_ts=prior_start, end_ts=prior_end
                 )
                 prior_totals.append(prior["total_contracts"])
             average_prior_contracts = sum(prior_totals) / relative_volume_lookback
