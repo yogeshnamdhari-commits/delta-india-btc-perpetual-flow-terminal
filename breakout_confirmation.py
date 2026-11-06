@@ -1086,20 +1086,26 @@ def build_breakout_explanation(item: Mapping[str, Any]) -> dict[str, Any]:
                 f"({fmt(acceptance_buffer_atr)} ATR) acceptance beyond level {fmt(level)}. "
                 f"Observed directional clearance: {fmt(confirmation_clearance)} points."
             )
-    elif not is_genuine and relative_volume is not None and relative_volume < required_volume:
+    elif not is_genuine and relative_volume is None:
+        primary_reason = "VOLUME_UNVERIFIED"
+        failure_reason = "The breakout-candle volume ratio or its prior-20-candle denominator is unavailable; volume confirmation cannot be scored."
+    elif not is_genuine and relative_volume < required_volume:
         primary_reason = "FAILED_VOLUME"
         failure_reason = f"Breakout volume was {fmt(relative_volume)}x versus the required {fmt(required_volume)}x same-timeframe prior-20 average."
     elif not is_genuine and not capture_eligible:
-        if "INSUFFICIENT CLASSIFIED PRINTS" in capture_reasons:
-            primary_reason = "INSUFFICIENT_CLASSIFIED_PRINTS"
-        elif "LOW ACTIVE-MINUTE COVERAGE" in capture_reasons:
-            primary_reason = "INSUFFICIENT_ACTIVE_MINUTE_COVERAGE"
-        elif "APP STARTED AFTER BREAKOUT BAR BEGAN" in capture_reasons:
+        # Report the earliest/upstream capture failure first. For historical
+        # candles, a late process start explains absent prints more accurately
+        # than presenting the zero captured-print count as the root cause.
+        if "APP STARTED AFTER BREAKOUT BAR BEGAN" in capture_reasons:
             primary_reason = "CAPTURE_STARTED_AFTER_EVENT"
         elif "TRADE FEED NOT CONNECTED" in capture_reasons:
             primary_reason = "TRADE_FEED_DISCONNECTED"
         elif "TRADE CHANNEL STALE" in capture_reasons:
             primary_reason = "TRADE_CHANNEL_STALE"
+        elif "LOW ACTIVE-MINUTE COVERAGE" in capture_reasons:
+            primary_reason = "INSUFFICIENT_ACTIVE_MINUTE_COVERAGE"
+        elif "INSUFFICIENT CLASSIFIED PRINTS" in capture_reasons:
+            primary_reason = "INSUFFICIENT_CLASSIFIED_PRINTS"
         else:
             primary_reason = "ORDER_FLOW_UNVERIFIED"
         failure_reason = (
