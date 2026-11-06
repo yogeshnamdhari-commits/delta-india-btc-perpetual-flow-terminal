@@ -2,6 +2,8 @@
 
 Wallet transfers and executed taker trades are deliberately separate datasets:
 an exchange deposit is not a confirmed sale, and a withdrawal is not a confirmed buy.
+CryptoQuant taker volumes are USD-normalized. BTC quantities below are explicitly
+estimates derived from the matched all-exchange perpetual BTC index close.
 """
 from __future__ import annotations
 
@@ -96,8 +98,18 @@ def parse_exchange_flow_series(
     return result
 
 
-def parse_taker_buy_sell_series(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize CryptoQuant perpetual-swap taker volumes, denominated in USD."""
+def parse_taker_buy_sell_series(
+    rows: list[dict[str, Any]],
+    perpetual_price_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize daily/hourly perpetual taker values and estimate BTC equivalents.
+
+    CryptoQuant returns taker BUY/SELL volume in USD across heterogeneous
+    perpetual contracts. We divide each USD value by the matching UTC interval's
+    all-exchange perpetual BTC index close. These are BTC-equivalent estimates,
+    not contract counts or exact BTC settlement quantities.
+    """
+    prices = _indexed_values(perpetual_price_rows or [], "close")
     result: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -108,14 +120,25 @@ def parse_taker_buy_sell_series(rows: list[dict[str, Any]]) -> list[dict[str, An
         if key is None or buy is None or sell is None or buy < 0 or sell < 0:
             continue
         total = buy + sell
+        price = prices.get(key)
+        buy_btc = buy / price if price is not None and price > 0 else None
+        sell_btc = sell / price if price is not None and price > 0 else None
+        total_btc = buy_btc + sell_btc if buy_btc is not None and sell_btc is not None else None
         result.append({
             "time": key,
             "taker_buy_usd": buy,
             "taker_sell_usd": sell,
+            "taker_total_usd": total,
             "net_taker_usd": buy - sell,
             "buy_ratio_pct": buy / total * 100.0 if total > 0 else None,
             "sell_ratio_pct": sell / total * 100.0 if total > 0 else None,
             "buy_sell_ratio": buy / sell if sell > 0 else None,
+            "perpetual_index_close_usd": price,
+            "taker_buy_btc_est": buy_btc,
+            "taker_sell_btc_est": sell_btc,
+            "taker_total_btc_est": total_btc,
+            "average_trade_size": None,
+            "trade_count": None,
         })
     return sorted(result, key=lambda item: item["time"])
 
@@ -195,6 +218,7 @@ def fetch_exchange_flow_data(
         "flow_error": None,
         "price_error": None,
         "taker_error": None,
+        "taker_price_error": None,
     }
 
     try:
@@ -226,7 +250,22 @@ def fetch_exchange_flow_data(
             "btc/market-data/taker-buy-sell-stats",
             {"exchange": taker_exchange, "window": taker_window, "limit": limit},
         )
-        output["taker_rows"] = parse_taker_buy_sell_series(taker)
+        try:
+            perpetual_prices = _get_rows(
+                api_key,
+                "btc/market-data/price-ohlcv",
+                {
+                    "market": "perpetual",
+                    "exchange": "all_exchange",
+                    "symbol": "btc_usd",
+                    "window": taker_window,
+                    "limit": limit,
+                },
+            )
+        except CryptoQuantAPIError as exc:
+            perpetual_prices = []
+            output["taker_price_error"] = str(exc)
+        output["taker_rows"] = parse_taker_buy_sell_series(taker, perpetual_prices)
     except CryptoQuantAPIError as exc:
         output["taker_error"] = str(exc)
 
