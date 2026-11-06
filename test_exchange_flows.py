@@ -56,21 +56,44 @@ def test_exchange_flow_preserves_partial_inflow_outflow_without_fabricating_netf
     assert rows[0]["netflow_usd_est"] is None
 
 
-def test_taker_buy_sell_values_are_normalized_as_usd_and_ratio():
-    rows = parse_taker_buy_sell_series([
-        {
-            "date": "2026-11-05",
-            "taker_buy_volume": "125000000",
-            "taker_sell_volume": "100000000",
-        }
-    ])
+def test_taker_buy_sell_values_quantities_and_total_volume_are_calculated():
+    rows = parse_taker_buy_sell_series(
+        [
+            {
+                "date": "2026-11-05",
+                "taker_buy_volume": "125000000",
+                "taker_sell_volume": "100000000",
+            }
+        ],
+        [{"date": "2026-11-05", "close": "100000"}],
+    )
 
     assert rows[0]["taker_buy_usd"] == pytest.approx(125_000_000)
     assert rows[0]["taker_sell_usd"] == pytest.approx(100_000_000)
+    assert rows[0]["taker_total_usd"] == pytest.approx(225_000_000)
     assert rows[0]["net_taker_usd"] == pytest.approx(25_000_000)
     assert rows[0]["buy_ratio_pct"] == pytest.approx(55.5555555556)
     assert rows[0]["sell_ratio_pct"] == pytest.approx(44.4444444444)
     assert rows[0]["buy_sell_ratio"] == pytest.approx(1.25)
+    assert rows[0]["perpetual_index_close_usd"] == pytest.approx(100_000)
+    assert rows[0]["taker_buy_btc_est"] == pytest.approx(1_250)
+    assert rows[0]["taker_sell_btc_est"] == pytest.approx(1_000)
+    assert rows[0]["taker_total_btc_est"] == pytest.approx(2_250)
+    assert rows[0]["trade_count"] is None
+    assert rows[0]["average_trade_size"] is None
+
+
+def test_taker_btc_equivalent_requires_matching_reference_price():
+    rows = parse_taker_buy_sell_series(
+        [{"date": "2026-11-05", "taker_buy_volume": 200_000, "taker_sell_volume": 100_000}],
+        [{"date": "2026-11-04", "close": 100_000}],
+    )
+
+    assert rows[0]["taker_buy_usd"] == pytest.approx(200_000)
+    assert rows[0]["taker_sell_usd"] == pytest.approx(100_000)
+    assert rows[0]["taker_buy_btc_est"] is None
+    assert rows[0]["taker_sell_btc_est"] is None
+    assert rows[0]["taker_total_btc_est"] is None
 
 
 def test_taker_buy_sell_zero_total_does_not_divide_by_zero():
