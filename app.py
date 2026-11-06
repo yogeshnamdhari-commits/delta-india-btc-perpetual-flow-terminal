@@ -2818,7 +2818,7 @@ def render_flow_panel() -> None:
                 levels_df.style.format({
                     "Price": "{:,.1f}",
                     "Distance (points)": "{:,.1f}",
-                    "Distance (%)": "{:.3f}%",
+                    "Distance (%)": "{:.3%}",
                     "Pivot touches": "{:,.0f}",
                     "Retest attempts": "{:,.0f}",
                     "Sweeps / reclaims": "{:,.0f}",
