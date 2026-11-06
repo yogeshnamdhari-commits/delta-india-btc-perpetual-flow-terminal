@@ -149,6 +149,8 @@ def test_failed_second_close_never_becomes_genuine():
     duration = 60
     rows = _valid_bullish_history(duration)
     rows[28].update({"open": 104, "high": 104.5, "low": 99, "close": 100})
+    # Prevent bar 29 from creating a separate, newer breakout candidate.
+    rows[29].update({"open": 100, "high": 101, "low": 99, "close": 100, "volume": 110})
     breakout_start = rows[27]["time"]
     flow = _flow(breakout_start, 1)
     now = rows[-1]["time"] + duration + 5
@@ -161,6 +163,9 @@ def test_failed_second_close_never_becomes_genuine():
 
     assert item["classification"] == "FAILED BREAKOUT"
     assert item["failed"] is True
+    assert item["breakout_time"] == breakout_start
+    assert item["confirmation_close"] == pytest.approx(100)
+    assert item["price_accepted"] is False
 
 
 def test_wick_through_level_and_close_back_inside_is_liquidity_sweep():
