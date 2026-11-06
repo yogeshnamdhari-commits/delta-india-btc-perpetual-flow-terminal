@@ -433,6 +433,13 @@ def build_liquidity_effectiveness(
             "Pivot touches": candidate["pivot_count"],
             "Retest attempts": stats["attempts"],
             "Sweeps / reclaims": stats["sweeps"],
+            "Successful reactions": stats["successes"],
+            "Accepted breakouts": stats["failures"],
+            "Level effectiveness (%)": (
+                stats["effectiveness_pct"]
+                if stats["resolved_samples"] >= min_effectiveness_samples else None
+            ),
+            "Level resolved N": stats["resolved_samples"],
             "Last reaction": outcome,
             "Status": status,
             "Age (bars)": age,
