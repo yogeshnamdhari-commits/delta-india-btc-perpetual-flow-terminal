@@ -28,6 +28,7 @@ from binance_panel import render_binance_cross_venue_panel
 from trade_activity import summarize_trade_prints
 from zone_strength import measure_zone_strength
 from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
+from liquidity_effectiveness import build_liquidity_effectiveness
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -2799,6 +2800,69 @@ def render_flow_panel() -> None:
                 {"Contracts": "{:,.0f}", "Price": "{:,.1f}"}),
                 hide_index=True, use_container_width=True, height=170)
             st.caption("Δ response: book mid vs first execution price of the cluster, measured after the response window; a price move after a trade does not prove the trade caused it.")
+    with st.expander("Liquidity levels — historical effectiveness", expanded=True):
+        effectiveness = build_liquidity_effectiveness(
+            closed,
+            _f(d.get("last_price")),
+            tolerance_points=float(eq_tolerance),
+            horizon_bars=10,
+            reaction_atr=0.5,
+            breakout_atr=0.25,
+            min_effectiveness_samples=5,
+            limit_per_side=8,
+        )
+        level_rows = effectiveness.get("levels", [])
+        if level_rows:
+            levels_df = pd.DataFrame(level_rows)
+            st.dataframe(
+                levels_df.style.format({
+                    "Price": "{:,.1f}",
+                    "Distance (points)": "{:,.1f}",
+                    "Distance (%)": "{:.3%}",
+                    "Pivot touches": "{:,.0f}",
+                    "Retest attempts": "{:,.0f}",
+                    "Sweeps / reclaims": "{:,.0f}",
+                    "Successful reactions": "{:,.0f}",
+                    "Accepted breakouts": "{:,.0f}",
+                    "Level effectiveness (%)": "{:.1f}%",
+                    "Level resolved N": "{:,.0f}",
+                    "Age (bars)": "{:,.0f}",
+                    "Side effectiveness (%)": "{:.1f}%",
+                    "Side resolved N": "{:,.0f}",
+                }, na_rep="—"),
+                hide_index=True,
+                use_container_width=True,
+                height=330,
+            )
+        else:
+            st.caption("Not enough completed one-minute candles to identify confirmed swing liquidity levels.")
+        buy_stats = effectiveness.get("buy_side", {})
+        sell_stats = effectiveness.get("sell_side", {})
+        buy_col, sell_col = st.columns(2)
+        for column, title, stats in (
+            (buy_col, "BUY-SIDE historical baseline (swing highs)", buy_stats),
+            (sell_col, "SELL-SIDE historical baseline (swing lows)", sell_stats),
+        ):
+            resolved = int(stats.get("resolved_samples", 0) or 0)
+            successes = int(stats.get("successes", 0) or 0)
+            failures = int(stats.get("failures", 0) or 0)
+            rate = stats.get("effectiveness_pct")
+            value = (
+                f"{float(rate):.1f}%"
+                if rate is not None
+                else f"Insufficient sample ({resolved}/{effectiveness.get('effectiveness_min_samples', 5)})"
+            )
+            column.metric(title, value, help=f"{successes} successful rejection reactions / {resolved} decisive outcomes; {failures} breakouts accepted.")
+        st.caption(
+            f"Historical method: {effectiveness.get('history_bars', 0):,} loaded completed 1-minute candles. "
+            "A level is first confirmed using 5 candles on each side; only later retests are evaluated. "
+            "A successful reaction moves at least 0.5 ATR away within 10 candles before two consecutive closes "
+            "accept 0.25 ATR beyond the level. Level effectiveness is calculated per displayed level only "
+            "when it has at least 5 decisive retest outcomes. Side effectiveness is a pooled historical baseline "
+            "across swing highs or swing lows (minimum 5 decisive outcomes), not an individual-level probability. "
+            "Ambiguous, neutral and unfinished cases are excluded from percentages and remain separately unscored. "
+            "This measures candle-price reaction, not verified resting stops or market-wide liquidations."
+        )
     with st.expander("Price-action liquidity pools (derived)", expanded=False):
         sess = pa["session"] if pa else {}
         if sess:
