@@ -29,6 +29,7 @@ from trade_activity import summarize_trade_prints
 from zone_strength import measure_zone_strength
 from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
 from liquidity_effectiveness import build_liquidity_effectiveness
+from liquidity_taker_signal import calculate_liquidity_taker_signal
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -2800,6 +2801,77 @@ def render_flow_panel() -> None:
                 {"Contracts": "{:,.0f}", "Price": "{:,.1f}"}),
                 hide_index=True, use_container_width=True, height=170)
             st.caption("Δ response: book mid vs first execution price of the cluster, measured after the response window; a price move after a trade does not prove the trade caused it.")
+    st.markdown("**Who is taking liquidity? — live aggressor signal**")
+    taker_flow = calculate_liquidity_taker_signal(
+        d.get("trade_log", []),
+        now_ts=now,
+        contract_value_btc=CONTRACT_VALUE_BTC,
+        windows=(60, 300, 900),
+        min_prints=10,
+        dominance_share_pct=60.0,
+    )
+    primary_taker = taker_flow["primary"]
+    primary_share = primary_taker.get("dominant_share_pct")
+    primary_ratio = primary_taker.get("dominance_ratio")
+    signal_delta = (
+        f"{primary_taker['intensity']} · {primary_share:.1f}% of captured contracts"
+        if primary_share is not None
+        else primary_taker["intensity"]
+    )
+    taker_signal_col, taker_intensity_col, taker_share_col, taker_delta_col = st.columns(4)
+    taker_signal_col.metric("5-minute liquidity-taker signal", primary_taker["signal"])
+    taker_intensity_col.metric("Intensity", primary_taker["intensity"])
+    taker_share_col.metric(
+        "Dominant taker volume share",
+        "—" if primary_share is None else f"{primary_share:.1f}%",
+    )
+    taker_delta_col.metric(
+        "5-minute net taker delta",
+        f"{primary_taker['net_delta_contracts']:+,.0f} contracts",
+    )
+    taker_rows = []
+    for item in taker_flow["windows"]:
+        taker_rows.append({
+            "Window": item["window"],
+            "Liquidity taker": item["signal"],
+            "Intensity": item["intensity"],
+            "Classified prints": item["classified_prints"],
+            "Buyer takes ASK (contracts)": item["buy_contracts"],
+            "Seller takes BID (contracts)": item["sell_contracts"],
+            "Buyer share": item["buy_share_pct"],
+            "Seller share": item["sell_share_pct"],
+            "Dominance ratio": item["dominance_ratio"],
+            "Approx BUY notional (USD)": item["buy_usd"],
+            "Approx SELL notional (USD)": item["sell_usd"],
+        })
+    if taker_rows:
+        st.dataframe(
+            pd.DataFrame(taker_rows).style.format({
+                "Classified prints": "{:,.0f}",
+                "Buyer takes ASK (contracts)": "{:,.0f}",
+                "Seller takes BID (contracts)": "{:,.0f}",
+                "Buyer share": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+                "Seller share": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+                "Dominance ratio": lambda value: "One-sided" if pd.isna(value) else f"{value:.2f}x",
+                "Approx BUY notional (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.0f}",
+                "Approx SELL notional (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.0f}",
+            }, na_rep="—"),
+            hide_index=True,
+            use_container_width=True,
+        )
+    age_seconds = primary_taker.get("latest_trade_age_seconds")
+    age_text = "no classified prints" if age_seconds is None else f"latest classified print {age_seconds:.1f}s ago"
+    st.caption(
+        "Interpretation: BUY taker prints mean buyers executed against resting ASK liquidity; "
+        "SELL taker prints mean sellers executed against resting BID liquidity. "
+        "The 5-minute signal requires at least 10 classified prints and a dominant side with at least 60% "
+        "of captured contract volume. Intensity is MODERATE at 60–69.9% and STRONG at 70% or more; "
+        "otherwise flow is BALANCED or the sample is INSUFFICIENT. "
+        f"Timeframe alignment (1m/5m/15m): {taker_flow['timeframe_alignment']} · {age_text}. "
+        "USD values are approximate (contracts × 0.001 BTC × execution price). "
+        "These are taker-side executions from the retained public tape, not proof of every L2 depth reduction; "
+        "counts are trade prints, not unique parent orders. The tape resets when the process restarts."
+    )
     with st.expander("Liquidity levels — historical effectiveness", expanded=True):
         effectiveness = build_liquidity_effectiveness(
             closed,
