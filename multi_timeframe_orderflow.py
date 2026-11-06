@@ -217,6 +217,8 @@ def summarize_aligned_taker_flow(
         current = _aggregate_period(
             minute_map, start_ts=period_start, end_ts=period_end
         )
+        current["buy_btc"] = current["buy_contracts"] * contract_btc
+        current["sell_btc"] = current["sell_contracts"] * contract_btc
         current["total_btc"] = current["total_contracts"] * contract_btc
 
         capture_text, capture_ok, trade_age = _capture_status(
