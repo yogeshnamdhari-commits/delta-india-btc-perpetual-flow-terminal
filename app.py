@@ -31,7 +31,7 @@ from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summ
 from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
-from breakout_confirmation import detect_multi_timeframe_breakouts
+from breakout_confirmation import detect_multi_timeframe_breakouts, build_breakout_explanation
 from exchange_flow_panel import render_exchange_flow_panel
 from exhaustion_confirmation import analyze_exhaustion_and_sweeps
 
@@ -3100,11 +3100,15 @@ def render_flow_panel() -> None:
             .astimezone(TZ_IST).strftime("%d %b %Y %H:%M")
             if event_time is not None else "—"
         )
+        explanation = build_breakout_explanation(item)
         breakout_rows.append({
             "Timeframe": item["timeframe"],
             "Breakout time (IST)": event_label,
             "Direction": item.get("direction") or "—",
             "Classification": item["classification"],
+            "Primary reason": explanation["primary_reason"],
+            "Success reason": explanation["success_reason"] if explanation["primary_reason"] == "CONFIRMED_BREAKOUT" else "—",
+            "Failure / blocker reason": explanation["failure_reason"] if explanation["primary_reason"] != "CONFIRMED_BREAKOUT" else "—",
             "Reference level": item.get("level"),
             "Breakout close": item.get("breakout_close"),
             "Breakout candle volume (source units)": item.get("breakout_volume"),
@@ -3154,6 +3158,48 @@ def render_flow_panel() -> None:
         hide_index=True,
         use_container_width=True,
     )
+    st.markdown("**Breakout success / failure explanations**")
+    st.caption(
+        "Each panel shows every gate, its measured value, the unchanged threshold, and the reason "
+        "for PASS, FAIL, PENDING, INSUFFICIENT or UNVERIFIED. Unavailable trade evidence is not "
+        "treated as zero market activity and is never silently marked as a price failure."
+    )
+    for item in breakout_analysis["windows"]:
+        explanation = build_breakout_explanation(item)
+        direction = item.get("direction") or "NO DIRECTION"
+        title = (
+            f'{item["timeframe"]} · {direction} · {item["classification"]} · '
+            f'{explanation["primary_reason"]}'
+        )
+        with st.expander(title, expanded=False):
+            st.markdown("**Success reason**")
+            st.write(explanation["success_reason"])
+            st.markdown("**Failure / blocker reason**")
+            st.write(explanation["failure_reason"])
+            if explanation.get("secondary_failures"):
+                st.caption("Additional non-passing or unverified checks: " + explanation["secondary_failures"])
+            checks_df = pd.DataFrame(explanation["checks"])
+            st.dataframe(
+                checks_df,
+                hide_index=True,
+                use_container_width=True,
+            )
+            breakout_ts = item.get("breakout_time")
+            confirmation_ts = item.get("confirmation_time")
+            breakout_label = (
+                datetime.fromtimestamp(float(breakout_ts), timezone.utc)
+                .astimezone(TZ_IST).strftime("%d %b %Y %H:%M:%S IST")
+                if breakout_ts is not None else "—"
+            )
+            confirmation_label = (
+                datetime.fromtimestamp(float(confirmation_ts), timezone.utc)
+                .astimezone(TZ_IST).strftime("%d %b %Y %H:%M:%S IST")
+                if confirmation_ts is not None else "Not available"
+            )
+            st.caption(
+                f'Breakout candle: {breakout_label} · Confirmation candle: {confirmation_label} · '
+                f'Retest: {item.get("retest_status") or "Not evaluated"}'
+            )
     genuine_events = [
         item for item in breakout_analysis["windows"]
         if str(item.get("classification", "")).startswith("GENUINE ")

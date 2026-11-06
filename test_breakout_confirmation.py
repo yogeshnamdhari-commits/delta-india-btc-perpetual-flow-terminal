@@ -362,3 +362,127 @@ def test_confirmation_engine_supports_each_native_timeframe(timeframe, duration)
 
     assert item["classification"].startswith("GENUINE BUY BREAKOUT")
     assert item["flow"]["active_minute_coverage_pct"] == pytest.approx(100.0)
+
+
+
+def test_breakout_explanation_reports_all_success_gates_with_calculations():
+    from breakout_confirmation import build_breakout_explanation
+
+    duration = 60
+    rows = _valid_bullish_history(duration)
+    breakout_start = rows[27]["time"]
+    flow = _flow(
+        breakout_start, 1, buy=15, sell=5,
+        buy_contracts=180, sell_contracts=20,
+    )
+    now = rows[-1]["time"] + duration + 5
+    item = detect_multi_timeframe_breakouts(
+        {"1m": rows}, flow,
+        **_args(now, rows[0]["time"] - 1),
+        timeframes=(("1m", duration),),
+    )["windows"][0]
+
+    explanation = build_breakout_explanation(item)
+
+    assert explanation["primary_reason"] == "CONFIRMED_BREAKOUT"
+    assert "trigger candle closed" in explanation["success_reason"]
+    assert "prior-20 average" in explanation["success_reason"]
+    results = {check["Condition"]: check["Result"] for check in explanation["checks"]}
+    assert results["Initial range breakout"] == "PASS"
+    assert results["Next-candle price acceptance"] == "PASS"
+    assert results["Breakout-candle relative volume"] == "PASS"
+    assert results["Classified trade prints"] == "PASS"
+    assert results["Active-minute trade coverage"] == "PASS"
+    assert results["Trade-feed capture quality"] == "PASS"
+    assert results["Same-direction taker dominance"] == "PASS"
+
+
+def test_breakout_explanation_distinguishes_acceptance_buffer_failure_from_reclaim():
+    from breakout_confirmation import build_breakout_explanation
+
+    duration = 60
+    rows = _valid_bullish_history(duration)
+    # Level is 101; the confirmation close remains above it but does not clear
+    # the 0.05 ATR acceptance buffer (ATR is approximately 2 points).
+    rows[28].update({"open": 104, "high": 104.5, "low": 100.8, "close": 101.05})
+    rows[29].update({"open": 101.05, "high": 101.5, "low": 100.5, "close": 101.2, "volume": 110})
+    breakout_start = rows[27]["time"]
+    flow = _flow(breakout_start, 1)
+    now = rows[-1]["time"] + duration + 5
+    item = detect_multi_timeframe_breakouts(
+        {"1m": rows}, flow,
+        **_args(now, rows[0]["time"] - 1),
+        timeframes=(("1m", duration),),
+    )["windows"][0]
+
+    explanation = build_breakout_explanation(item)
+
+    assert item["classification"] == "FAILED BREAKOUT"
+    assert explanation["primary_reason"] == "FAILED_PRICE_ACCEPTANCE_BUFFER"
+    acceptance = next(check for check in explanation["checks"] if check["Condition"] == "Next-candle price acceptance")
+    assert acceptance["Result"] == "FAIL"
+    assert "did not achieve" in explanation["failure_reason"]
+
+
+def test_breakout_explanation_keeps_unavailable_trade_data_unverified():
+    from breakout_confirmation import build_breakout_explanation
+
+    duration = 60
+    rows = _valid_bullish_history(duration)
+    now = rows[-1]["time"] + duration + 5
+    item = detect_multi_timeframe_breakouts(
+        {"1m": rows}, {},
+        **_args(now, rows[0]["time"] - 1),
+        timeframes=(("1m", duration),),
+    )["windows"][0]
+
+    explanation = build_breakout_explanation(item)
+    results = {check["Condition"]: check["Result"] for check in explanation["checks"]}
+
+    assert explanation["primary_reason"] == "INSUFFICIENT_ACTIVE_MINUTE_COVERAGE"
+    assert results["Trade-feed capture quality"] == "UNVERIFIED"
+    assert results["Same-direction taker dominance"] == "UNVERIFIED"
+    assert results["Classified trade prints"] == "INSUFFICIENT"
+
+
+
+def test_breakout_explanation_prioritizes_capture_start_after_historical_event():
+    from breakout_confirmation import build_breakout_explanation
+
+    duration = 60
+    rows = _valid_bullish_history(duration)
+    breakout_start = rows[27]["time"]
+    now = rows[-1]["time"] + duration + 5
+    item = detect_multi_timeframe_breakouts(
+        {"1m": rows}, {},
+        **_args(now, breakout_start + 1),
+        timeframes=(("1m", duration),),
+    )["windows"][0]
+
+    explanation = build_breakout_explanation(item)
+
+    assert explanation["primary_reason"] == "CAPTURE_STARTED_AFTER_EVENT"
+    assert "APP STARTED AFTER BREAKOUT BAR BEGAN" in explanation["failure_reason"]
+
+
+def test_breakout_explanation_marks_missing_relative_volume_unverified():
+    from breakout_confirmation import build_breakout_explanation
+
+    explanation = build_breakout_explanation({
+        "direction": "BUY",
+        "classification": "PRICE ACCEPTED — VOLUME NOT CONFIRMED",
+        "level": 100.0,
+        "atr": 2.0,
+        "breakout_close": 101.0,
+        "confirmation_close": 101.2,
+        "price_accepted": True,
+        "breakout_buffer_points": 0.2,
+        "acceptance_buffer_points": 0.1,
+        "relative_volume": None,
+        "relative_volume_multiple_required": 1.5,
+        "flow": {"capture_eligible": False, "capture_status": "UNVERIFIED — NO TAPE DATA"},
+    })
+
+    assert explanation["primary_reason"] == "VOLUME_UNVERIFIED"
+    volume = next(check for check in explanation["checks"] if check["Condition"] == "Breakout-candle relative volume")
+    assert volume["Result"] == "UNVERIFIED"
