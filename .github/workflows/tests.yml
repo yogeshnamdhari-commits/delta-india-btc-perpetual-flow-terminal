@@ -54,6 +54,8 @@ jobs:
           exit 1
 
       - name: Live Kilo Gateway free-model response smoke test
+        # Third-party free-model inventory and availability are external to the app's core test gate.
+        continue-on-error: true
         env:
           KILO_SMOKE_PREFERRED_MODEL: nvidia/nemotron-3.5-super-vl:free
         run: |
