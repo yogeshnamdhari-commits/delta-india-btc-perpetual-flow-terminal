@@ -1,0 +1,43 @@
+name: Breakout confirmation tests
+
+on:
+  push:
+    branches:
+      - feature/automatic-breakout-confirmation
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  focused-tests:
+    name: Breakout and aligned-flow tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test runner
+        run: python -m pip install --upgrade pip pytest
+      - name: Run breakout and aligned-flow tests
+        run: >-
+          python -m pytest -q
+          test_breakout_confirmation.py
+          test_multi_timeframe_orderflow.py
+          test_liquidity_taker_signal.py
+      - name: Compile application and analytics modules
+        run: >-
+          python -m py_compile
+          app.py
+          breakout_confirmation.py
+          multi_timeframe_orderflow.py
+          liquidity_taker_signal.py

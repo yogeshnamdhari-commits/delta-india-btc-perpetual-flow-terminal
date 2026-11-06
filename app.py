@@ -31,6 +31,7 @@ from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summ
 from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
+from breakout_confirmation import detect_multi_timeframe_breakouts
 from exchange_flow_panel import render_exchange_flow_panel
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
@@ -358,6 +359,79 @@ def load_daily_volume_history() -> list[dict[str, int | float]]:
     except (requests.RequestException, ValueError, TypeError):
         _logger.warning("Daily BTCUSD candle volume unavailable", exc_info=True)
         return []
+
+
+BREAKOUT_TIMEFRAMES = (
+    ("1m", 60),
+    ("5m", 5 * 60),
+    ("15m", 15 * 60),
+    ("1h", 60 * 60),
+    ("4h", 4 * 60 * 60),
+    ("1d", 24 * 60 * 60),
+)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_breakout_candle_history() -> dict[str, Any]:
+    """Fetch separate native Delta BTCUSD candles for automatic breakout analysis.
+
+    Delta's candle endpoint supports these native resolutions and returns at
+    most 2,000 candles per request. Candle volume stays in source-reported units.
+    """
+    end = int(time.time())
+
+    def fetch_one(timeframe: str, duration: int) -> tuple[str, list[dict[str, Any]], str | None]:
+        start = end - duration * 2000
+        try:
+            response = requests.get(
+                REST_URL,
+                params={
+                    "resolution": timeframe,
+                    "symbol": SYMBOL,
+                    "start": start,
+                    "end": end,
+                },
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "DeltaIndiaBTCFlowTerminal/1.0",
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("result", []) if isinstance(payload, dict) else []
+            candles: list[dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                timestamp = _ts_seconds(row.get("time"))
+                values = {key: _f(row.get(key)) for key in ("open", "high", "low", "close", "volume")}
+                if timestamp is None or any(value is None for value in values.values()):
+                    continue
+                candles.append({"time": timestamp, **values})
+            candles.sort(key=lambda row: row["time"])
+            return timeframe, candles[-2000:], None
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            return timeframe, [], f"{type(exc).__name__}: {str(exc)[:200]}"
+        except Exception as exc:
+            return timeframe, [], f"{type(exc).__name__}: {str(exc)[:200]}"
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    candles_by_timeframe: dict[str, list[dict[str, Any]]] = {}
+    errors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=len(BREAKOUT_TIMEFRAMES)) as executor:
+        futures = [
+            executor.submit(fetch_one, timeframe, duration)
+            for timeframe, duration in BREAKOUT_TIMEFRAMES
+        ]
+        for future in futures:
+            timeframe, candles, error = future.result()
+            candles_by_timeframe[timeframe] = candles
+            if error:
+                errors[timeframe] = error
+
+    return {"candles": candles_by_timeframe, "errors": errors, "fetched_at": end}
 
 
 class DeltaFeed:
@@ -2948,6 +3022,128 @@ def render_flow_panel() -> None:
         "monitoring measurements, not breakout detection or strategy entry signals. "
         + aligned_flow["limitations"]
     )
+    st.markdown("**Automatic breakout detection and genuine order-flow confirmation**")
+    candle_history = load_breakout_candle_history()
+    breakout_analysis = detect_multi_timeframe_breakouts(
+        candle_history.get("candles", {}),
+        d.get("trade_flow_minutes", {}),
+        now_ts=now,
+        feed_started_at=d.get("started_at"),
+        connection_status=str(d.get("connection", "unknown")),
+        trade_channel_last_seen=(d.get("channel_last_seen", {}) or {}).get("trades"),
+        timeframes=BREAKOUT_TIMEFRAMES,
+        range_lookback=20,
+        atr_period=14,
+        min_relative_volume=1.5,
+        breakout_buffer_atr=0.10,
+        acceptance_buffer_atr=0.05,
+        retest_band_atr=0.25,
+        min_taker_prints=10,
+        min_taker_share_pct=60.0,
+        min_active_minute_coverage_pct=95.0,
+        max_trade_age_seconds=float(CHANNEL_STALE_SECONDS.get("trades") or 20),
+        contract_value_btc=CONTRACT_VALUE_BTC,
+        event_lookback_bars=10,
+        retest_lookahead_bars=10,
+    )
+    breakout_rows = []
+    history_errors = candle_history.get("errors", {}) or {}
+    for item in breakout_analysis["windows"]:
+        flow = item.get("flow") or {}
+        event_time = item.get("breakout_time")
+        event_label = (
+            datetime.fromtimestamp(float(event_time), timezone.utc)
+            .astimezone(TZ_IST).strftime("%d %b %Y %H:%M")
+            if event_time is not None else "—"
+        )
+        breakout_rows.append({
+            "Timeframe": item["timeframe"],
+            "Breakout time (IST)": event_label,
+            "Direction": item.get("direction") or "—",
+            "Classification": item["classification"],
+            "Reference level": item.get("level"),
+            "Breakout close": item.get("breakout_close"),
+            "Breakout candle volume (source units)": item.get("breakout_volume"),
+            "Average prior 20 volume": item.get("average_prior_20_volume"),
+            "Relative candle volume": item.get("relative_volume"),
+            "Required relative volume": item.get("relative_volume_multiple_required", 1.5),
+            "BUY taker (contracts)": flow.get("buy_contracts"),
+            "SELL taker (contracts)": flow.get("sell_contracts"),
+            "BUY taker (BTC eq.)": flow.get("buy_btc"),
+            "SELL taker (BTC eq.)": flow.get("sell_btc"),
+            "BUY taker (USD)": flow.get("buy_usd"),
+            "SELL taker (USD)": flow.get("sell_usd"),
+            "Net delta (contracts)": flow.get("net_delta_contracts"),
+            "BUY share": flow.get("buy_share_pct"),
+            "SELL share": flow.get("sell_share_pct"),
+            "Taker prints": flow.get("classified_prints"),
+            "Active-minute coverage": flow.get("active_minute_coverage_pct"),
+            "Order-flow capture": flow.get("capture_status") or "Not evaluated",
+            "Retest": item.get("retest_status") or "—",
+            "Price history": (
+                "API ERROR: " + history_errors[item["timeframe"]]
+                if item["timeframe"] in history_errors
+                else f'{item.get("completed_candles", 0):,} completed bars'
+            ),
+        })
+    breakout_df = pd.DataFrame(breakout_rows)
+    st.dataframe(
+        breakout_df.style.format({
+            "Reference level": lambda value: "—" if pd.isna(value) else f"{value:,.1f}",
+            "Breakout close": lambda value: "—" if pd.isna(value) else f"{value:,.1f}",
+            "Breakout candle volume (source units)": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "Average prior 20 volume": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "Relative candle volume": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
+            "Required relative volume": "{:.2f}x",
+            "BUY taker (contracts)": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "SELL taker (contracts)": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "BUY taker (BTC eq.)": lambda value: "—" if pd.isna(value) else f"{value:,.4f}",
+            "SELL taker (BTC eq.)": lambda value: "—" if pd.isna(value) else f"{value:,.4f}",
+            "BUY taker (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.0f}",
+            "SELL taker (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.0f}",
+            "Net delta (contracts)": lambda value: "—" if pd.isna(value) else f"{value:+,.0f}",
+            "BUY share": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+            "SELL share": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+            "Taker prints": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "Active-minute coverage": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+        }, na_rep="—"),
+        hide_index=True,
+        use_container_width=True,
+    )
+    genuine_events = [
+        item for item in breakout_analysis["windows"]
+        if str(item.get("classification", "")).startswith("GENUINE ")
+    ]
+    if genuine_events:
+        st.success(
+            "Confirmed monitoring event(s): "
+            + ", ".join(
+                f'{item["timeframe"]} {item["classification"]}'
+                for item in genuine_events
+            )
+        )
+    else:
+        st.info(
+            "No breakout currently satisfies every configured confirmation condition. "
+            "This is a monitoring classification, not an order or strategy signal."
+        )
+    st.caption(
+        "Automatic rules (separate from the frozen strategy): prior 20 completed native candles define "
+        "the range high/low; trigger close must clear that level by 0.10 × prior ATR(14); the next "
+        "completed candle must accept at least 0.05 × ATR beyond the level; breakout-candle Delta "
+        "reported volume must be >=1.50x the average of the prior 20 completed candles; same-direction "
+        "taker flow must be >=60% of captured contracts with >=10 classified prints and >=95% active-minute "
+        "coverage. Strong taker dominance is >=70%. A failed close back through the level is marked failed; "
+        "wick-through and close-back-inside is shown as a liquidity sweep. Retest status is tracked separately. "
+        "Candle volume is kept in Delta's reported units and only same-timeframe ratios are compared. "
+        "Active-minute coverage is not proof of every trade message; the public stream has no per-trade sequence ID. "
+        "No order is generated, and these monitoring labels do not alter the frozen strategy."
+    )
+    if history_errors:
+        st.caption(
+            "Historical candle API issues: "
+            + " · ".join(f"{tf}: {message}" for tf, message in sorted(history_errors.items()))
+        )
     with st.expander("Liquidity levels — historical effectiveness", expanded=True):
         effectiveness = build_liquidity_effectiveness(
             closed,
