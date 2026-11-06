@@ -266,3 +266,26 @@ def test_invalid_settings_are_rejected(kwargs):
     args.update(kwargs)
     with pytest.raises(ValueError):
         detect_multi_timeframe_breakouts({}, {}, **args)
+
+
+def test_candle_gap_in_required_range_window_blocks_breakout_confirmation():
+    duration = 60
+    rows = _valid_bullish_history(duration)
+    # Remove one candle from the range/ATR segment. No gap is silently filled.
+    del rows[12]
+    breakout_time = 1_800_000_000 + 27 * duration
+    flow = _flow(breakout_time, 1)
+    now = rows[-1]["time"] + duration + 5
+
+    item = detect_multi_timeframe_breakouts(
+        {"1m": rows}, flow,
+        **_args(now, rows[0]["time"] - 1),
+        timeframes=(("1m", duration),),
+    )["windows"][0]
+
+    assert item["classification"] in (
+        "INSUFFICIENT — CANDLE HISTORY GAP",
+        "PRICE + VOLUME — ORDER FLOW UNVERIFIED",
+        "NO RECENT BREAKOUT",
+    )
+    assert not str(item["classification"]).startswith("GENUINE ")
