@@ -33,6 +33,7 @@ from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
 from breakout_confirmation import detect_multi_timeframe_breakouts
 from exchange_flow_panel import render_exchange_flow_panel
+from exhaustion_confirmation import analyze_exhaustion_and_sweeps
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -340,6 +341,49 @@ def load_open_interest_history() -> list[dict[str, Any]]:
     except (requests.RequestException, ValueError, TypeError):
         _logger.warning("Historical OI REST snapshot unavailable", exc_info=True)
         return []
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_intraday_open_interest_history() -> dict[str, Any]:
+    """Fetch Delta-native completed 1m OI candles for event-level confirmation.
+
+    Delta documents OI:<symbol> as a historical-candle symbol. The 2,000-bar
+    API limit bounds this request to roughly 33 hours; gaps are not filled.
+    """
+    end = int(time.time())
+    start = end - 2000 * 60
+    try:
+        response = requests.get(
+            REST_URL,
+            params={
+                "resolution": "1m",
+                "symbol": f"OI:{SYMBOL}",
+                "start": start,
+                "end": end,
+            },
+            headers={"Accept": "application/json", "User-Agent": "DeltaIndiaBTCFlowTerminal/1.0"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result = payload.get("result", []) if isinstance(payload, dict) else []
+        rows = []
+        for row in result:
+            if not isinstance(row, dict):
+                continue
+            timestamp = _ts_seconds(row.get("time"))
+            close = _f(row.get("close"))
+            if timestamp is None or close is None or close <= 0:
+                continue
+            rows.append({"time": timestamp, "close": close})
+        rows.sort(key=lambda row: row["time"])
+        return {"candles": rows[-2000:], "error": None, "fetched_at": end}
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        _logger.warning("Intraday OI REST snapshot unavailable", exc_info=True)
+        return {
+            "candles": [],
+            "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            "fetched_at": end,
+        }
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -3404,6 +3448,106 @@ def render_flow_panel() -> None:
             "This is a heuristic context label, not proof of a reversal or an entry signal."
         )
 
+    with st.expander("Multi-factor exhaustion and stop-hunt-like sweep confirmation (OI + flow + volume)", expanded=True):
+        oi_intraday = load_intraday_open_interest_history()
+        multi_factor = analyze_exhaustion_and_sweeps(
+            closed,
+            d.get("trade_flow_minutes", {}),
+            oi_intraday.get("candles", []),
+            (pa or {}).get("swept", []),
+            now_ts=now,
+            feed_started_at=_f(d.get("started_at")),
+            connection_status=str(d.get("connection", "unknown")),
+            trade_channel_last_seen=_f((d.get("channel_last_seen") or {}).get("trades")),
+        )
+        oi_age = multi_factor.get("latest_oi_age_seconds")
+        oi_col, oi_age_col, price_col = st.columns(3)
+        oi_col.metric("Completed 1m OI candles", f'{multi_factor["completed_oi_candles"]:,}')
+        oi_age_col.metric(
+            "Latest completed OI candle age",
+            "—" if oi_age is None else f"{float(oi_age):.0f}s",
+        )
+        price_col.metric(
+            "OI history",
+            "FRESH" if multi_factor.get("oi_history_fresh") else "UNAVAILABLE / STALE",
+        )
+        if oi_intraday.get("error"):
+            st.warning(f'Intraday OI history unavailable: {oi_intraday["error"]}')
+        if multi_factor["exhaustion_candidates"]:
+            st.markdown("**Exhaustion — all four checks shown separately**")
+            enriched_exhaustion_rows = [{
+                "Type": item["kind"],
+                "Time (IST)": _ist_str(item["time"]),
+                "Price": item["price"],
+                "Volume / prior 20": item["relative_volume"],
+                "BUY taker contracts": item["flow"]["buy_contracts"],
+                "SELL taker contracts": item["flow"]["sell_contracts"],
+                "Expected-side ratio": item["flow"]["expected_side_aggressor_ratio"],
+                "Prints": item["flow"]["classified_prints"],
+                "OI Δ contracts": item["oi"]["change_contracts"],
+                "OI Δ %": item["oi"]["change_pct"],
+                "OI state": item["oi"].get("status"),
+                "Evidence score": f'{item["score"]}/4',
+                "Classification": item["classification"],
+            } for item in multi_factor["exhaustion_candidates"][:8]]
+            st.dataframe(
+                pd.DataFrame(enriched_exhaustion_rows).style.format({
+                    "Price": "{:,.1f}",
+                    "Volume / prior 20": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
+                    "BUY taker contracts": "{:,.0f}",
+                    "SELL taker contracts": "{:,.0f}",
+                    "Expected-side ratio": lambda value: "—" if pd.isna(value) else ("One-sided" if value == float("inf") else f"{value:.2f}x"),
+                    "Prints": "{:,.0f}",
+                    "OI Δ contracts": lambda value: "—" if pd.isna(value) else f"{value:+,.0f}",
+                    "OI Δ %": lambda value: "—" if pd.isna(value) else f"{value:+.3f}%",
+                }, na_rep="—"),
+                hide_index=True, use_container_width=True, height=300,
+            )
+        else:
+            st.info("No completed 1m price-rejection candidates are currently available for multi-factor evaluation.")
+
+        if multi_factor["sweep_candidates"]:
+            st.markdown("**Confirmed price sweeps — OI/flow/volume cross-check**")
+            enriched_sweep_rows = [{
+                "Sweep": "BUY-SIDE liquidity (above high)" if item["kind"] == "high" else "SELL-SIDE liquidity (below low)",
+                "Reclaim time (IST)": _ist_str(item["reclaim_time"]),
+                "Level": item["level"],
+                "Overshoot (pts)": item["overshoot_points"],
+                "Reclaim delay (bars)": item["reclaim_delay_bars"],
+                "Volume / prior comparable windows": item["relative_volume"],
+                "Expected-side ratio": item["flow"]["expected_side_aggressor_ratio"],
+                "Taker prints": item["flow"]["classified_prints"],
+                "OI Δ contracts": item["oi"]["change_contracts"],
+                "OI Δ %": item["oi"]["change_pct"],
+                "OI state": item["oi"].get("status"),
+                "Classification": item["classification"],
+            } for item in multi_factor["sweep_candidates"][:8]]
+            st.dataframe(
+                pd.DataFrame(enriched_sweep_rows).style.format({
+                    "Level": "{:,.1f}",
+                    "Overshoot (pts)": "{:,.1f}",
+                    "Volume / prior comparable windows": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
+                    "Expected-side ratio": lambda value: "—" if pd.isna(value) else ("One-sided" if value == float("inf") else f"{value:.2f}x"),
+                    "Taker prints": "{:,.0f}",
+                    "OI Δ contracts": lambda value: "—" if pd.isna(value) else f"{value:+,.0f}",
+                    "OI Δ %": lambda value: "—" if pd.isna(value) else f"{value:+.3f}%",
+                }, na_rep="—"),
+                hide_index=True, use_container_width=True, height=280,
+            )
+        else:
+            st.info("No confirmed price breach-and-reclaim sweep is available in the current completed-candle lookback.")
+
+        st.caption(
+            "Exhaustion evidence requires a completed local-extreme rejection, same-direction captured taker flow, "
+            "Delta candle volume >=1.50x its prior-20 baseline, and a material OI change versus the adaptive prior-20 OI-change baseline. "
+            "The OI threshold is the greater of 0.01% or the 75th percentile of prior absolute 1m OI percentage changes. "
+            "A stop-hunt-like label additionally requires a confirmed price-level reclaim, breach-direction taker flow, "
+            "comparable-window volume >=1.50x, and OI reduction across the breach/reclaim interval. "
+            "OI is aggregate contracts, not directional long/short OI; flow is aggressor execution, not proof of opening/closing. "
+            "Public data cannot prove hidden stops, stop intent or a liquidation. Capture freshness/active-minute coverage does not prove lossless trade delivery. "
+            "These are monitoring labels only; strategy, entry thresholds, holdout evaluator and order execution are unchanged."
+        )
+
     if show_depth_heat:
         st.markdown("**Observed depth heatmap (captured samples only)**")
         fig_heat = _depth_heatmap(d)
@@ -3638,6 +3782,17 @@ def _build_ai_market_structure_context(data: dict[str, Any]) -> dict[str, Any]:
         "close_position_0_to_1": _f(row.get("close_position")),
         "classified_print_count": row.get("trade_count"),
     } for row in exhaustion_raw[-8:]]
+    intraday_oi = load_intraday_open_interest_history()
+    multi_factor_context = analyze_exhaustion_and_sweeps(
+        closed,
+        data.get("trade_flow_minutes", {}),
+        intraday_oi.get("candles", []),
+        pa.get("swept", []),
+        now_ts=now,
+        feed_started_at=_f(data.get("started_at")),
+        connection_status=str(data.get("connection", "unknown")),
+        trade_channel_last_seen=_f((data.get("channel_last_seen") or {}).get("trades")),
+    )
 
     book_valid = (
         bool(data.get("book_synced"))
@@ -3744,6 +3899,16 @@ def _build_ai_market_structure_context(data: dict[str, Any]) -> dict[str, Any]:
         "supply_demand_order_blocks": zones,
         "confirmed_price_sweep_candidates": sweeps,
         "buy_sell_exhaustion_candidates": exhaustion,
+        "oi_flow_volume_exhaustion_and_sweeps": {
+            "completed_price_candles": multi_factor_context["completed_price_candles"],
+            "completed_oi_candles": multi_factor_context["completed_oi_candles"],
+            "latest_oi_age_seconds": multi_factor_context["latest_oi_age_seconds"],
+            "oi_history_fresh": multi_factor_context["oi_history_fresh"],
+            "exhaustion_candidates": multi_factor_context["exhaustion_candidates"][:8],
+            "sweep_candidates": multi_factor_context["sweep_candidates"][:8],
+            "parameters": multi_factor_context["parameters"],
+            "interpretation_limits": multi_factor_context["interpretation_limits"],
+        },
         "rolling_aggressor_flow": {
             "window_minutes": int(cvd_window_min),
             "buy_aggressor_contracts": _f(rolling_flow.get("buy_contracts")),
