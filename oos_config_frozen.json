@@ -1,0 +1,16 @@
+{
+  "params_version": "oos-1.0",
+  "spread_bps": 2.0,
+  "taker_fee_bps": 5.0,
+  "slippage_bps": 2.0,
+  "min_history_1m": 900,
+  "flow_window_minutes": 5.0,
+  "max_1m_candle_age_minutes": 5.0,
+  "max_trade_age_minutes": 10.0,
+  "intrabar_convention": "stop_first",
+  "entry_reference": "next_bar_open",
+  "assume_funding": "ignored",
+  "engine_overrides": {
+    "require_checksum_verified": false
+  }
+}

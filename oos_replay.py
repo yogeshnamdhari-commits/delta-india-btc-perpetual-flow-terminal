@@ -90,6 +90,11 @@ def _parse_ts(value: Any) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def signal_audit_key(signal_id: str, decision_ts_utc: datetime) -> str:
+    """Stable identity for one emission of a structural signal setup."""
+    return f"{signal_id}|{decision_ts_utc.isoformat()}"
+
+
 def _num(value: Any, name: str) -> float:
     try:
         out = float(value)
@@ -300,6 +305,15 @@ class CostModel:
 
 
 
+@dataclass(frozen=True)
+class SimulationDisposition:
+    """Immutable, auditable outcome for one confirmed signal emission."""
+    status: str
+    reason_code: Optional[str] = None
+    rejection_ts_utc: Optional[str] = None
+    trade: Optional[Dict[str, Any]] = None
+
+
 @dataclass
 class ReplayStats:
     bars_total: int = 0
@@ -310,6 +324,8 @@ class ReplayStats:
     signals_buy: int = 0
     signals_sell: int = 0
     signals_simulated: int = 0
+    signals_rejected: int = 0
+    simulation_rejection_counts: Dict[str, int] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
 
 
@@ -433,79 +449,163 @@ class ReplayRunner:
 
 
     # -- signal simulation ----------------------------------------------------
-    def simulate(self, result: se.SignalResult,
-                 entry_bar: Optional[Bar1m]) -> Optional[Dict[str, Any]]:
-        """Resolve a signal from the specified next-bar open; censor incomplete paths."""
-        if entry_bar is None or result.proposed_entry is None or result.expires_at_utc is None:
-            return None
-        direction = "BUY" if result.signal is se.Signal.BUY else "SELL"
-        cost = CostModel(self.cfg["taker_fee_bps"], self.cfg["slippage_bps"], self.cfg["spread_bps"])
-        start = bisect_left(self._ts, entry_bar.ts_utc)
-        if start >= len(self.bars) or self.bars[start].ts_utc != entry_bar.ts_utc:
-            return None
+    def simulate_with_disposition(self, result: se.SignalResult,
+                                  entry_ts_utc: datetime,
+                                  entry_bar: Optional[Bar1m]) -> SimulationDisposition:
+        """Resolve one signal and return an explicit simulated/rejected outcome.
+
+        The expiry timestamp is an exclusive boundary for entry eligibility and
+        for every one-minute bar inspected on the path.
+        """
+        entry_ts = _parse_ts(entry_ts_utc)
+        expiry_raw = result.expires_at_utc
+        if expiry_raw is None:
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_INVALID_LEVELS", entry_ts.isoformat())
+        expiry_ts = _parse_ts(expiry_raw)
+
+        # Rejection precedence is intentional: an expired entry stays classified
+        # as expired even when the entry bar is absent from the historical file.
+        if entry_ts >= expiry_ts:
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_EXPIRED_AT_ENTRY", entry_ts.isoformat())
+
+        if expiry_ts.second != 0 or expiry_ts.microsecond != 0:
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_EXPIRY_NOT_BAR_ALIGNED", expiry_ts.isoformat())
+
+        if entry_bar is None or _parse_ts(entry_bar.ts_utc) != entry_ts:
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_MISSING_ENTRY_BAR", entry_ts.isoformat())
+
+        start = bisect_left(self._ts, entry_ts)
+        if start >= len(self.bars) or self.bars[start].ts_utc != entry_ts:
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_MISSING_ENTRY_BAR", entry_ts.isoformat())
+
+        direction = "BUY" if result.signal is se.Signal.BUY else (
+            "SELL" if result.signal is se.Signal.SELL else None)
+        planned = (result.proposed_entry, result.stop_loss, result.take_profit)
+        if direction is None or any(
+            value is None or not math.isfinite(value) or value <= 0
+            for value in planned
+        ):
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_INVALID_LEVELS", entry_ts.isoformat())
+        if (result.invalidation_price is not None and
+                (not math.isfinite(result.invalidation_price) or result.invalidation_price <= 0)):
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_INVALID_LEVELS", entry_ts.isoformat())
+
+        planned_entry = float(result.proposed_entry)
+        stop = float(result.stop_loss)
+        target = float(result.take_profit)
+        planned_risk = abs(planned_entry - stop)
+        valid_geometry = (stop < planned_entry < target) if direction == "BUY" else (
+            target < planned_entry < stop)
+        if not valid_geometry or not math.isfinite(planned_risk) or planned_risk <= 0:
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_INVALID_LEVELS", entry_ts.isoformat())
+        if result.invalidation_price is not None:
+            invalidation = float(result.invalidation_price)
+            valid_invalidation = (stop < invalidation < planned_entry) if direction == "BUY" else (
+                planned_entry < invalidation < stop)
+            if not valid_invalidation:
+                return SimulationDisposition(
+                    "REJECTED", "REJECTED_INVALID_LEVELS", entry_ts.isoformat())
+
+        cost = CostModel(self.cfg["taker_fee_bps"], self.cfg["slippage_bps"],
+                         self.cfg["spread_bps"])
         entry_fill = cost.entry_price(entry_bar.open, direction)
+        if not math.isfinite(entry_fill) or entry_fill <= 0:
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_INVALID_LEVELS", entry_ts.isoformat())
         entry_fee = cost.fees(entry_fill)
-        if result.stop_loss is None or result.take_profit is None:
-            return None
-        risk = abs(entry_fill - result.stop_loss)
+        if direction == "BUY" and not (stop < entry_fill < target):
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_ENTRY_GAP_THROUGH_LEVEL", entry_ts.isoformat())
+        if direction == "SELL" and not (target < entry_fill < stop):
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_ENTRY_GAP_THROUGH_LEVEL", entry_ts.isoformat())
+
+        risk = abs(entry_fill - stop)
         if not math.isfinite(risk) or risk <= 0:
-            return None
-        # If the market gaps past a planned stop or target before entry, the setup is
-        # no longer valid at the first fill reference; do not invent a favorable fill.
-        if direction == "BUY" and not (result.stop_loss < entry_fill < result.take_profit):
-            return None
-        if direction == "SELL" and not (result.take_profit < entry_fill < result.stop_loss):
-            return None
-        expiry_ts = result.expires_at_utc
-        outcome, exit_fill, exit_bar_ts = None, None, None
+            return SimulationDisposition(
+                "REJECTED", "REJECTED_INVALID_LEVELS", entry_ts.isoformat())
+
+        outcome, exit_fill, exit_bar_open_ts = None, None, None
         last_observed_bar = None
         previous_bar = None
         for bar in self.bars[start:]:
-            # Bar timestamps represent opens; no bar that starts at expiry is usable.
+            if previous_bar is not None:
+                expected_next = previous_bar.ts_utc + timedelta(minutes=1)
+                # A later observed bar (including one at expiry) proves a gap
+                # when an expected minute strictly before expiry is absent.
+                if expected_next < expiry_ts and bar.ts_utc != expected_next:
+                    return SimulationDisposition(
+                        "REJECTED", "REJECTED_PATH_GAP", expected_next.isoformat())
+            # Bar timestamps represent opens; a bar starting exactly at expiry
+            # is excluded, even if its OHLC touches the stop or target.
             if bar.ts_utc >= expiry_ts:
                 break
-            if previous_bar is not None and (bar.ts_utc - previous_bar.ts_utc).total_seconds() != 60:
-                return None  # gaps make intrabar stop/target sequencing unknown
             previous_bar = bar
             last_observed_bar = bar
-            hit_stop = bar.low <= result.stop_loss if direction == "BUY" else bar.high >= result.stop_loss
-            hit_target = bar.high >= result.take_profit if direction == "BUY" else bar.low <= result.take_profit
+            hit_stop = bar.low <= stop if direction == "BUY" else bar.high >= stop
+            hit_target = bar.high >= target if direction == "BUY" else bar.low <= target
             if self.cfg["intrabar_convention"] == "stop_first":
                 if hit_stop:
-                    outcome, exit_fill, exit_bar_ts = "stop", result.stop_loss, bar.ts_utc
+                    outcome, exit_fill, exit_bar_open_ts = "stop", stop, bar.ts_utc
                     break
                 if hit_target:
-                    outcome, exit_fill, exit_bar_ts = "target", result.take_profit, bar.ts_utc
+                    outcome, exit_fill, exit_bar_open_ts = "target", target, bar.ts_utc
                     break
             else:
                 if hit_target:
-                    outcome, exit_fill, exit_bar_ts = "target", result.take_profit, bar.ts_utc
+                    outcome, exit_fill, exit_bar_open_ts = "target", target, bar.ts_utc
                     break
                 if hit_stop:
-                    outcome, exit_fill, exit_bar_ts = "stop", result.stop_loss, bar.ts_utc
+                    outcome, exit_fill, exit_bar_open_ts = "stop", stop, bar.ts_utc
                     break
+
         if exit_fill is None:
-            # Do not label a truncated end-of-file path as a completed timeout.
-            if last_observed_bar is None or last_observed_bar.ts_utc + timedelta(minutes=1) < expiry_ts:
-                return None
-            outcome, exit_fill, exit_bar_ts = "timeout", last_observed_bar.close, last_observed_bar.ts_utc
+            if last_observed_bar is None:
+                return SimulationDisposition(
+                    "REJECTED", "REJECTED_INCOMPLETE_HISTORY_BEFORE_EXPIRY",
+                    entry_ts.isoformat())
+            first_unavailable_ts = last_observed_bar.ts_utc + timedelta(minutes=1)
+            if first_unavailable_ts < expiry_ts:
+                return SimulationDisposition(
+                    "REJECTED", "REJECTED_INCOMPLETE_HISTORY_BEFORE_EXPIRY",
+                    first_unavailable_ts.isoformat())
+            if first_unavailable_ts != expiry_ts:
+                return SimulationDisposition(
+                    "REJECTED", "REJECTED_INCOMPLETE_HISTORY_BEFORE_EXPIRY",
+                    first_unavailable_ts.isoformat())
+            outcome, exit_fill, exit_bar_open_ts = (
+                "timeout", last_observed_bar.close, last_observed_bar.ts_utc)
+            exit_ts = expiry_ts
+        else:
+            exit_ts = exit_bar_open_ts
+
         exit_fill = cost.exit_price(exit_fill, direction)
         exit_fee = cost.fees(exit_fill)
         pnl_per_unit = (exit_fill - entry_fill) if direction == "BUY" else (entry_fill - exit_fill)
         gross_r = pnl_per_unit / risk
         costs_r = (entry_fee + exit_fee) / risk
-        return {
+        trade = {
             "signal_id": result.signal_id,
             "decision_ts_utc": result.generated_at_utc.isoformat() if result.generated_at_utc else None,
             "direction": direction,
-            "trigger_ts_utc": (result.expires_at_utc - timedelta(minutes=self.engine_cfg["expiry_1m_candles"])).isoformat(),
+            "trigger_ts_utc": (result.trigger_ts_utc.isoformat() if result.trigger_ts_utc
+                               else (expiry_ts - timedelta(minutes=self.engine_cfg["expiry_1m_candles"])).isoformat()),
             "planned_entry": result.proposed_entry,
             "simulated_entry": entry_fill,
             "stop_loss": result.stop_loss,
             "take_profit": result.take_profit,
             "planned_rr": result.risk_reward_ratio,
             "exit_fill": exit_fill,
-            "exit_ts_utc": exit_bar_ts.isoformat() if exit_bar_ts else None,
+            "exit_ts_utc": exit_ts.isoformat(),
+            "exit_bar_open_ts_utc": exit_bar_open_ts.isoformat(),
             "outcome": outcome,
             "gross_r": gross_r,
             "costs_r": costs_r,
@@ -515,6 +615,14 @@ class ReplayRunner:
             "slippage_bps_per_fill": self.cfg["slippage_bps"],
             "taker_fee_bps_per_side": self.cfg["taker_fee_bps"],
         }
+        return SimulationDisposition("SIMULATED", trade=trade)
+
+    def simulate(self, result: se.SignalResult,
+                 entry_bar: Optional[Bar1m]) -> Optional[Dict[str, Any]]:
+        """Compatibility wrapper returning trade-or-None as before."""
+        if entry_bar is None:
+            return None
+        return self.simulate_with_disposition(result, entry_bar.ts_utc, entry_bar).trade
 
 
 
@@ -560,7 +668,7 @@ def run_replay(bars: List[Bar1m], trades: List[Print1m],
                config: Optional[Dict[str, Any]] = None,
                ask_liquidity: Optional[List[se.LiquidityLevel]] = None,
                bid_liquidity: Optional[List[se.LiquidityLevel]] = None) -> Dict[str, Any]:
-    """Replay the frozen engine and return signals + metrics.
+    """Replay the frozen engine and return signals, audit dispositions and metrics.
 
     Synthetic data is fine for self-tests. With authentic historical data this
     returns the out-of-sample measurements; it never returns a profitability claim
@@ -570,13 +678,48 @@ def run_replay(bars: List[Bar1m], trades: List[Print1m],
                           ask_liquidity=ask_liquidity, bid_liquidity=bid_liquidity)
     engine = se.SignalEngine(runner.engine_cfg)
     signals: List[Dict[str, Any]] = []
+    expired_candidates: List[Dict[str, Any]] = []
     sims: List[Dict[str, Any]] = []
+    confirmed_signal_ids: set[str] = set()
     for now, snap in runner.iter_snapshots():
         result = engine.evaluate(snap, now_utc=now)
         if result.signal is se.Signal.WAIT:
+            if (se.WAIT_SETUP_EXPIRED in result.reason_codes
+                    and result.signal_id not in confirmed_signal_ids):
+                required_audit_fields = {
+                    "signal_id": result.signal_id,
+                    "decision_ts_utc": result.generated_at_utc,
+                    "trigger_ts_utc": result.trigger_ts_utc,
+                    "last_completed_candle_ts_utc": result.last_completed_candle_ts_utc,
+                    "setup_candle_timestamp": result.setup_candle_timestamp,
+                    "expires_at_utc": result.expires_at_utc,
+                }
+                missing_fields = [name for name, value in required_audit_fields.items()
+                                  if value is None or (name == "signal_id" and not value)]
+                if missing_fields:
+                    raise ReplayDataError(
+                        "expired candidate missing audit metadata: " + ", ".join(missing_fields))
+                candidate = {
+                    "signal_id": result.signal_id,
+                    "audit_event_key": signal_audit_key(result.signal_id, result.generated_at_utc),
+                    "decision_ts_utc": result.generated_at_utc.isoformat(),
+                    "trigger_ts_utc": result.trigger_ts_utc.isoformat()
+                    if result.trigger_ts_utc else None,
+                    "last_completed_candle_ts_utc": result.last_completed_candle_ts_utc.isoformat()
+                    if result.last_completed_candle_ts_utc else None,
+                    "setup_candle_timestamp": result.setup_candle_timestamp.isoformat()
+                    if result.setup_candle_timestamp else None,
+                    "expires_at_utc": result.expires_at_utc.isoformat()
+                    if result.expires_at_utc else None,
+                    "reason_code": se.WAIT_SETUP_EXPIRED,
+                }
+                expired_candidates.append(candidate)
             continue
         if result.duplicate_suppressed:
             continue
+
+        if result.signal_id:
+            confirmed_signal_ids.add(result.signal_id)
         runner.stats.signals_confirmed += 1
         if result.signal is se.Signal.BUY:
             runner.stats.signals_buy += 1
@@ -587,6 +730,9 @@ def run_replay(bars: List[Bar1m], trades: List[Print1m],
         start = bisect_left(runner._ts, now)
         if start < len(runner.bars) and runner.bars[start].ts_utc == now:
             entry_bar = runner.bars[start]
+
+        disposition = runner.simulate_with_disposition(result, now, entry_bar)
+        audit_key = signal_audit_key(result.signal_id, now)
         rec = {
             "signal_id": result.signal_id,
             "signal": result.signal.value,
@@ -597,12 +743,26 @@ def run_replay(bars: List[Bar1m], trades: List[Print1m],
             "target": result.take_profit, "invalidation": result.invalidation_price,
             "rr": result.risk_reward_ratio, "expires_ts_utc": result.expires_at_utc.isoformat(),
             "reason_codes": list(result.reason_codes),
+            "audit_event_key": audit_key,
+            "simulation_status": disposition.status,
+            "simulation_rejection_reason": disposition.reason_code,
+            "rejection_ts_utc": disposition.rejection_ts_utc,
         }
         signals.append(rec)
-        sim = runner.simulate(result, entry_bar)
-        if sim is not None:
+        if disposition.status == "SIMULATED" and disposition.trade is not None:
             runner.stats.signals_simulated += 1
-            sims.append(sim)
+            sims.append(disposition.trade)
+        elif disposition.status == "REJECTED":
+            runner.stats.signals_rejected += 1
+            reason = disposition.reason_code or "REJECTED_UNKNOWN"
+            runner.stats.simulation_rejection_counts[reason] = (
+                runner.stats.simulation_rejection_counts.get(reason, 0) + 1)
+        else:
+            # The disposition contract is closed: a malformed outcome must not
+            # silently escape the reconciliation counters.
+            raise ReplayDataError(
+                f"invalid simulation disposition for {audit_key}: {disposition!r}")
+
     return {
         "params_version": PARAMS_VERSION,
         "config": {k: v for k, v in runner.cfg.items()},
@@ -618,9 +778,13 @@ def run_replay(bars: List[Bar1m], trades: List[Print1m],
             "incomplete_buckets_dropped": runner.stats.incomplete_buckets_dropped,
             "signals_confirmed": runner.stats.signals_confirmed,
             "signals_simulated": runner.stats.signals_simulated,
+            "signals_rejected": runner.stats.signals_rejected,
+            "simulation_rejection_counts": dict(sorted(
+                runner.stats.simulation_rejection_counts.items())),
             "gaps": runner.stats.notes,
         },
         "signals": signals,
+        "expired_candidates": expired_candidates,
         "simulated_trades": sims,
         "metrics": compute_metrics(sims),
     }

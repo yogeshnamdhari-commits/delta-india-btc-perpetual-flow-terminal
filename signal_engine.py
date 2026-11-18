@@ -212,6 +212,8 @@ class SignalResult:
     signal_id: str = ""
     generated_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at_utc: Optional[datetime] = None
+    trigger_ts_utc: Optional[datetime] = None
+    last_completed_candle_ts_utc: Optional[datetime] = None
     proposed_entry: Optional[float] = None
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
@@ -545,7 +547,10 @@ def detect_setup(snap: MarketSnapshot, cfg: Dict[str, Any],
     trigger = None
     earliest = struct_cd.ts_utc + timedelta(minutes=5)
     eligible = [c for c in c1 if c.ts_utc >= earliest]
-    for cd in eligible[-cfg["trigger_max_bars"]:]:
+    # The trigger window is anchored to the first completed 1m bars after the
+    # structure break. A rolling tail would let an expired structure acquire a
+    # later trigger indefinitely as old candles fall out of the window.
+    for cd in eligible[:cfg["trigger_max_bars"]]:
         if (cd.close > ref_px) if direction == "bullish" else (cd.close < ref_px):
             trigger = cd
             break
@@ -554,9 +559,8 @@ def detect_setup(snap: MarketSnapshot, cfg: Dict[str, Any],
         return None, passed, failed
     passed.append("1m trigger bar completed after the setup bar closed")
 
-    last_ts = c1[-1].ts_utc
-    span_min = (last_ts - trigger.ts_utc).total_seconds() / 60.0
-    expired = span_min > cfg["expiry_1m_candles"]
+    expiry_ts = trigger.ts_utc + timedelta(minutes=cfg["expiry_1m_candles"])
+    expired = snap.ts_utc >= expiry_ts
     invalidated = False
     if not expired:
         for cd in eligible:
@@ -697,6 +701,17 @@ def _evaluate(snap: MarketSnapshot, cfg: Dict[str, Any]) -> Tuple[SignalResult, 
         res.reason_codes = failed
         res.human_readable_explanation = "Setup not confirmed: " + ", ".join(failed)
         return res, None
+
+    if setup.expired:
+        # Lifecycle identity/timestamps are required on pre-confirmation expiry
+        # records. Keep ordinary WAIT results on their legacy metadata contract:
+        # they are not confirmed/expired candidates and must not look duplicate.
+        res.signal_id = _signal_id(direction, setup)
+        res.setup_candle_timestamp = setup.setup_ts
+        res.trigger_ts_utc = setup.trigger_ts
+        res.last_completed_candle_ts_utc = snap.candles_1m[-1].ts_utc
+        res.expires_at_utc = setup.trigger_ts + timedelta(minutes=cfg["expiry_1m_candles"])
+
     if setup.expired or setup.invalidated:
         res.signal, res.state = Signal.WAIT, SignalState.WAIT
         res.confirmation_conditions_failed = ["setup still live"]
@@ -901,7 +916,7 @@ class SignalEngine:
                              now, "INVALIDATED")
                 notes.append(f"{sid}:INVALIDATED")
                 continue
-            if now > trade.expires_ts:
+            if now >= trade.expires_ts:
                 self._retire(sid, f"expired after {self.cfg['expiry_1m_candles']} completed 1m candles",
                              now, "EXPIRED")
                 notes.append(f"{sid}:EXPIRED")

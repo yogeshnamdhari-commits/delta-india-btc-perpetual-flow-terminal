@@ -16,6 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 import websocket
 
 import orderflow
@@ -34,6 +35,10 @@ from multi_timeframe_orderflow import summarize_aligned_taker_flow
 from breakout_confirmation import detect_multi_timeframe_breakouts
 from exchange_flow_panel import render_exchange_flow_panel
 from exhaustion_confirmation import analyze_exhaustion_and_sweeps
+
+# Importing this module is also used by pytest and offline analysis tools.
+# Only a Streamlit script run has permission to perform live market-data I/O.
+_STREAMLIT_SCRIPT_CONTEXT_ACTIVE = get_script_run_ctx(suppress_warning=True) is not None
 
 EVENT_LOG_FILE = os.environ.get("DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
 EVENT_LOG_FILE_FULL = os.environ.get("DELTA_EVENT_LOG_FILE_FULL", "/Users/targetmobile/Downloads/delta_feed_events_full.jsonl")
@@ -266,6 +271,8 @@ def _ts_seconds(value: Any) -> int | None:
 @st.cache_data(ttl=240, show_spinner="Loading recent BTCUSD candles…")
 def load_initial_candles() -> list[dict[str, float | int]]:
     """Fetch up to 2000 recent one-minute candles for chart and signal warm-up."""
+    if not _STREAMLIT_SCRIPT_CONTEXT_ACTIVE:
+        return []
     end = int(time.time())
     start = end - 2000 * 60
     try:
@@ -304,6 +311,8 @@ def load_initial_candles() -> list[dict[str, float | int]]:
 @st.cache_data(ttl=20, show_spinner=False)
 def load_daily_ticker_metrics() -> dict[str, Any]:
     """Fetch Delta's official rolling-24h ticker totals and current OI."""
+    if not _STREAMLIT_SCRIPT_CONTEXT_ACTIVE:
+        return parse_ticker_payload({}, SYMBOL)
     try:
         response = requests.get(
             f"{TICKER_REST_URL}/{SYMBOL}",
@@ -320,6 +329,8 @@ def load_daily_ticker_metrics() -> dict[str, Any]:
 @st.cache_data(ttl=180, show_spinner=False)
 def load_open_interest_history() -> list[dict[str, Any]]:
     """Fetch hourly OI candles used to establish a genuine 24h comparison baseline."""
+    if not _STREAMLIT_SCRIPT_CONTEXT_ACTIVE:
+        return []
     end = int(time.time())
     start = end - 28 * 60 * 60
     try:
@@ -349,6 +360,8 @@ def load_intraday_open_interest_history() -> dict[str, Any]:
     Delta documents OI:<symbol> as a historical-candle symbol. The 2,000-bar
     API limit bounds this request to roughly 33 hours; gaps are not filled.
     """
+    if not _STREAMLIT_SCRIPT_CONTEXT_ACTIVE:
+        return {"candles": [], "error": "Streamlit runtime is inactive", "fetched_at": int(time.time())}
     end = int(time.time())
     start = end - 2000 * 60
     try:
@@ -389,6 +402,8 @@ def load_intraday_open_interest_history() -> dict[str, Any]:
 @st.cache_data(ttl=60, show_spinner=False)
 def load_daily_volume_history() -> list[dict[str, int | float]]:
     """Fetch recent BTCUSD daily candles; the latest candle may still be forming."""
+    if not _STREAMLIT_SCRIPT_CONTEXT_ACTIVE:
+        return []
     end = int(time.time())
     start = end - 7 * 86_400
     try:
@@ -422,6 +437,12 @@ def load_breakout_candle_history() -> dict[str, Any]:
     Delta's candle endpoint supports these native resolutions and returns at
     most 2,000 candles per request. Candle volume stays in source-reported units.
     """
+    if not _STREAMLIT_SCRIPT_CONTEXT_ACTIVE:
+        return {
+            "candles": {timeframe: [] for timeframe, _ in BREAKOUT_TIMEFRAMES},
+            "errors": {},
+            "fetched_at": int(time.time()),
+        }
     end = int(time.time())
 
     def fetch_one(timeframe: str, duration: int) -> tuple[str, list[dict[str, Any]], str | None]:
@@ -555,6 +576,8 @@ class DeltaFeed:
         }
         self.thread: threading.Thread | None = None
         self.ws: websocket.WebSocketApp | None = None
+        self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self.resubscribe_lock = threading.Lock()
         self.last_resubscribe = 0.0
         self._first_msg_channels: set[str] = set()
@@ -570,15 +593,52 @@ class DeltaFeed:
         self._sthread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self.thread and self.thread.is_alive():
-            return
-        self.thread = threading.Thread(target=self._run_forever, name="delta-public-ws", daemon=True)
-        self.thread.start()
-        self._hthread = threading.Thread(target=self._health_loop, name="delta-health", daemon=True)
-        self._hthread.start()
-        if not (self._sthread and self._sthread.is_alive()):
+        """Start the read-only feed workers once; safe to call on Streamlit reruns."""
+        with self._lifecycle_lock:
+            workers = (self.thread, self._hthread, self._sthread)
+            if any(worker and worker.is_alive() for worker in workers):
+                return
+            self._stop_event.clear()
+            self.thread = threading.Thread(target=self._run_forever, name="delta-public-ws", daemon=True)
+            self._hthread = threading.Thread(target=self._health_loop, name="delta-health", daemon=True)
             self._sthread = threading.Thread(target=self._sample_loop, name="delta-depth-sampler", daemon=True)
+            self.thread.start()
+            self._hthread.start()
             self._sthread.start()
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        """Stop feed workers, close the socket, and wait for all threads to exit.
+
+        Returns True only when every worker has terminated within ``timeout``.
+        This method is idempotent and does not place or alter any orders.
+        """
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        with self._lifecycle_lock:
+            self._stop_event.set()
+            ws = self.ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception as exc:
+                _logger.warning("Error while closing Delta WebSocket during stop: %s", exc)
+
+        deadline = time.monotonic() + timeout
+        workers = (self.thread, self._hthread, self._sthread)
+        current = threading.current_thread()
+        for worker in workers:
+            if worker is None or worker is current:
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            worker.join(timeout=remaining)
+
+        still_alive = [worker.name for worker in workers
+                       if worker is not None and worker is not current and worker.is_alive()]
+        if still_alive:
+            _logger.warning("Delta feed workers did not stop before timeout: %s", ", ".join(still_alive))
+            return False
+        self._set_status("stopped")
+        return True
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -662,23 +722,30 @@ class DeltaFeed:
     def _run_forever(self) -> None:
         delay = 2.0
         attempts = 0
-        while True:
+        while not self._stop_event.is_set():
             attempts += 1
             self._set_status("connecting")
             _logger.info("Attempting WebSocket connection to %s (attempt %d, delay=%.1fs)", WS_URL, attempts, delay)
             try:
-                self.ws = websocket.WebSocketApp(
-                    WS_URL,
-                    on_open=self._on_open,
-                    on_message=self._on_message,
-                    on_error=self._on_error,
-                    on_close=self._on_close,
-                )
-                self.ws.run_forever(ping_interval=20, ping_timeout=10, skip_utf8_validation=True)
+                with self._lifecycle_lock:
+                    if self._stop_event.is_set():
+                        break
+                    ws = websocket.WebSocketApp(
+                        WS_URL,
+                        on_open=self._on_open,
+                        on_message=self._on_message,
+                        on_error=self._on_error,
+                        on_close=self._on_close,
+                    )
+                    self.ws = ws
+                ws.run_forever(ping_interval=20, ping_timeout=10, skip_utf8_validation=True)
                 _logger.info("WebSocket connection ended (run_forever returned) after %d attempt(s)", attempts)
             except Exception as exc:
-                self._set_status("disconnected", str(exc))
-                _logger.error("run_forever exception (attempt %d): %s", attempts, exc)
+                if not self._stop_event.is_set():
+                    self._set_status("disconnected", str(exc))
+                    _logger.error("run_forever exception (attempt %d): %s", attempts, exc)
+            if self._stop_event.is_set():
+                break
             with self.lock:
                 self.data["book_synced"] = False
                 self.data["sequence_gap_unresolved"] = True
@@ -687,12 +754,13 @@ class DeltaFeed:
                 self._checksum_logged = False
             self._set_status(f"reconnecting in {delay:.0f}s")
             _logger.info("Reconnecting in %.1fs", delay)
-            time.sleep(delay)
+            if self._stop_event.wait(delay):
+                break
             delay = min(delay * 1.6, 15.0)
+        self._set_status("stopped")
 
     def _health_loop(self) -> None:
-        while True:
-            time.sleep(30)
+        while not self._stop_event.wait(30.0):
             try:
                 self._log_health()
             except Exception:
@@ -955,14 +1023,16 @@ class DeltaFeed:
         banded depth) and finalizes large-trade clusters with a measured price
         response. Never raises; one bad sample must not kill the thread.
         """
-        while True:
+        while not self._stop_event.is_set():
             try:
                 interval = float(self.sample_interval) if self.sample_interval else 2.0
-                time.sleep(interval)
+                if self._stop_event.wait(interval):
+                    break
                 self._take_depth_sample()
             except Exception as exc:
                 _logger.warning("Depth sampler error: %s", exc)
-                time.sleep(2.0)
+                if self._stop_event.wait(2.0):
+                    break
 
     def _take_depth_sample(self) -> None:
         now = time.time()
@@ -2118,12 +2188,18 @@ def _render_order_book(d: dict[str, Any], depth_levels: int, compact: bool = Fal
 
 @st.cache_resource(show_spinner=False)
 def get_feed() -> DeltaFeed:
-    feed = DeltaFeed(load_initial_candles())
+    """Return the session-cached feed without starting background workers."""
+    return DeltaFeed(load_initial_candles())
+
+
+# Bare imports (including pytest collection) must not open network connections
+# or start daemon threads. Streamlit attaches a ScriptRunContext to its script
+# thread; only that runtime path is allowed to start the public market-data feed.
+if _STREAMLIT_SCRIPT_CONTEXT_ACTIVE:
+    feed = get_feed()
     feed.start()
-    return feed
-
-
-feed = get_feed()
+else:
+    feed = DeltaFeed()
 
 with st.sidebar:
     st.header("Terminal settings")
@@ -4174,9 +4250,15 @@ with st.expander("Feed diagnostics and limitations", expanded=False):
 
 # Independent Bybit V5 public feed adds cross-venue context without altering the
 # Delta-specific detector, signal engine, frozen evaluator, or release gate.
-bybit_analyst_context = render_bybit_cross_venue_panel(feed)
-okx_history_context = render_okx_history_panel()
-binance_analyst_context = render_binance_cross_venue_panel(feed)
+# Do not instantiate any cross-venue feeds when this module is imported by tests.
+if _STREAMLIT_SCRIPT_CONTEXT_ACTIVE:
+    bybit_analyst_context = render_bybit_cross_venue_panel(feed)
+    okx_history_context = render_okx_history_panel()
+    binance_analyst_context = render_binance_cross_venue_panel(feed)
+else:
+    bybit_analyst_context = {}
+    okx_history_context = {}
+    binance_analyst_context = {}
 ai_snapshot = feed.snapshot()
 ai_snapshot["cross_venue_market_data"] = bybit_analyst_context
 ai_snapshot["cross_venue_okx_history_context"] = okx_history_context

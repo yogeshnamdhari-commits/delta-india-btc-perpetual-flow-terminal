@@ -71,7 +71,7 @@ def main():
         replay={
             'params_version':getattr(oos,'PARAMS_VERSION','unknown'),
             'metrics':{}, 'stats':{'replay_skipped':'data coverage gates failed'},
-            'simulated_trades':[],
+            'signals':[], 'expired_candidates':[], 'simulated_trades':[],
         }
         replay_skipped=True
     segments={'train':[],'validation':[],'holdout_oos':[]}
@@ -124,7 +124,10 @@ def main():
         'funding':'Not modelled by the frozen default harness; results exclude funding.',
         'full_period':replay.get('metrics',{}),
         'segments':{name:oos.compute_metrics(records) for name,records in segments.items()},
-        'stats':replay.get('stats',{}), 'trades':full_trades,
+        'stats':replay.get('stats',{}),
+        'signals':replay.get('signals',[]),
+        'expired_candidates':replay.get('expired_candidates',[]),
+        'trades':full_trades,
         'limitations':[
             'A holdout generated after strategy development is retrospective, not prospective validation.',
             'A flow strategy needs real trade prints covering the bar window; candle-only coverage cannot pass this gate.',
