@@ -410,6 +410,68 @@ class TestConfirmationPaths(unittest.TestCase):
         self.assertIs(res.signal, se.Signal.WAIT)
         self.assertIn(se.WAIT_SETUP_EXPIRED, res.reason_codes)
 
+    def test_setup_is_confirmable_before_expiry(self):
+        snap = base_snapshot("bullish")
+        trigger_ts = STRUCT_TS + timedelta(minutes=5)
+        expiry_ts = trigger_ts + timedelta(minutes=3)
+        self.assertEqual(snap.ts_utc, expiry_ts - timedelta(minutes=1))
+
+        res = se.evaluate(snap)
+
+        self.assertIs(res.signal, se.Signal.BUY)
+        self.assertEqual(res.expires_at_utc, expiry_ts)
+
+    def test_setup_expires_at_exact_decision_boundary(self):
+        snap = base_snapshot("bullish")
+        expiry_ts = STRUCT_TS + timedelta(minutes=8)
+        object.__setattr__(snap, "ts_utc", expiry_ts)
+
+        res = se.evaluate(snap)
+
+        self.assertIs(res.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_SETUP_EXPIRED, res.reason_codes)
+
+    def test_setup_expires_after_decision_boundary(self):
+        snap = base_snapshot("bullish")
+        expiry_ts = STRUCT_TS + timedelta(minutes=8)
+        object.__setattr__(snap, "ts_utc", expiry_ts + timedelta(minutes=1))
+
+        res = se.evaluate(snap)
+
+        self.assertIs(res.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_SETUP_EXPIRED, res.reason_codes)
+
+    def test_expired_candidate_exposes_deterministic_identity_and_expiry(self):
+        snap = base_snapshot("bullish")
+        expiry_ts = STRUCT_TS + timedelta(minutes=8)
+        object.__setattr__(snap, "ts_utc", expiry_ts)
+
+        first = se.evaluate(snap)
+        second = se.evaluate(snap)
+
+        self.assertIs(first.signal, se.Signal.WAIT)
+        self.assertNotIn(first.signal, (se.Signal.BUY, se.Signal.SELL))
+        self.assertTrue(first.signal_id)
+        self.assertEqual(first.signal_id, second.signal_id)
+        self.assertEqual(first.expires_at_utc, expiry_ts)
+
+    def test_expired_candidate_preserves_complete_lifecycle_timestamps(self):
+        snap = base_snapshot("bullish")
+        trigger_ts = STRUCT_TS + timedelta(minutes=5)
+        expiry_ts = trigger_ts + timedelta(minutes=3)
+        decision_ts = expiry_ts
+        last_completed_ts = snap.candles_1m[-1].ts_utc
+        object.__setattr__(snap, "ts_utc", decision_ts)
+
+        res = se.evaluate(snap)
+
+        self.assertEqual(res.generated_at_utc, decision_ts)
+        self.assertEqual(res.trigger_ts_utc, trigger_ts)
+        self.assertEqual(res.last_completed_candle_ts_utc, last_completed_ts)
+        self.assertEqual(res.setup_candle_timestamp, STRUCT_TS)
+        self.assertEqual(res.expires_at_utc, expiry_ts)
+        self.assertIn(se.WAIT_SETUP_EXPIRED, res.reason_codes)
+
     def test_structural_invalidation_waits(self):
         snap = base_snapshot("bullish")
         # a later 1m bar closes below the order-block bottom -> setup invalidated
@@ -476,6 +538,30 @@ class TestSignalLifecycle(unittest.TestCase):
         self.assertEqual(eng.active_signals(), [])
         self.assertTrue(any(t["to"] == "EXPIRED" for t in eng.transitions))
 
+    def test_active_signal_retires_at_exact_expiry_even_when_trend_gate_waits(self):
+        eng = se.SignalEngine()
+        snap = base_snapshot("bullish")
+        confirmed = eng.evaluate(snap)
+        self.assertIs(confirmed.signal, se.Signal.BUY)
+        expiry_ts = confirmed.expires_at_utc
+        self.assertEqual(len(eng.active_signals()), 1)
+
+        # At the exact expiry boundary, make the 15m trend neutral. This forces
+        # a WAIT_NO_15M_TREND result without WAIT_SETUP_EXPIRED, so lifecycle
+        # retirement must be enforced by the active-trade expiry check itself.
+        object.__setattr__(snap, "ts_utc", expiry_ts)
+        # Simulate an otherwise-unconfirmable trend state without changing any
+        # production thresholds: equal EMA periods make the directional gate neutral.
+        eng.cfg["ema_fast"] = eng.cfg["ema_slow"]
+
+        waited = eng.evaluate(snap)
+
+        self.assertIs(waited.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_NO_15M_TREND, waited.reason_codes)
+        self.assertEqual(eng.active_signals(), [])
+        self.assertTrue(any(t["to"] == "EXPIRED" and t["ts_utc"] == expiry_ts.isoformat()
+                            for t in eng.transitions))
+
     def test_structural_invalidation_retires_signal(self):
         eng = se.SignalEngine()
         snap = base_snapshot("bullish")
@@ -539,6 +625,169 @@ class TestSignalLifecycle(unittest.TestCase):
         a = se.evaluate(base_snapshot("bullish"))
         b = se.evaluate(base_snapshot("bullish"))
         self.assertEqual(a.signal_id, b.signal_id)
+
+    def _rolling_trigger_snapshot(self, closes, count, ask_liquidity=None,
+                                   direction="bullish", bid_liquidity=None):
+        start = STRUCT_TS + timedelta(minutes=5)
+        bars = []
+        mirror = MIRROR if direction == "bearish" else 0.0
+        source_closes = [mirror - value for value in closes[:count]] if direction == "bearish" else closes[:count]
+        previous_close = mirror - 1096.0 if direction == "bearish" else 1096.0
+        for index, close in enumerate(source_closes):
+            open_price = previous_close
+            bars.append(c(start + timedelta(minutes=index), open_price,
+                          max(open_price, close) + 1.0,
+                          min(open_price, close) - 1.0, close))
+            previous_close = close
+        decision_ts = bars[-1].ts_utc
+        snap = base_snapshot(direction, ask_liq=ask_liquidity,
+                             bid_liq=bid_liquidity, trades_end=decision_ts)
+        object.__setattr__(snap, "candles_1m", bars)
+        object.__setattr__(snap, "ts_utc", decision_ts)
+        object.__setattr__(snap, "last_price", bars[-1].close)
+        object.__setattr__(snap, "bid", bars[-1].close - 0.5)
+        object.__setattr__(snap, "ask", bars[-1].close + 0.5)
+        object.__setattr__(snap, "recent_trades", build_trades(decision_ts, direction))
+        return snap
+
+    def test_trigger_window_is_anchored_and_expired_structure_cannot_retrigger(self):
+        closes = [1098.0] + [1090.0] * 6 + [1100.0]
+        engine = se.SignalEngine()
+        expired_id = None
+        final_result = None
+
+        for count in range(1, len(closes) + 1):
+            snap = self._rolling_trigger_snapshot(
+                closes, count,
+                [se.LiquidityLevel(
+                    price=1200.0, contracts=250.0, side="ask",
+                    observed_ts_utc=(STRUCT_TS + timedelta(minutes=5 + count - 1)))]
+                if count == len(closes)
+                else [],
+            )
+            final_result = engine.evaluate(snap, now_utc=snap.ts_utc)
+            if count == 4:
+                self.assertIn(se.WAIT_SETUP_EXPIRED, final_result.reason_codes)
+                expired_id = final_result.signal_id
+
+        self.assertTrue(expired_id)
+        self.assertIs(final_result.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_SETUP_EXPIRED, final_result.reason_codes)
+        self.assertEqual(final_result.signal_id, expired_id)
+        self.assertEqual(engine.active_signals(), [])
+
+    def test_bearish_trigger_window_is_anchored_and_expired_structure_cannot_retrigger(self):
+        closes = [1098.0] + [1090.0] * 6 + [1100.0]
+        engine = se.SignalEngine()
+        expired_id = None
+        final_result = None
+
+        for count in range(1, len(closes) + 1):
+            snap = self._rolling_trigger_snapshot(
+                closes, count, direction="bearish",
+                bid_liquidity=[se.LiquidityLevel(
+                    price=1000.0, contracts=250.0, side="bid",
+                    observed_ts_utc=(STRUCT_TS + timedelta(minutes=5 + count - 1)))]
+                if count == len(closes)
+                else [],
+            )
+            final_result = engine.evaluate(snap, now_utc=snap.ts_utc)
+            if count == 4:
+                self.assertIn(se.WAIT_SETUP_EXPIRED, final_result.reason_codes)
+                expired_id = final_result.signal_id
+
+        self.assertTrue(expired_id)
+        self.assertIs(final_result.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_SETUP_EXPIRED, final_result.reason_codes)
+        self.assertEqual(final_result.signal_id, expired_id)
+        self.assertEqual(engine.active_signals(), [])
+
+    def test_nonexpired_wait_preserves_legacy_signal_metadata_contract(self):
+        snap = base_snapshot("bullish", ask_liq=[])
+
+        result = se.evaluate(snap)
+
+        self.assertIs(result.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_NO_VALID_TARGET, result.reason_codes)
+        self.assertEqual(result.signal_id, "")
+        self.assertIsNone(result.trigger_ts_utc)
+        self.assertIsNone(result.last_completed_candle_ts_utc)
+        self.assertEqual(
+            result.expires_at_utc,
+            snap.candles_1m[-1].ts_utc + timedelta(minutes=se.DEFAULT_CONFIG["expiry_1m_candles"]),
+        )
+        self.assertEqual(result.setup_candle_timestamp, STRUCT_TS)
+
+    def test_sixth_completed_bar_is_inclusive_trigger_window_boundary(self):
+        closes = [1090.0] * 5 + [1098.0]
+        decision_bar_ts = STRUCT_TS + timedelta(minutes=10)
+        snap = self._rolling_trigger_snapshot(
+            closes, len(closes),
+            [se.LiquidityLevel(
+                price=1200.0, contracts=250.0, side="ask",
+                observed_ts_utc=decision_bar_ts,
+            )],
+        )
+
+        result = se.evaluate(snap)
+
+        self.assertIs(result.signal, se.Signal.BUY)
+        self.assertEqual(result.expires_at_utc, STRUCT_TS + timedelta(minutes=13))
+
+    def test_seventh_completed_bar_buy_trigger_is_excluded(self):
+        # The first six eligible bars stay below the bullish trigger threshold;
+        # only bar seven crosses. The frozen six-bar window must reject it.
+        closes = [1090.0] * 6 + [1098.0]
+        snap = self._rolling_trigger_snapshot(
+            closes, len(closes), ask_liquidity=[], direction="bullish"
+        )
+
+        result = se.evaluate(snap)
+
+        self.assertIs(result.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_NO_1M_TRIGGER, result.reason_codes)
+
+    def test_seventh_completed_bar_sell_trigger_is_excluded(self):
+        # Mirror the bullish case around MIRROR: only the seventh eligible bar
+        # crosses below the bearish trigger threshold.
+        closes = [1090.0] * 6 + [1098.0]
+        snap = self._rolling_trigger_snapshot(
+            closes, len(closes), bid_liquidity=[], direction="bearish"
+        )
+
+        result = se.evaluate(snap)
+
+        self.assertIs(result.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_NO_1M_TRIGGER, result.reason_codes)
+
+    def test_nonexpired_wait_is_not_duplicate_suppressed_while_signal_active(self):
+        engine = se.SignalEngine()
+        confirmed = engine.evaluate(base_snapshot("bullish"))
+        self.assertIs(confirmed.signal, se.Signal.BUY)
+        self.assertEqual(len(engine.active_signals()), 1)
+
+        waited = engine.evaluate(base_snapshot("bullish", ask_liq=[]))
+
+        self.assertIs(waited.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_NO_VALID_TARGET, waited.reason_codes)
+        self.assertEqual(waited.signal_id, "")
+        self.assertFalse(waited.duplicate_suppressed)
+        self.assertEqual(len(engine.active_signals()), 1)
+
+    def test_expired_wait_is_never_labelled_duplicate_suppressed(self):
+        engine = se.SignalEngine()
+        confirmed = engine.evaluate(base_snapshot("bullish"))
+        self.assertIs(confirmed.signal, se.Signal.BUY)
+        expiry = confirmed.expires_at_utc
+        self.assertEqual(len(engine.active_signals()), 1)
+
+        expired_snapshot = base_snapshot("bullish")
+        object.__setattr__(expired_snapshot, "ts_utc", expiry)
+        waited = engine.evaluate(expired_snapshot, now_utc=expiry - timedelta(seconds=1))
+
+        self.assertIs(waited.signal, se.Signal.WAIT)
+        self.assertIn(se.WAIT_SETUP_EXPIRED, waited.reason_codes)
+        self.assertFalse(waited.duplicate_suppressed)
 
 
 class TestRiskGeometry(unittest.TestCase):

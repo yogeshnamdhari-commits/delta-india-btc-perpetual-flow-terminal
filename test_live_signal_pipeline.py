@@ -112,6 +112,27 @@ class TestFeedToDecisionPipeline(unittest.TestCase):
         r=self.record(); out=json.loads(json.dumps(r,allow_nan=False))
         self.assertEqual(out["decision"],r["decision"])
         self.assertEqual(out["signal_type"],r["signal_type"])
+    def test_nonexpired_wait_keeps_legacy_metadata_through_live_bridge(self):
+        import test_signal_engine as S
+        from unittest.mock import patch
+
+        snapshot = S.base_snapshot("bullish", ask_liq=[])
+        now = snapshot.ts_utc
+        feed_data = healthy_feed(now)
+        with patch("signal_integration_bridge.build_market_snapshot", return_value=snapshot):
+            record = evaluate_feed_snapshot(
+                feed_data, engine=SignalEngine(), now=now,
+                min_5m_candles=1, min_15m_candles=1,
+            )
+
+        self.assertEqual(record["decision"], "WAIT")
+        self.assertEqual(record["blocking_reason"], "WAIT_NO_VALID_TARGET")
+        engine_result = record["engine_result"]
+        self.assertEqual(engine_result["signal_id"], "")
+        self.assertEqual(engine_result["expires_at_utc"],
+                         (snapshot.candles_1m[-1].ts_utc + timedelta(minutes=3)).isoformat())
+        self.assertFalse(engine_result["duplicate_suppressed"])
+
     def test_compatibility_wrapper_uses_same_pipeline(self):
         r=evaluate_live_signal(FakeFeed(self.data),engine=SignalEngine(),now=self.now)
         self.assertIn(r["decision"],("WAIT","BUY","SELL","BLOCKED"))

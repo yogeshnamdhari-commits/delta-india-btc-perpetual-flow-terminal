@@ -190,15 +190,18 @@ class TestConfigFreezeAndPolicy(unittest.TestCase):
     def test_frozen_config_file_matches_module(self):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "oos_config_frozen.json")
-        if not os.path.exists(path):
-            self.skipTest("oos_config_frozen.json not written yet")
+        self.assertTrue(os.path.isfile(path), "tracked frozen OOS config fixture is required")
         import json
         with open(path, encoding="utf-8") as fh:
             frozen = json.load(fh)
-        self.assertEqual(frozen["params_version"], oos.PARAMS_VERSION)
-        for key, value in oos.FROZEN_OOS_CONFIG.items():
-            if key in frozen and key != "params_version":
-                self.assertEqual(frozen[key], value, f"frozen config drift on {key}")
+
+        expected_keys = set(oos.FROZEN_OOS_CONFIG) | {"engine_overrides"}
+        self.assertEqual(set(frozen), expected_keys,
+                         "frozen config fixture must contain every expected key and no extras")
+        frozen_oos_config = {key: value for key, value in frozen.items()
+                             if key != "engine_overrides"}
+        self.assertEqual(frozen_oos_config, oos.FROZEN_OOS_CONFIG,
+                         "frozen OOS config drift or missing configuration key")
         self.assertEqual(frozen["engine_overrides"], oos.FROZEN_ENGINE_OVERRIDES)
 
     def test_report_declares_policy_relaxation(self):
@@ -267,6 +270,184 @@ class TestSimulationAndCosts(unittest.TestCase):
             oos.ReplayRunner(synth_1m(1000), [], config={"slippage_bps": -1.0})
 
 
+class TestSimulationDispositions(unittest.TestCase):
+    def _result(self, **overrides):
+        values = dict(
+            signal=se.Signal.BUY, state=se.SignalState.BUY_CONFIRMED,
+            signal_id="expiry-test", generated_at_utc=ts_of(999),
+            proposed_entry=100.0, stop_loss=90.0, take_profit=130.0,
+            invalidation_price=95.0, risk_distance=10.0, reward_distance=30.0,
+            risk_reward_ratio=3.0, setup_timeframe="5m",
+            setup_candle_timestamp=ts_of(990), expires_at_utc=ts_of(1005),
+        )
+        values.update(overrides)
+        return se.SignalResult(**values)
+
+    def _bars(self, start=1000, end=1004):
+        return [bar(ts_of(i), 100.0, 102.0, 98.0, 100.0) for i in range(start, end + 1)]
+
+    def _runner(self, bars):
+        return oos.ReplayRunner(bars, [], config={"min_history_1m": 1})
+
+    def test_simulation_entry_before_expiry_is_eligible(self):
+        bars = self._bars()
+        runner = self._runner(bars)
+        disposition = runner.simulate_with_disposition(
+            self._result(), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.status, "SIMULATED")
+        self.assertIsNone(disposition.reason_code)
+        self.assertIsNotNone(disposition.trade)
+        self.assertEqual(disposition.trade["outcome"], "timeout")
+
+    def test_simulation_entry_exactly_at_expiry_is_rejected(self):
+        bars = self._bars(start=1005, end=1005)
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(), ts_of(1005), bars[0])
+
+        self.assertEqual(disposition.status, "REJECTED")
+        self.assertEqual(disposition.reason_code, "REJECTED_EXPIRED_AT_ENTRY")
+        self.assertEqual(disposition.rejection_ts_utc, ts_of(1005).isoformat())
+        self.assertIsNone(disposition.trade)
+
+    def test_simulation_entry_after_expiry_is_rejected(self):
+        bars = self._bars(start=1006, end=1006)
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(), ts_of(1006), bars[0])
+
+        self.assertEqual(disposition.status, "REJECTED")
+        self.assertEqual(disposition.reason_code, "REJECTED_EXPIRED_AT_ENTRY")
+        self.assertEqual(disposition.rejection_ts_utc, ts_of(1006).isoformat())
+
+    def test_expired_entry_takes_precedence_over_missing_entry_bar(self):
+        disposition = self._runner([]).simulate_with_disposition(
+            self._result(), ts_of(1005), None)
+
+        self.assertEqual(disposition.reason_code, "REJECTED_EXPIRED_AT_ENTRY")
+        self.assertEqual(disposition.rejection_ts_utc, ts_of(1005).isoformat())
+
+    def test_non_minute_aligned_expiry_is_rejected(self):
+        expiry = ts_of(1005) + timedelta(seconds=30)
+        bars = self._bars()
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(expires_at_utc=expiry), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.reason_code, "REJECTED_EXPIRY_NOT_BAR_ALIGNED")
+        self.assertEqual(disposition.rejection_ts_utc, expiry.isoformat())
+
+    def test_missing_entry_bar_within_valid_window_is_rejected(self):
+        disposition = self._runner([]).simulate_with_disposition(
+            self._result(), ts_of(1000), None)
+
+        self.assertEqual(disposition.reason_code, "REJECTED_MISSING_ENTRY_BAR")
+        self.assertEqual(disposition.rejection_ts_utc, ts_of(1000).isoformat())
+
+    def test_missing_or_wrong_side_levels_are_invalid_levels(self):
+        bars = self._bars()
+        runner = self._runner(bars)
+        invalid_results = (
+            self._result(stop_loss=None),
+            self._result(take_profit=None),
+            self._result(stop_loss=101.0),
+            self._result(take_profit=99.0),
+            self._result(proposed_entry=float("nan")),
+        )
+        for result in invalid_results:
+            with self.subTest(result=result):
+                disposition = runner.simulate_with_disposition(
+                    result, ts_of(1000), bars[0])
+                self.assertEqual(disposition.reason_code, "REJECTED_INVALID_LEVELS")
+                self.assertEqual(disposition.rejection_ts_utc, ts_of(1000).isoformat())
+
+    def test_directionally_invalid_supplied_invalidation_level_is_rejected(self):
+        bars = self._bars()
+        runner = self._runner(bars)
+        invalid_results = (
+            self._result(invalidation_price=105.0),
+            self._result(signal=se.Signal.SELL, proposed_entry=100.0,
+                         stop_loss=110.0, take_profit=80.0,
+                         invalidation_price=95.0),
+        )
+        for result in invalid_results:
+            with self.subTest(signal=result.signal, invalidation=result.invalidation_price):
+                disposition = runner.simulate_with_disposition(
+                    result, ts_of(1000), bars[0])
+                self.assertEqual(disposition.reason_code, "REJECTED_INVALID_LEVELS")
+                self.assertEqual(disposition.rejection_ts_utc, ts_of(1000).isoformat())
+
+    def test_entry_gap_through_stop_or_target_has_distinct_reason(self):
+        bars = [bar(ts_of(1000), 120.0, 122.0, 118.0, 120.0)]
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(stop_loss=90.0, take_profit=110.0), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.reason_code, "REJECTED_ENTRY_GAP_THROUGH_LEVEL")
+        self.assertEqual(disposition.rejection_ts_utc, ts_of(1000).isoformat())
+
+    def test_bar_gap_inside_path_is_path_gap_not_incomplete_history(self):
+        bars = [bar(ts_of(i), 100.0, 102.0, 98.0, 100.0)
+                for i in (1000, 1001, 1003, 1004)]
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.reason_code, "REJECTED_PATH_GAP")
+        self.assertEqual(disposition.rejection_ts_utc, ts_of(1002).isoformat())
+
+    def test_gap_before_expiry_is_path_gap_when_next_observed_bar_is_expiry_bar(self):
+        expiry = ts_of(1005)
+        bars = [bar(ts_of(1000), 100.0, 102.0, 98.0, 100.0),
+                bar(expiry, 100.0, 102.0, 98.0, 100.0)]
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(expires_at_utc=expiry), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.reason_code, "REJECTED_PATH_GAP")
+        self.assertEqual(disposition.rejection_ts_utc, ts_of(1001).isoformat())
+
+    def test_contiguous_history_ending_before_expiry_is_incomplete_history(self):
+        bars = self._bars(start=1000, end=1002)
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.reason_code, "REJECTED_INCOMPLETE_HISTORY_BEFORE_EXPIRY")
+        self.assertEqual(disposition.rejection_ts_utc, ts_of(1003).isoformat())
+
+    def test_timeout_requires_complete_last_candle_through_expiry(self):
+        bars = self._bars(start=1000, end=1003)
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.reason_code, "REJECTED_INCOMPLETE_HISTORY_BEFORE_EXPIRY")
+
+    def test_timeout_final_eligible_candle_closes_exactly_at_expiry(self):
+        expiry = ts_of(1005)
+        bars = self._bars(start=1000, end=1004)
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(expires_at_utc=expiry), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.status, "SIMULATED")
+        self.assertEqual(disposition.trade["outcome"], "timeout")
+        self.assertEqual(disposition.trade["exit_bar_open_ts_utc"], ts_of(1004).isoformat())
+        self.assertEqual(disposition.trade["exit_ts_utc"], expiry.isoformat())
+
+    def test_candle_opening_at_expiry_is_excluded(self):
+        expiry = ts_of(1005)
+        bars = self._bars(start=1000, end=1004)
+        bars.append(bar(expiry, 100.0, 140.0, 80.0, 100.0))
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(expires_at_utc=expiry), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.status, "SIMULATED")
+        self.assertEqual(disposition.trade["outcome"], "timeout")
+
+    def test_timeout_exit_timestamp_is_expiry_boundary(self):
+        expiry = ts_of(1005)
+        bars = self._bars()
+        disposition = self._runner(bars).simulate_with_disposition(
+            self._result(expires_at_utc=expiry), ts_of(1000), bars[0])
+
+        self.assertEqual(disposition.trade["exit_ts_utc"], expiry.isoformat())
+        self.assertEqual(disposition.trade["exit_bar_open_ts_utc"], ts_of(1004).isoformat())
+
+
 class TestDataLoading(unittest.TestCase):
     def test_csv_roundtrip_and_validation(self):
         bars = synth_1m(20)
@@ -298,6 +479,198 @@ class TestDataLoading(unittest.TestCase):
                 import json
                 json.dump(payload, fh)
             self.assertEqual(oos.load_bars_json(path), bars)
+
+
+class TestReplayAuditRecords(unittest.TestCase):
+    def _synthetic_replay(self):
+        bars, trades, first, _ = _synthetic_series("bullish")
+        ask_liq = [se.LiquidityLevel(price=1200.0, contracts=250.0, side="ask",
+                                     observed_ts_utc=first - timedelta(minutes=10))]
+        return oos.run_replay(bars, trades, config={"min_history_1m": 900},
+                              ask_liquidity=ask_liq)
+
+    def test_every_confirmed_signal_has_exactly_one_simulation_disposition(self):
+        replay = self._synthetic_replay()
+
+        self.assertEqual(len(replay["signals"]), replay["stats"]["signals_confirmed"])
+        for record in replay["signals"]:
+            self.assertIn(record["simulation_status"], ("SIMULATED", "REJECTED"))
+            self.assertTrue(record["audit_event_key"])
+
+    def test_simulation_rejection_is_retained_on_signal_record(self):
+        from unittest.mock import patch
+        rejected = oos.SimulationDisposition(
+            "REJECTED", "REJECTED_EXPIRED_AT_ENTRY", ts_of(1000).isoformat())
+        with patch.object(oos.ReplayRunner, "simulate_with_disposition", return_value=rejected):
+            replay = self._synthetic_replay()
+
+        self.assertTrue(replay["signals"])
+        self.assertEqual(replay["signals"][0]["simulation_status"], "REJECTED")
+        self.assertEqual(replay["signals"][0]["simulation_rejection_reason"],
+                         "REJECTED_EXPIRED_AT_ENTRY")
+        self.assertEqual(replay["signals"][0]["rejection_ts_utc"], ts_of(1000).isoformat())
+        self.assertEqual(replay["stats"]["signals_rejected"], replay["stats"]["signals_confirmed"])
+
+    def test_replay_stats_reconcile_confirmed_simulated_and_rejected_counts(self):
+        replay = self._synthetic_replay()
+        stats = replay["stats"]
+
+        self.assertEqual(len(replay["signals"]), stats["signals_confirmed"])
+        self.assertEqual(stats["signals_simulated"] + stats["signals_rejected"],
+                         stats["signals_confirmed"])
+        self.assertEqual(len(replay["simulated_trades"]), stats["signals_simulated"])
+
+    def test_same_signal_id_at_different_decision_times_has_unique_audit_keys(self):
+        first = oos.signal_audit_key("same-setup", ts_of(1000))
+        second = oos.signal_audit_key("same-setup", ts_of(1001))
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, f"same-setup|{ts_of(1000).isoformat()}")
+
+    def _replay_with_one_expired_preconfirmation_candidate(self):
+        from unittest.mock import patch
+        bars, trades, first, _ = _synthetic_series("bullish")
+        original_evaluate = se.SignalEngine.evaluate
+        injected = {"done": False}
+
+        def evaluate_with_one_expired(self, snap, now_utc=None):
+            now = now_utc or snap.ts_utc
+            if not injected["done"]:
+                injected["done"] = True
+                trigger = now - timedelta(minutes=4)
+                return se.SignalResult(
+                    signal=se.Signal.WAIT, state=se.SignalState.WAIT,
+                    signal_id="expired-preconfirmation-001", generated_at_utc=now,
+                    trigger_ts_utc=trigger,
+                    last_completed_candle_ts_utc=snap.candles_1m[-1].ts_utc,
+                    setup_candle_timestamp=now - timedelta(minutes=30),
+                    expires_at_utc=trigger + timedelta(minutes=3),
+                    reason_codes=[se.WAIT_SETUP_EXPIRED],
+                )
+            return original_evaluate(self, snap, now_utc=now)
+
+        with patch.object(se.SignalEngine, "evaluate", autospec=True,
+                          side_effect=evaluate_with_one_expired):
+            return oos.run_replay(bars, trades, config={"min_history_1m": 900})
+
+    def test_expired_preconfirmation_candidates_are_visible_separately(self):
+        replay = self._replay_with_one_expired_preconfirmation_candidate()
+
+        self.assertEqual(len(replay["expired_candidates"]), 1)
+        candidate = replay["expired_candidates"][0]
+        self.assertEqual(candidate["signal_id"], "expired-preconfirmation-001")
+        self.assertEqual(candidate["reason_code"], se.WAIT_SETUP_EXPIRED)
+
+    def test_expired_candidates_preserve_all_four_lifecycle_timestamps(self):
+        replay = self._replay_with_one_expired_preconfirmation_candidate()
+        candidate = replay["expired_candidates"][0]
+
+        for field in ("trigger_ts_utc", "last_completed_candle_ts_utc",
+                      "setup_candle_timestamp", "expires_at_utc"):
+            self.assertTrue(candidate[field], field)
+
+    def test_expired_candidates_retain_deterministic_signal_id_and_decision_timestamp(self):
+        replay = self._replay_with_one_expired_preconfirmation_candidate()
+        candidate = replay["expired_candidates"][0]
+
+        self.assertEqual(candidate["signal_id"], "expired-preconfirmation-001")
+        self.assertTrue(candidate["decision_ts_utc"])
+        self.assertEqual(candidate["audit_event_key"],
+                         oos.signal_audit_key(candidate["signal_id"],
+                                              oos._parse_ts(candidate["decision_ts_utc"])))
+
+    def test_expired_candidate_missing_audit_metadata_fails_closed(self):
+        from unittest.mock import patch
+        bars, trades, _, _ = _synthetic_series("bullish")
+
+        def missing_metadata(self, snap, now_utc=None):
+            now = now_utc or snap.ts_utc
+            return se.SignalResult(
+                signal=se.Signal.WAIT, state=se.SignalState.WAIT,
+                generated_at_utc=now, reason_codes=[se.WAIT_SETUP_EXPIRED],
+            )
+
+        with patch.object(se.SignalEngine, "evaluate", autospec=True,
+                          side_effect=missing_metadata):
+            with self.assertRaisesRegex(oos.ReplayDataError, "expired candidate missing audit metadata"):
+                oos.run_replay(bars, trades, config={"min_history_1m": 900})
+
+    def test_expired_candidates_are_not_counted_as_confirmed_signals(self):
+        replay = self._replay_with_one_expired_preconfirmation_candidate()
+
+        self.assertEqual(replay["stats"]["signals_confirmed"], 0)
+        self.assertEqual(replay["signals"], [])
+        self.assertEqual(len(replay["expired_candidates"]), 1)
+
+
+class TestSignalLifecycleAuditRegression(unittest.TestCase):
+    def _snapshots(self, liquidity_observed_at):
+        import test_signal_engine as S
+
+        first = S.STRUCT_TS + timedelta(minutes=5)
+        closes = [1098.0] + [1090.0] * 6 + [1100.0]
+        snapshots = []
+        for decision_offset in range(1, len(closes) + 1):
+            now = first + timedelta(minutes=decision_offset)
+            visible_closes = closes[:decision_offset]
+            bars = []
+            previous_close = 1096.0
+            for index, close in enumerate(visible_closes):
+                open_price = previous_close
+                bars.append(S.c(
+                    first + timedelta(minutes=index), open_price,
+                    max(open_price, close) + 1.0,
+                    min(open_price, close) - 1.0, close,
+                ))
+                previous_close = close
+
+            ask_liquidity = []
+            if liquidity_observed_at <= now:
+                ask_liquidity = [se.LiquidityLevel(
+                    price=1200.0, contracts=250.0, side="ask",
+                    observed_ts_utc=liquidity_observed_at,
+                )]
+            snap = S.base_snapshot(
+                "bullish", ask_liq=ask_liquidity,
+                trades_end=now - timedelta(seconds=1),
+            )
+            object.__setattr__(snap, "candles_1m", bars)
+            object.__setattr__(snap, "ts_utc", now)
+            object.__setattr__(snap, "last_price", bars[-1].close)
+            object.__setattr__(snap, "bid", bars[-1].close - 0.5)
+            object.__setattr__(snap, "ask", bars[-1].close + 0.5)
+            object.__setattr__(snap, "recent_trades", S.build_trades(
+                now - timedelta(seconds=1), "bullish"))
+            snapshots.append((now, snap))
+        return snapshots
+
+    def _run_engine_replay(self, liquidity_observed_at):
+        from unittest.mock import patch
+
+        snapshots = self._snapshots(liquidity_observed_at)
+        with patch.object(
+            oos.ReplayRunner, "iter_snapshots", autospec=True,
+            side_effect=lambda runner: iter(snapshots),
+        ):
+            return oos.run_replay([], [], config={"min_history_1m": 1})
+
+    def test_expired_candidate_then_later_cross_does_not_confirm_same_structure(self):
+        first = __import__("test_signal_engine").STRUCT_TS + timedelta(minutes=5)
+        replay = self._run_engine_replay(first + timedelta(minutes=8))
+
+        self.assertTrue(replay["expired_candidates"])
+        self.assertEqual(replay["signals"], [])
+
+    def test_confirmed_signal_then_expiry_does_not_reconfirm_same_structure(self):
+        first = __import__("test_signal_engine").STRUCT_TS + timedelta(minutes=5)
+        replay = self._run_engine_replay(first)
+
+        self.assertEqual(len(replay["signals"]), 1)
+        confirmed_id = replay["signals"][0]["signal_id"]
+        self.assertFalse(any(
+            item["signal_id"] == confirmed_id
+            for item in replay["expired_candidates"]
+        ))
 
 
 if __name__ == "__main__":
@@ -352,6 +725,7 @@ def _synthetic_series(direction="bullish"):
     return bars, trades, first, closing
 
 
+
 class TestEndToEndSyntheticReplay(unittest.TestCase):
     """Synthetic end-to-end proof that the harness can drive the frozen engine.
 
@@ -396,6 +770,39 @@ class TestEndToEndSyntheticReplay(unittest.TestCase):
         self.assertGreater(trade["costs_r"], 0)
         self.assertLess(trade["net_r"], trade["gross_r"])
         self.assertGreaterEqual(trade["planned_rr"], 1.5)
+
+    def test_confirmed_signal_is_not_reclassified_as_preconfirmation_expired(self):
+        bars, trades, first, _ = _synthetic_series("bullish")
+        ask_liq = [se.LiquidityLevel(
+            price=1200.0, contracts=250.0, side="ask",
+            observed_ts_utc=first - timedelta(minutes=10))]
+        config = {"min_history_1m": 900}
+
+        initial = oos.run_replay(bars, trades, config=config, ask_liquidity=ask_liq)
+        self.assertEqual(len(initial["signals"]), 1)
+        confirmed_signal_id = initial["signals"][0]["signal_id"]
+        expiry_ts = oos._parse_ts(initial["signals"][0]["expires_ts_utc"])
+
+        # Continue the same contiguous synthetic path through the exclusive
+        # expiry boundary so the engine emits WAIT_SETUP_EXPIRED for this setup.
+        last = bars[-1]
+        while last.ts_utc < expiry_ts:
+            next_ts = last.ts_utc + timedelta(minutes=1)
+            close = last.close
+            last = bar(next_ts, close, close + 0.2, close - 0.2, close)
+            bars.append(last)
+
+        replay = oos.run_replay(bars, trades, config=config, ask_liquidity=ask_liq)
+        confirmed_ids = {record["signal_id"] for record in replay["signals"]}
+        expired_ids = {record["signal_id"] for record in replay["expired_candidates"]}
+
+        self.assertIn(confirmed_signal_id, confirmed_ids)
+        self.assertNotIn(
+            confirmed_signal_id,
+            expired_ids,
+            "a confirmed setup must not be reclassified as a pre-confirmation expiry",
+        )
+        self.assertTrue(confirmed_ids.isdisjoint(expired_ids))
 
     def test_report_carries_policy_and_version(self):
         rep = self._run("bullish")

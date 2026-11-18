@@ -10,8 +10,10 @@ import json
 import os
 import tempfile
 import time
+import threading
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import app
 
@@ -27,17 +29,114 @@ class TestSignalDecisionLogging(unittest.TestCase):
         os.environ["DELTA_EVENT_LOG_FILE"] = self.event_log
         os.environ["DELTA_DECISION_LOG_FILE"] = self.decision_log
 
+        self.original_paths = (
+            app.EVENT_LOG_FILE,
+            app.EVENT_LOG_FILE_FULL,
+            app.DECISION_LOG_FILE,
+        )
+        self.original_event_lock = app._event_lock
         app.EVENT_LOG_FILE = self.event_log
         app.EVENT_LOG_FILE_FULL = self.full_log
         app.DECISION_LOG_FILE = self.decision_log
-
-        app._event_lock = __import__("threading").RLock()
+        app._event_lock = threading.RLock()
 
     def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self.original_env)
+        # Stop background writers before restoring log destinations or deleting
+        # the temporary directory used by this test case. Cleanup must still run
+        # when shutdown times out so later tests never inherit stale paths/env.
+        stop = getattr(getattr(app, "feed", None), "stop", None)
+        stopped = True
+        try:
+            if callable(stop):
+                stopped = stop(timeout=2.0)
+        finally:
+            app.EVENT_LOG_FILE, app.EVENT_LOG_FILE_FULL, app.DECISION_LOG_FILE = self.original_paths
+            app._event_lock = self.original_event_lock
+            os.environ.clear()
+            os.environ.update(self.original_env)
+            import shutil
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+        if callable(stop):
+            self.assertTrue(stopped, "Delta feed threads must stop before teardown")
+
+    def test_teardown_restores_state_when_feed_stop_times_out(self):
         import shutil
-        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+        nested_case = TestSignalDecisionLogging(
+            methodName="test_import_does_not_start_delta_feed_threads")
+        nested_case.setUp()
+        nested_dir = nested_case.test_dir
+        expected_paths = nested_case.original_paths
+        expected_lock = nested_case.original_event_lock
+        expected_env = nested_case.original_env.copy()
+
+        try:
+            with patch.object(app.feed, "stop", return_value=False):
+                with self.assertRaisesRegex(AssertionError, "must stop before teardown"):
+                    nested_case.tearDown()
+
+            self.assertEqual(
+                (app.EVENT_LOG_FILE, app.EVENT_LOG_FILE_FULL, app.DECISION_LOG_FILE),
+                expected_paths,
+            )
+            self.assertIs(app._event_lock, expected_lock)
+            self.assertEqual(os.environ, expected_env)
+            self.assertFalse(os.path.exists(nested_dir))
+        finally:
+            # Keep this regression self-contained even when run against the
+            # broken teardown implementation (the expected RED state).
+            app.EVENT_LOG_FILE, app.EVENT_LOG_FILE_FULL, app.DECISION_LOG_FILE = expected_paths
+            app._event_lock = expected_lock
+            os.environ.clear()
+            os.environ.update(expected_env)
+            shutil.rmtree(nested_dir, ignore_errors=True)
+
+    def test_import_does_not_start_delta_feed_threads(self):
+        self.assertIsNone(app.feed.thread, "module import must not start the Delta WebSocket")
+        self.assertIsNone(app.feed._hthread, "module import must not start the health logger")
+        self.assertIsNone(app.feed._sthread, "module import must not start the depth sampler")
+
+    def test_market_data_loaders_do_not_call_rest_without_streamlit_context(self):
+        with patch.object(app, "_STREAMLIT_SCRIPT_CONTEXT_ACTIVE", False), \
+                patch.object(app.requests, "get") as rest_get:
+            app.load_initial_candles()
+            app.load_daily_ticker_metrics()
+            app.load_open_interest_history()
+            app.load_intraday_open_interest_history()
+            app.load_daily_volume_history()
+            app.load_breakout_candle_history()
+
+        rest_get.assert_not_called()
+
+    def test_delta_feed_stop_closes_socket_and_joins_worker_threads(self):
+        class BlockingWebSocket:
+            def __init__(self, *_args, **_kwargs):
+                self.closed = threading.Event()
+                self.sock = type("SocketState", (), {"connected": True})()
+
+            def run_forever(self, **_kwargs):
+                self.closed.wait(timeout=5.0)
+
+            def close(self):
+                self.closed.set()
+
+        feed = app.DeltaFeed()
+        with patch.object(app.websocket, "WebSocketApp", BlockingWebSocket):
+            feed.start()
+            deadline = time.monotonic() + 1.0
+            while feed.ws is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertIsNotNone(feed.ws, "feed worker should construct its WebSocket client")
+            ws = feed.ws
+            self.assertTrue(feed.stop(timeout=1.0))
+
+        self.assertTrue(ws.closed.is_set(), "stop must close the WebSocket to unblock run_forever")
+        for worker in (feed.thread, feed._hthread, feed._sthread):
+            self.assertIsNotNone(worker)
+            self.assertFalse(worker.is_alive(), f"worker {worker.name} survived stop()")
+        self.assertTrue(feed.stop(timeout=0.1), "stop should be idempotent")
 
     def test_log_event_writes_to_decision_file(self):
         decision = {
