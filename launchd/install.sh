@@ -51,9 +51,25 @@ for plist in "$MAIN_PLIST" "$WATCHDOG_PLIST"; do
   fi
 done
 
-# If our own service is currently loaded, stop it before checking the port.
+# Detect whether this install already owns the running dashboard.
+main_loaded=0
 if launchctl print "$gui_domain/$MAIN_LABEL" >/dev/null 2>&1; then
+  main_loaded=1
+fi
+if [[ "$main_loaded" -eq 0 ]] && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port $PORT is already occupied. Stop the existing Streamlit process with Ctrl+C, then run this installer again. No process was killed." >&2
+  exit 1
+fi
+
+# Boot out both jobs before replacing their property lists.
+if [[ "$main_loaded" -eq 1 ]]; then
   launchctl bootout "$gui_domain/$MAIN_LABEL"
+fi
+if launchctl print "$gui_domain/$WATCHDOG_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "$gui_domain/$WATCHDOG_LABEL"
+fi
+
+if [[ "$main_loaded" -eq 1 ]]; then
   for _ in {1..20}; do
     if ! lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then break; fi
     sleep 1
@@ -61,7 +77,7 @@ if launchctl print "$gui_domain/$MAIN_LABEL" >/dev/null 2>&1; then
 fi
 
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "Port $PORT is already occupied. Stop the existing Streamlit process with Ctrl+C, then run this installer again. No process was killed." >&2
+  echo "Port $PORT is still occupied after stopping this project's service. No unrelated process was killed." >&2
   exit 1
 fi
 
