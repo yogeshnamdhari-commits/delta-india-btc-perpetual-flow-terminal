@@ -64,3 +64,34 @@ def test_restart_requires_failure_threshold_and_respects_cooldown():
         consecutive_failures=3, last_restart_epoch=950, now_epoch=1000,
         cooldown_seconds=600,
     )
+
+
+def test_launchd_shell_scripts_pass_bash_syntax_check():
+    from pathlib import Path
+    import subprocess
+
+    root = Path(__file__).resolve().parent
+    for relative in (
+        "launchd/run_dashboard.sh",
+        "launchd/install.sh",
+        "launchd/uninstall.sh",
+    ):
+        result = subprocess.run(
+            ["bash", "-n", str(root / relative)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"{relative}: {result.stderr}"
+
+
+def test_launchd_installer_embedded_plist_builder_is_valid_python():
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent / "launchd/install.sh").read_text(encoding="utf-8")
+    marker = '\\"$VENV_PY\\" - <<\'PY\'\\n'
+    assert marker in source
+    start = source.index(marker) + len(marker)
+    end = source.index("\\nPY\\n", start)
+    builder = source[start:end]
+    compile(builder, "launchd/install.sh:plist-builder", "exec")
