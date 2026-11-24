@@ -32,6 +32,7 @@ from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
 from breakout_confirmation import detect_multi_timeframe_breakouts
+from market_microstructure import analyze_orderbook_events, summarize_daily_utc_flow
 from exchange_flow_panel import render_exchange_flow_panel
 from exhaustion_confirmation import analyze_exhaustion_and_sweeps
 
@@ -549,6 +550,7 @@ class DeltaFeed:
             "trade_clusters": deque(maxlen=100),  # finalized aggressive clusters (+ price response)
             "open_clusters": {},                  # side -> cluster still accepting trades
             "depth_samples": deque(maxlen=6000),  # (ts, side, price, size) significant bands
+            "book_snapshots": deque(maxlen=300),  # top-25 L2 snapshots sampled every ~2s for candidate diagnostics
             "level_stats": {},   # (side, price) -> first/last seen, max size (bounded, pruned)
             "book_liq_threshold": None,           # adaptive book-significance threshold (contracts)
             "large_trade_threshold": None,        # adaptive large-trade threshold (contracts)
@@ -599,6 +601,10 @@ class DeltaFeed:
             copy["trade_clusters"] = [dict(c) for c in self.data["trade_clusters"]]
             copy["open_clusters"] = [dict(c) for c in self.data["open_clusters"].values()]
             copy["depth_samples"] = list(self.data["depth_samples"])[-1200:]
+            copy["book_snapshots"] = [
+                {"ts": float(item["ts"]), "bids": dict(item["bids"]), "asks": dict(item["asks"])}
+                for item in self.data["book_snapshots"]
+            ]
             copy["level_stats"] = {k: dict(v) for k, v in self.data["level_stats"].items()}
             copy["book_liq_threshold"] = self.data["book_liq_threshold"]
             copy["large_trade_threshold"] = self.data["large_trade_threshold"]
@@ -975,6 +981,11 @@ class DeltaFeed:
             else:
                 asks = {float(k): _f(v, 0.0) or 0.0 for k, v in self.data["asks"].items()}
                 bids = {float(k): _f(v, 0.0) or 0.0 for k, v in self.data["bids"].items()}
+                self.data["book_snapshots"].append({
+                    "ts": now,
+                    "bids": dict(sorted(bids.items(), key=lambda item: item[0], reverse=True)[:25]),
+                    "asks": dict(sorted(asks.items(), key=lambda item: item[0])[:25]),
+                })
         mid = None
         if asks and bids:
             mid = (min(asks) + max(bids)) / 2.0
@@ -2783,6 +2794,54 @@ def render_tape_cvd_panel() -> None:
         "Approximate USD notional = contracts × 0.001 BTC × execution price."
     )
 
+    daily_flow = summarize_daily_utc_flow(
+        d.get("trade_flow_minutes", {}),
+        now_ts=now_ts,
+        feed_started_at=d.get("started_at"),
+        trade_last_seen=(d.get("channel_last_seen", {}) or {}).get("trades"),
+        connection_status=str(d.get("connection", "unknown")),
+        contract_value_btc=CONTRACT_VALUE_BTC,
+        days=2,
+        trade_stale_seconds=float(CHANNEL_STALE_SECONDS.get("trades") or 20),
+    )
+    st.markdown("**UTC calendar-day BUY / SELL executed volume**")
+    daily_rows = []
+    for item in daily_flow["days"]:
+        daily_rows.append({
+            "UTC date": datetime.fromtimestamp(item["utc_date"], timezone.utc).strftime("%Y-%m-%d"),
+            "BUY prints": item["buy_prints"],
+            "SELL prints": item["sell_prints"],
+            "BUY contracts": item["buy_contracts"],
+            "SELL contracts": item["sell_contracts"],
+            "BUY BTC": item["buy_btc"],
+            "SELL BTC": item["sell_btc"],
+            "Net delta (contracts)": item["net_delta_contracts"],
+            "Minutes with trades": item["minutes_with_trades"],
+            "App window coverage": item["app_window_coverage_pct"],
+            "Capture status": item["capture_status"],
+        })
+    st.dataframe(
+        pd.DataFrame(daily_rows).style.format({
+            "BUY prints": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "SELL prints": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "BUY contracts": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "SELL contracts": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "BUY BTC": lambda value: "—" if pd.isna(value) else f"{value:,.4f}",
+            "SELL BTC": lambda value: "—" if pd.isna(value) else f"{value:,.4f}",
+            "Net delta (contracts)": lambda value: "—" if pd.isna(value) else f"{value:+,.0f}",
+            "Minutes with trades": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "App window coverage": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+        }, na_rep="—"),
+        hide_index=True, use_container_width=True, height=135,
+    )
+    st.caption(
+        "UTC calendar-day totals are computed from classified Delta public taker prints captured by this app process. "
+        "BUY takers lift resting asks; SELL takers hit resting bids. BTC equivalent = contracts × 0.001 BTC/contract. "
+        "Partial days are explicitly labelled. App-window coverage measures process uptime within the day only; it does "
+        "not prove uninterrupted message delivery. Delta's public tape has no per-trade sequence number or historical "
+        "backfill, so these figures are observed totals, not guaranteed exchange-complete daily volume."
+    )
+
     oi_chart_rows = oi_24h.get("history") or []
     if len(oi_chart_rows) >= 2:
         oi_chart_df = pd.DataFrame(oi_chart_rows)
@@ -2848,6 +2907,29 @@ def render_flow_panel() -> None:
                                      ob_zone_basis, eq_tolerance)
     liq = _book_liquidity(d, float(liq_percentile), 2) if book_ready else None
 
+    if book_ready:
+        best_bid_price = max(float(price) for price in d["bids"])
+        best_ask_price = min(float(price) for price in d["asks"])
+        best_bid_size = float(d["bids"].get(str(best_bid_price), d["bids"].get(best_bid_price, 0.0)))
+        best_ask_size = float(d["asks"].get(str(best_ask_price), d["asks"].get(best_ask_price, 0.0)))
+        depth_sum = best_bid_size + best_ask_size
+        microprice = (
+            (best_ask_price * best_bid_size + best_bid_price * best_ask_size) / depth_sum
+            if depth_sum > 0 else None
+        )
+        q1, q2, q3, q4, q5 = st.columns(5)
+        q1.metric("Best buyer — top BID", f"{best_bid_price:,.1f}")
+        q2.metric("Best seller — top ASK", f"{best_ask_price:,.1f}")
+        q3.metric("Top bid size", f"{best_bid_size:,.0f} contracts")
+        q4.metric("Top ask size", f"{best_ask_size:,.0f} contracts")
+        q5.metric("Size-weighted microprice", "—" if microprice is None else f"{microprice:,.2f}")
+        st.caption(
+            "Quotes are the best visible prices in the current sequence-synced, CRC32-valid and fresh aggregated L2 book. "
+            "Microprice weights each opposite quote by displayed size; it is an order-book reference, not an executable fill price."
+        )
+    else:
+        st.info("Best bid/ask depth and microprice are withheld until the live L2 book is fresh, sequence-synced, gap-free and CRC32-valid.")
+
     with st.expander("Authentic market-wide liquidation levels", expanded=True):
         st.warning(
             "UNAVAILABLE — this dashboard subscribes to Delta's public market-data channels, "
@@ -2861,6 +2943,93 @@ def render_flow_panel() -> None:
             "liquidation map. To add authentic levels later, a verified market-wide data source and "
             "instrument-specific schema are required."
         )
+
+    microstructure = analyze_orderbook_events(
+        d.get("book_snapshots", []),
+        d.get("trade_log", []),
+        now_ts=now,
+        book_valid=zone_book_valid,
+        tick_size=BOOK_TICK,
+        min_large_contracts=50.0,
+        min_refill_execution_contracts=25.0,
+        max_snapshot_gap_seconds=6.0,
+        max_snapshot_age_seconds=6.0,
+        lookback_seconds=600.0,
+        min_refill_events=2,
+    )
+    with st.expander("Spoofing-like quote pulls and iceberg-like replenishment candidates", expanded=True):
+        st.caption(
+            "CANDIDATE ANALYSIS ONLY — sampled public L2 data is aggregated by price and has no individual order IDs "
+            "or participant identity. A quote-pull candidate is a large displayed-size reduction with little matching "
+            "taker execution. An iceberg-like candidate is repeated same-price size persistence while matching aggressive "
+            "volume trades. Neither proves manipulation, hidden quantity, or a particular trader."
+        )
+        if microstructure["status"].startswith("UNAVAILABLE"):
+            st.warning(microstructure["status"])
+            st.caption(
+                f"Valid-book sample count: {microstructure.get('snapshot_count', 0)} · "
+                f"latest snapshot age: {_fmt(microstructure.get('last_snapshot_age_seconds'), 1)}s. "
+                "The sampler retains only recent snapshots captured since this process started."
+            )
+        else:
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Recent L2 samples", f'{microstructure["snapshot_count"]:,}')
+            s2.metric(
+                "Large visible level threshold",
+                f'{microstructure["adaptive_large_level_threshold_contracts"]:,.0f} contracts',
+            )
+            s3.metric(
+                "Latest sample age",
+                f'{microstructure["last_snapshot_age_seconds"]:.1f}s',
+            )
+            quote_rows = [{
+                "Time (IST)": _ist_str(item["time"], with_date=True),
+                "Side": item["side"],
+                "Price": item["price"],
+                "Displayed before": item["displayed_before_contracts"],
+                "Displayed after": item["displayed_after_contracts"],
+                "Drop (%)": item["displayed_drop_pct"],
+                "Matched taker execution": item["matched_taker_execution_contracts"],
+                "Unexplained reduction": item["unexplained_reduction_contracts"],
+                "Classification": item["classification"],
+            } for item in microstructure["quote_pull_candidates"]]
+            st.markdown("**Quote-pull / spoofing-like candidates**")
+            if quote_rows:
+                st.dataframe(
+                    pd.DataFrame(quote_rows).style.format({
+                        "Price": "{:,.1f}",
+                        "Displayed before": "{:,.0f}",
+                        "Displayed after": "{:,.0f}",
+                        "Drop (%)": "{:.1f}%",
+                        "Matched taker execution": "{:,.0f}",
+                        "Unexplained reduction": "{:,.0f}",
+                    }, na_rep="—"),
+                    hide_index=True, use_container_width=True, height=230,
+                )
+            else:
+                st.caption("No quote-pull candidates met the current sample and execution-adjustment rules.")
+            iceberg_rows = [{
+                "Side": item["side"],
+                "Price": item["price"],
+                "Repeated refill intervals": item["refill_intervals"],
+                "Matched taker execution": item["matched_taker_execution_contracts"],
+                "Typical displayed size": item["typical_visible_size_contracts"],
+                "Latest event (IST)": _ist_str(item["latest_time"], with_date=True),
+                "Classification": item["classification"],
+            } for item in microstructure["iceberg_refill_candidates"]]
+            st.markdown("**Repeated refill / iceberg-like candidates**")
+            if iceberg_rows:
+                st.dataframe(
+                    pd.DataFrame(iceberg_rows).style.format({
+                        "Price": "{:,.1f}",
+                        "Matched taker execution": "{:,.0f}",
+                        "Typical displayed size": "{:,.0f}",
+                    }, na_rep="—"),
+                    hide_index=True, use_container_width=True, height=210,
+                )
+            else:
+                st.caption("No repeated-refill candidates met the minimum evidence threshold.")
+            st.caption(microstructure.get("limitations", ""))
 
     flow_l, flow_r = st.columns([1, 1], gap="large")
     with flow_l:
@@ -3303,7 +3472,7 @@ def render_flow_panel() -> None:
                 "A confirmed price sweep is a stop-hunt candidate, not proof that stop orders actually existed or were triggered. "
                 "Overshoot and reclaim timing are measured from completed candles."
             )
-    with st.expander("Supply / demand zones — measured volume and resting liquidity", expanded=True):
+    with st.expander("Order blocks + supply/demand — executed BUY/SELL and resting depth", expanded=True):
         zones = (pa or {}).get("zones", [])
         last_price = _f(d.get("last_price"))
         zone_rows = []
@@ -3356,7 +3525,7 @@ def render_flow_panel() -> None:
                 opposing_side, opposing, strength["opposing_levels"]
             )
             zone_rows.append({
-                "Zone": "DEMAND" if z.get("direction") == "bullish" else "SUPPLY",
+                "Order block": "BULLISH DEMAND" if z.get("direction") == "bullish" else "BEARISH SUPPLY",
                 "Lower": bottom,
                 "Upper": top,
                 "Midpoint": midpoint,
@@ -3394,6 +3563,7 @@ def render_flow_panel() -> None:
         else:
             st.caption("No confirmed supply/demand zones in the current completed-candle lookback.")
         st.caption(
+            "The zone is a confirmed price-action-derived order-block candidate, not an exchange-labelled institutional order. "
             "Formation volume is the exchange candle's reported volume field for the origin candle. "
             "Executed BUY/SELL figures count retained classified public trade prints and contracts inside the zone "
             "(up to 20,000 captured prints; process restart resets this in-memory window). "
