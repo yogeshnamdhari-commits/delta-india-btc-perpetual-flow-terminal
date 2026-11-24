@@ -2908,10 +2908,12 @@ def render_flow_panel() -> None:
     liq = _book_liquidity(d, float(liq_percentile), 2) if book_ready else None
 
     if book_ready:
-        best_bid_price = max(float(price) for price in d["bids"])
-        best_ask_price = min(float(price) for price in d["asks"])
-        best_bid_size = float(d["bids"].get(str(best_bid_price), d["bids"].get(best_bid_price, 0.0)))
-        best_ask_size = float(d["asks"].get(str(best_ask_price), d["asks"].get(best_ask_price, 0.0)))
+        best_bid_key = max(d["bids"], key=lambda price: float(price))
+        best_ask_key = min(d["asks"], key=lambda price: float(price))
+        best_bid_price = float(best_bid_key)
+        best_ask_price = float(best_ask_key)
+        best_bid_size = float(d["bids"][best_bid_key])
+        best_ask_size = float(d["asks"][best_ask_key])
         depth_sum = best_bid_size + best_ask_size
         microprice = (
             (best_ask_price * best_bid_size + best_bid_price * best_ask_size) / depth_sum
