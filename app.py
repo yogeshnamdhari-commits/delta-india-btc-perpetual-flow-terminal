@@ -722,6 +722,33 @@ class DeltaFeed:
             "Feed health: connection=%s book_synced=%s gaps=%s crc_fail=%s per_channel_age=[%s]",
             conn, book_synced, gaps, crc_fail, ", ".join(parts) if parts else "none",
         )
+        health_path = os.environ.get("DELTA_FEED_HEALTH_FILE")
+        if health_path:
+            with self.lock:
+                heartbeat = {
+                    "ts_epoch": now,
+                    "pid": os.getpid(),
+                    "connection": self.data.get("connection"),
+                    "last_market_message_at": self.data.get("last_market_message_at"),
+                    "channel_last_seen": dict(self.data.get("channel_last_seen", {})),
+                    "book_synced": self.data.get("book_synced") is True,
+                    "sequence_gap_unresolved": self.data.get("sequence_gap_unresolved", True) is not False,
+                    "checksum_ok": self.data.get("checksum_ok"),
+                    "websocket_worker_alive": bool(self.thread and self.thread.is_alive()),
+                    "sampler_worker_alive": bool(self._sthread and self._sthread.is_alive()),
+                }
+            try:
+                health_dir = os.path.dirname(os.path.abspath(health_path))
+                os.makedirs(health_dir, exist_ok=True)
+                temp_path = f"{health_path}.{os.getpid()}.tmp"
+                with open(temp_path, "w", encoding="utf-8") as handle:
+                    json.dump(heartbeat, handle, allow_nan=False, separators=(",", ":"))
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, health_path)
+            except (OSError, TypeError, ValueError) as exc:
+                _logger.exception("Failed to publish feed-health heartbeat: %s", exc)
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
         self._set_status("connected", "")

@@ -45,6 +45,41 @@ chmod +x start_mac.command
 
 The launcher creates a local virtual environment when needed, installs the listed Python packages, and launches the app on port 8502. Set `STREAMLIT_SERVER_PORT` before running it to use a different local port.
 
+## macOS LaunchAgent — continuous local service
+
+For a Mac that should keep collecting while the user session is logged in, install the supervised LaunchAgent:
+
+```bash
+./launchd/install.sh
+```
+
+The installer prepares the project virtual environment once, installs a per-user LaunchAgent under `~/Library/LaunchAgents`, starts the read-only dashboard on port 8502, and installs a separate 60-second watchdog. The main agent uses `KeepAlive` and `RunAtLoad`; the watchdog checks the Streamlit health endpoint and an atomic feed-worker heartbeat. If the dashboard becomes unresponsive, the heartbeat stops, or the WebSocket worker dies, it requests a supervised restart. A disconnected exchange/network is not by itself treated as a dead process: the feed worker retains its reconnect loop and signal data-quality gates remain fail-closed.
+
+The launcher uses absolute paths and `caffeinate -is` to inhibit idle sleep while the app runs (the system-sleep assertion applies on AC power). Keep the Mac powered, awake, online and the user logged in. Closing a MacBook lid, logging out, loss of power, network outages, exchange outages, and disk-full conditions can still interrupt capture. A user LaunchAgent starts at login; it is not a pre-login system daemon.
+
+Logs and state are kept outside the Git repository:
+- Feed/trade event capture: `~/Downloads/delta_feed_events.jsonl`
+- Decision log: `~/Downloads/signal_decisions.jsonl`
+- Service logs: `~/Library/Logs/DeltaBTCTerminal/`
+- Feed heartbeat and watchdog state: `~/Library/Application Support/DeltaBTCTerminal/`
+
+Check status and logs:
+
+```bash
+launchctl print gui/$(id -u)/com.yogesh.delta-btc-terminal
+launchctl print gui/$(id -u)/com.yogesh.delta-btc-terminal-watchdog
+tail -f ~/Library/Logs/DeltaBTCTerminal/streamlit.stdout.log
+tail -f ~/Library/Logs/DeltaBTCTerminal/watchdog.stdout.log
+```
+
+Remove the services without deleting captured data or logs:
+
+```bash
+./launchd/uninstall.sh
+```
+
+This improves process recovery; it does not guarantee uninterrupted 24/7 uptime or certify signal profitability. The watchdog restarts a dead/unresponsive application process or dead collector thread. A healthy collector that is disconnected from the exchange is allowed to reconnect and all stale/invalid data must continue to block signals. The app remains read-only and live trading remains unapproved until real-feed recovery and independent out-of-sample validation pass.
+
 ## Run automated tests
 
 Install the development/test dependencies in the project environment, then run the full suite:
