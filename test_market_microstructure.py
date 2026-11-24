@@ -44,10 +44,10 @@ def test_daily_flow_marks_previous_day_unobserved_instead_of_fabricating_zero():
 
 
 def test_daily_flow_exposes_partial_day_coverage_and_stale_channel():
-    now = 1_800_000_000.0
-    day = int(now // 86_400) * 86_400
+    day = int(1_800_000_000 // 86_400) * 86_400
+    now = float(day + 57_600)
     result = summarize_daily_utc_flow(
-        {}, now_ts=now, feed_started_at=day + 43_200,
+        {}, now_ts=now, feed_started_at=day + 28_800,
         trade_last_seen=now - 60, connection_status="connected", days=1,
     )
     row = result["days"][0]
