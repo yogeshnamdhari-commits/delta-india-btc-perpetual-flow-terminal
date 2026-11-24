@@ -22,6 +22,39 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+
+
+def best_visible_quote_levels(
+    bids: Mapping[Any, Any] | None,
+    asks: Mapping[Any, Any] | None,
+) -> dict[str, dict[str, float] | None]:
+    """Return the highest positive-size BID and lowest positive-size ASK.
+
+    Each result contains the displayed price and the contracts resting at that
+    exact price level. Invalid, non-finite, non-positive prices or sizes are
+    ignored. Callers must still gate display on their book freshness/integrity
+    checks; this helper does not certify a live order book.
+    """
+    def pick(levels: Mapping[Any, Any] | None, *, highest: bool) -> dict[str, float] | None:
+        if not isinstance(levels, Mapping):
+            return None
+        valid: list[tuple[float, float]] = []
+        for raw_price, raw_size in levels.items():
+            price = _finite(raw_price)
+            size = _finite(raw_size)
+            if price is None or price <= 0 or size is None or size <= 0:
+                continue
+            valid.append((price, size))
+        if not valid:
+            return None
+        price, size = (max if highest else min)(valid, key=lambda item: item[0])
+        return {"price": price, "size_contracts": size}
+
+    return {
+        "best_bid": pick(bids, highest=True),
+        "best_ask": pick(asks, highest=False),
+    }
+
 def _epoch(value: Any) -> int | None:
     number = _finite(value)
     if number is None or number <= 0:
