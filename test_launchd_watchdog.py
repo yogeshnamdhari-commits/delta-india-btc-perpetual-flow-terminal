@@ -89,9 +89,9 @@ def test_launchd_installer_embedded_plist_builder_is_valid_python():
     from pathlib import Path
 
     source = (Path(__file__).resolve().parent / "launchd/install.sh").read_text(encoding="utf-8")
-    marker = '\\"$VENV_PY\\" - <<\'PY\'\\n'
+    marker = '<<' + "'PY'" + "\n"
     assert marker in source
     start = source.index(marker) + len(marker)
-    end = source.index("\\nPY\\n", start)
+    end = source.index("\nPY\n", start)
     builder = source[start:end]
     compile(builder, "launchd/install.sh:plist-builder", "exec")
