@@ -124,6 +124,19 @@ Select **OpenAI API (separate API billing)** in the panel. Configure `OPENAI_API
 - Answers are generated commentary, not validated trading signals or a guarantee of profitability. Live data alone cannot certify historical completeness or out-of-sample results.
 - Unit tests for the context packer and provider-response parsing can be run with `python -m unittest test_ai_analyst.py`.
 
+## Trading-focused execution and order-flow panels
+
+The order-flow workspace groups the following read-only market context:
+
+- **Daily taker BUY/SELL BTC:** UTC calendar-day and rolling-24h totals show captured classified BUY and SELL taker prints, contracts, BTC-equivalent quantity, notional, net delta, observed trade minutes and process-window status. These are captured process observations, not an exchange-complete historical tape; public trades have no per-trade sequence and are not backfilled.
+- **Order blocks and supply/demand:** confirmed completed-candle price-action zones are labelled bullish demand / bearish supply. For each zone, the app separately reports observed executed BUY-taker and SELL-taker prints/contracts/notional in the zone, plus currently visible aligned and opposing L2 resting depth when the book is fresh and integrity-verified. These are algorithmic price-action zones, not exchange-labelled institutional orders.
+- **Best buyer and seller:** the best visible BID/ASK prices, top-level displayed sizes and a size-weighted microprice are shown only when the L2 book is sequence-synchronized, fresh, gap-free and CRC32-valid. Microprice is a reference statistic, not a guaranteed fill.
+- **Who is taking liquidity:** the live 1m/5m/15m taker panel identifies buyers lifting resting asks versus sellers hitting resting bids and displays prints, contracts, shares, dominance and approximate notional.
+- **Up/down breakout confirmation:** the existing multi-timeframe detector evaluates completed-candle range breaks and acceptance, source-reported candle volume, captured same-direction taker flow and retest state across 1m/5m/15m/1h/4h/1d. Missing or insufficient evidence does not receive a genuine breakout label.
+- **Spoofing-like quote pulls and iceberg-like replenishment:** recent top-25 L2 snapshots are sampled approximately every two seconds while the book is synchronized. A large unexplained displayed-size reduction after adjusting for same-price taker executions can be labelled a quote-pull candidate; repeated same-price displayed-size persistence during substantial matching taker executions can be labelled an iceberg-like refill candidate. The panel requires a fresh, valid book and shows candidate evidence, not accusations.
+
+**Critical limits:** Delta public L2 is aggregated by price and does not expose individual order IDs or participant identities. Quote-pull patterns do not prove spoofing or intent, and repeated displayed-size replenishment does not prove a hidden iceberg order or hidden quantity. The detectors can miss events between samples and are not execution signals. The snapshot history resets with the dashboard process. The app remains read-only; no orders are placed.
+
 ## Market structure and liquidity intelligence
 
 The read-only **Order flow & liquidity** area distinguishes measured market data from price-action inference:
