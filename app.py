@@ -2604,8 +2604,8 @@ def render_book_panel(compact: bool = False) -> None:
 
 
 @st.fragment(run_every=2.0)
-def render_tape_cvd_panel() -> None:
-    """Executed-trade tape and session CVD proxy."""
+def render_open_interest_panel() -> None:
+    """Always-visible aggregate OI and executed taker BUY/SELL summary."""
     d = feed.snapshot()
 
     st.subheader("1. OPEN INTEREST + EXECUTED BUY/SELL FLOW")
@@ -2833,6 +2833,10 @@ def render_tape_cvd_panel() -> None:
         + ("—" if d.get("open_interest_change_6h_settlement") is None else f"{float(d['open_interest_change_6h_settlement']):+,.0f} settlement units")
     )
 
+@st.fragment(run_every=2.0)
+def render_tape_cvd_panel() -> None:
+    """Executed-trade tape and session CVD proxy."""
+    d = feed.snapshot()
     st.subheader("Executed trades and session CVD")
     tape_col, cvd_col = st.columns([1, 1], gap="large")
     with tape_col:
@@ -2897,6 +2901,7 @@ def render_tape_cvd_panel() -> None:
         c2.metric("Sell-aggressor contracts", _fmt(d["sell_contracts"], 0))
         c3.metric("Net session delta", _fmt(d["cvd_value"], 0))
         st.caption("CVD is a client-side proxy collected since this dashboard started. It resets on restart and should not be treated as a verified exchange-calculated metric.")
+
 
 @st.fragment(run_every=2.0)
 def render_flow_panel() -> None:
@@ -3887,18 +3892,22 @@ else:
         render_book_panel(compact=True)
 
 st.markdown("---")
-render_tape_cvd_panel()
+render_open_interest_panel()
 
 st.markdown("---")
 st.subheader("TRADING PANELS — ORDER FLOW, LIQUIDITY & DEALING RANGE")
 st.caption(
-    "Observed resting liquidity comes from the live sequence- and CRC32-synchronized order book; "
-    "resting orders can be cancelled, moved or replenished at any time and may not execute. "
-    "Order blocks, equal highs/lows and sweeps are price-action-derived from completed candles - not verified "
-    "institutional activity. A large executed trade indicates size only, not measured market impact or institutional identity."
+    "Core trading panels are always displayed in this order: aggregate OI and executed taker flow; "
+    "best visible BID/ASK; confirmed-swing premium/discount; then completed-candle order blocks with "
+    "captured executed BUY/SELL activity and verified visible BID/ASK depth. "
+    "The public feed does not publish independent long-side and short-side OI totals. "
+    "Order blocks are price-action candidates, not exchange-identified institutional orders."
 )
 render_flow_panel()
 render_exchange_flow_panel()
+
+st.markdown("---")
+render_tape_cvd_panel()
 
 
 from datetime import datetime, timezone
