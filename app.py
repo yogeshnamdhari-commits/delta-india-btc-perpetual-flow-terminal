@@ -2801,7 +2801,7 @@ def render_tape_cvd_panel() -> None:
         trade_last_seen=(d.get("channel_last_seen", {}) or {}).get("trades"),
         connection_status=str(d.get("connection", "unknown")),
         contract_value_btc=CONTRACT_VALUE_BTC,
-        days=2,
+        days=7,
         trade_stale_seconds=float(CHANNEL_STALE_SECONDS.get("trades") or 20),
     )
     st.markdown("**UTC calendar-day BUY / SELL executed volume**")
@@ -2835,7 +2835,7 @@ def render_tape_cvd_panel() -> None:
         hide_index=True, use_container_width=True, height=135,
     )
     st.caption(
-        "UTC calendar-day totals are computed from classified Delta public taker prints captured by this app process. "
+        "The table shows the latest seven UTC calendar dates, computed from classified Delta public taker prints captured by this app process. "
         "BUY takers lift resting asks; SELL takers hit resting bids. BTC equivalent = contracts × 0.001 BTC/contract. "
         "Partial days are explicitly labelled. App-window coverage measures process uptime within the day only; it does "
         "not prove uninterrupted message delivery. Delta's public tape has no per-trade sequence number or historical "
@@ -2907,7 +2907,7 @@ def render_flow_panel() -> None:
                                      ob_zone_basis, eq_tolerance)
     liq = _book_liquidity(d, float(liq_percentile), 2) if book_ready else None
 
-    if book_ready:
+    if zone_book_valid:
         best_bid_key = max(d["bids"], key=lambda price: float(price))
         best_ask_key = min(d["asks"], key=lambda price: float(price))
         best_bid_price = float(best_bid_key)
