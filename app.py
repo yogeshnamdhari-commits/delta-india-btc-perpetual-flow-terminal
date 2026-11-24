@@ -3891,13 +3891,14 @@ render_tape_cvd_panel()
 
 st.markdown("---")
 st.subheader("TRADING PANELS — ORDER FLOW, LIQUIDITY & DEALING RANGE")
-    st.caption(
-        "Observed resting liquidity comes from the live sequence- and CRC32-synchronized order book; "
-        "resting orders can be cancelled, moved or replenished at any time and may not execute. "
-        "Order blocks, equal highs/lows and sweeps are price-action-derived from completed candles - not verified "
-        "institutional activity. A large executed trade indicates size only, not measured market impact or institutional identity.")
-    render_flow_panel()
-    render_exchange_flow_panel()
+st.caption(
+    "Observed resting liquidity comes from the live sequence- and CRC32-synchronized order book; "
+    "resting orders can be cancelled, moved or replenished at any time and may not execute. "
+    "Order blocks, equal highs/lows and sweeps are price-action-derived from completed candles - not verified "
+    "institutional activity. A large executed trade indicates size only, not measured market impact or institutional identity."
+)
+render_flow_panel()
+render_exchange_flow_panel()
 
 
 from datetime import datetime, timezone
