@@ -33,6 +33,7 @@ from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
 from breakout_confirmation import detect_multi_timeframe_breakouts
 from market_microstructure import analyze_orderbook_events, summarize_daily_utc_flow
+from premium_discount import build_premium_discount_map, classify_price_in_dealing_range
 from exchange_flow_panel import render_exchange_flow_panel
 from exhaustion_confirmation import analyze_exhaustion_and_sweeps
 
@@ -2723,16 +2724,34 @@ def render_tape_cvd_panel() -> None:
         "—" if turnover_usd is None else f"${float(turnover_usd):,.0f}",
     )
     m4.metric(
-        "Current open interest",
+        "Aggregate open interest",
         "—" if current_oi is None else f"{float(current_oi):,.0f} contracts",
     )
     m5.metric(
-        "OI change (24h)",
+        "Aggregate OI change (24h)",
         oi_change_text,
     )
     m6.metric(
         "OI value (USD)",
         "—" if oi_value_usd is None else f"${float(oi_value_usd):,.0f}",
+    )
+
+    st.markdown("**Open interest side availability**")
+    oi_long_col, oi_short_col = st.columns(2)
+    oi_long_col.metric(
+        "Long-side open interest",
+        "NOT PUBLISHED",
+        help="Delta's public ticker supplies aggregate outstanding contracts, not a long-position OI split.",
+    )
+    oi_short_col.metric(
+        "Short-side open interest",
+        "NOT PUBLISHED",
+        help="Delta's public ticker supplies aggregate outstanding contracts, not a short-position OI split.",
+    )
+    st.caption(
+        "Open interest is one aggregate contract count. Every open contract has one long and one short counterparty, "
+        "so the public aggregate cannot be split into independent BUY-side and SELL-side OI totals. "
+        "The buyer/seller table below is executed taker flow, not position-side open interest."
     )
 
     if daily_volume_history:
@@ -2770,6 +2789,7 @@ def render_tape_cvd_panel() -> None:
             "Captured volume share": flow_24h["sell_share_pct"],
         },
     ]
+    st.markdown("**Executed taker BUY / SELL flow — separate from open interest positions**")
     direction_df = pd.DataFrame(direction_rows)
     st.dataframe(
         direction_df.style.format({
@@ -3474,6 +3494,57 @@ def render_flow_panel() -> None:
                 "A confirmed price sweep is a stop-hunt candidate, not proof that stop orders actually existed or were triggered. "
                 "Overshoot and reclaim timing are measured from completed candles."
             )
+    premium_discount = (
+        build_premium_discount_map(
+            (pa or {}).get("swings", []),
+            _f(d.get("last_price")),
+            max_pair_bars=max(1, int(ob_lookback)),
+        )
+        if _f(d.get("last_price")) is not None
+        else {"status": "UNAVAILABLE — CURRENT PRICE MISSING", "location": "UNAVAILABLE"}
+    )
+    with st.expander("Premium / discount — confirmed swing dealing range", expanded=True):
+        if premium_discount.get("status") != "AVAILABLE":
+            st.info(premium_discount.get("status", "Premium/discount range unavailable."))
+        else:
+            pd1, pd2, pd3, pd4 = st.columns(4)
+            pd1.metric("Confirmed range high", f'{premium_discount["range_high"]:,.1f}')
+            pd2.metric("Equilibrium (50%)", f'{premium_discount["equilibrium"]:,.1f}')
+            pd3.metric("Confirmed range low", f'{premium_discount["range_low"]:,.1f}')
+            pd4.metric(
+                "Current location",
+                premium_discount["location"],
+                help=f'Current price position: {premium_discount["position_pct"]:.1f}% of the dealing range.',
+            )
+            pd_rows = [
+                {
+                    "Dealing-range area": "PREMIUM",
+                    "Lower boundary": premium_discount["premium_low"],
+                    "Upper boundary": premium_discount["premium_high"],
+                    "Interpretation": "Upper half: equilibrium to confirmed swing high",
+                },
+                {
+                    "Dealing-range area": "DISCOUNT",
+                    "Lower boundary": premium_discount["discount_low"],
+                    "Upper boundary": premium_discount["discount_high"],
+                    "Interpretation": "Lower half: confirmed swing low to equilibrium",
+                },
+            ]
+            st.dataframe(
+                pd.DataFrame(pd_rows).style.format({
+                    "Lower boundary": "{:,.1f}",
+                    "Upper boundary": "{:,.1f}",
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "Range source: the most recent valid pair of opposite-kind, confirmed swing pivots from completed "
+                f"candles (maximum pivot separation {int(ob_lookback)} bars). Equilibrium is the 50% midpoint. "
+                "A price outside the selected range is labelled ABOVE RANGE or BELOW RANGE, not forced into "
+                "premium/discount. These are price-location zones, not resting-order counts or entry signals."
+            )
+
     with st.expander("Order blocks + supply/demand — executed BUY/SELL and resting depth", expanded=True):
         zones = (pa or {}).get("zones", [])
         last_price = _f(d.get("last_price"))
@@ -3497,9 +3568,11 @@ def render_flow_panel() -> None:
             )
 
             def execution_strength_text(flow: dict[str, Any]) -> str:
+                contracts = float(flow["contracts"])
                 return (
                     f'{int(flow["prints"]):,} prints · '
-                    f'{float(flow["contracts"]):,.0f} contracts · '
+                    f'{contracts:,.0f} contracts · '
+                    f'{contracts * CONTRACT_VALUE_BTC:,.4f} BTC eq. · '
                     f'${float(flow["usd"]):,.0f}'
                 )
 
@@ -3526,17 +3599,20 @@ def render_flow_panel() -> None:
             opposing_text = resting_strength_text(
                 opposing_side, opposing, strength["opposing_levels"]
             )
+            bid_depth_text = aligned_text if strength["aligned_side"] == "BID" else opposing_text
+            ask_depth_text = aligned_text if strength["aligned_side"] == "ASK" else opposing_text
             zone_rows.append({
                 "Order block": "BULLISH DEMAND" if z.get("direction") == "bullish" else "BEARISH SUPPLY",
                 "Lower": bottom,
                 "Upper": top,
                 "Midpoint": midpoint,
                 "Width (pts)": top - bottom,
+                "Zone location": classify_price_in_dealing_range(midpoint, premium_discount),
                 "Formation candle volume": strength["formation_volume"],
                 "Executed BUY in zone": execution_strength_text(strength["buy"]),
                 "Executed SELL in zone": execution_strength_text(strength["sell"]),
-                "Aligned resting depth": aligned_text,
-                "Opposing resting depth": opposing_text,
+                "Visible BID depth": bid_depth_text,
+                "Visible ASK depth": ask_depth_text,
                 "Aligned / opposing USD depth": ratio,
                 "Displacement (x ATR)": displacement,
                 "Distance to mid (pts)": distance,
