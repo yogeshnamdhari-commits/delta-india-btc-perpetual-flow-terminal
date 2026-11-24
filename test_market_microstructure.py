@@ -46,14 +46,18 @@ def test_daily_flow_marks_previous_day_unobserved_instead_of_fabricating_zero():
 def test_daily_flow_exposes_partial_day_coverage_and_stale_channel():
     day = int(1_800_000_000 // 86_400) * 86_400
     now = float(day + 57_600)
-    result = summarize_daily_utc_flow(
-        {}, now_ts=now, feed_started_at=day + 28_800,
-        trade_last_seen=now - 60, connection_status="connected", days=1,
-    )
-    row = result["days"][0]
-    assert row["app_window_coverage_pct"] == pytest.approx(50.0)
-    assert "PARTIAL UTC DAY" in row["capture_status"]
-    assert row["buy_contracts"] == pytest.approx(0.0)
+    kwargs = {
+        "now_ts": now, "feed_started_at": day + 28_800,
+        "connection_status": "connected", "days": 1,
+    }
+    fresh = summarize_daily_utc_flow({}, trade_last_seen=now - 1, **kwargs)["days"][0]
+    assert fresh["app_window_coverage_pct"] == pytest.approx(50.0)
+    assert "PARTIAL UTC DAY" in fresh["capture_status"]
+    assert fresh["buy_contracts"] == pytest.approx(0.0)
+
+    stale = summarize_daily_utc_flow({}, trade_last_seen=now - 60, **kwargs)["days"][0]
+    assert stale["app_window_coverage_pct"] == pytest.approx(50.0)
+    assert "TRADE CHANNEL NOT FRESH" in stale["capture_status"]
 
 
 def _snapshot(ts, *, bids=None, asks=None):
