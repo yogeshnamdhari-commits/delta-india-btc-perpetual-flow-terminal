@@ -1,6 +1,10 @@
 import pytest
 
-from market_microstructure import analyze_orderbook_events, summarize_daily_utc_flow
+from market_microstructure import (
+    analyze_orderbook_events,
+    best_visible_quote_levels,
+    summarize_daily_utc_flow,
+)
 
 
 def test_daily_utc_flow_reports_buy_sell_contracts_and_btc_equivalent():
@@ -150,3 +154,22 @@ def test_invalid_microstructure_configuration_is_rejected(kwargs):
     args.update(kwargs)
     with pytest.raises(ValueError):
         analyze_orderbook_events([], [], **args)
+
+
+
+def test_best_visible_quote_levels_selects_highest_bid_and_lowest_ask_with_exact_level_size():
+    result = best_visible_quote_levels(
+        bids={"99.5": 8, "100": 12, "100.5": 0, "nan": 20},
+        asks={"101.5": 5, "101": 7, "100.5": -1},
+    )
+    assert result["best_bid"] == {"price": 100.0, "size_contracts": 12.0}
+    assert result["best_ask"] == {"price": 101.0, "size_contracts": 7.0}
+
+
+def test_best_visible_quote_levels_returns_none_for_missing_or_invalid_side():
+    result = best_visible_quote_levels(
+        bids={"nan": 10, "100": 0, "-1": 2},
+        asks=None,
+    )
+    assert result == {"best_bid": None, "best_ask": None}
+
