@@ -158,6 +158,30 @@ All levels and labels are monitoring context, not trade guarantees. These UI add
 
 Delta API references: [WebSocket public channels](https://docs.delta.exchange/) and [private order updates](https://docs.delta.exchange/).
 
+
+## Open interest side visibility and premium/discount dealing range
+
+The order-flow dashboard distinguishes **aggregate open interest** from **executed taker BUY/SELL flow**.
+
+- Delta's public ticker provides one aggregate `oi` contract count and OI value fields. It does not provide separate long-side and short-side open-interest totals. The dashboard therefore shows **Long-side OI: NOT PUBLISHED** and **Short-side OI: NOT PUBLISHED** instead of fabricating a split.
+- The dashboard shows aggregate current OI, its available 24-hour change/baseline and USD value. It separately shows captured BUY-taker and SELL-taker prints, contracts, BTC-equivalent quantity, notional and share. Taker BUY/SELL are executed aggressor-side trades, not long/short position OI.
+- OI increasing means aggregate outstanding contracts increased; OI decreasing means aggregate outstanding contracts decreased. Neither change identifies which counterparty opened or closed.
+
+### Premium / discount map
+
+The **Premium / discount — confirmed swing dealing range** panel uses the most recent valid opposite-kind pair of already-confirmed swing pivots from completed candles, with the configured maximum pivot separation. It plots the 50% midpoint as equilibrium:
+
+- **Premium:** upper half, from equilibrium to confirmed swing high.
+- **Discount:** lower half, from confirmed swing low to equilibrium.
+- **Equilibrium:** the 50% midpoint.
+- **Above range / Below range:** shown explicitly when current price is outside the selected dealing range; the display does not force an outside price into premium/discount.
+
+Each displayed order-block candidate also shows whether its midpoint is in the Premium, Discount, Equilibrium, Above range or Below range area when a confirmed dealing range is available. This is a price-location classification, not evidence of resting orders or a trading signal.
+
+### Order-block execution and book quantities
+
+For each price-action-derived order-block candidate, the dashboard reports actual captured executed BUY and SELL taker prints, contracts, BTC equivalent and approximate USD notional within the zone, plus current visible BID and ASK depth when the Delta L2 book is fresh, sequence-synchronized, gap-free and CRC32-valid. The public L2 book is aggregated by price and has no individual order or participant IDs, so these are observed executed trades and visible price-level depth—not verified institutional parent orders.
+
 ## Exchange wallet flow and perpetual BUY/SELL values
 
 The dashboard includes an optional **Exchange wallet flows & perpetual BUY/SELL values (CryptoQuant)** panel under **Order flow & liquidity**. It uses public CryptoQuant market/on-chain metrics through a user-supplied API key; it does not connect to an exchange account and does not place orders.
