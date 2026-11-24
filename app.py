@@ -32,7 +32,11 @@ from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
 from breakout_confirmation import detect_multi_timeframe_breakouts
-from market_microstructure import analyze_orderbook_events, summarize_daily_utc_flow
+from market_microstructure import (
+    analyze_orderbook_events,
+    best_visible_quote_levels,
+    summarize_daily_utc_flow,
+)
 from premium_discount import build_premium_discount_map, classify_price_in_dealing_range
 from exchange_flow_panel import render_exchange_flow_panel
 from exhaustion_confirmation import analyze_exhaustion_and_sweeps
@@ -2933,31 +2937,47 @@ def render_flow_panel() -> None:
                                      ob_zone_basis, eq_tolerance)
     liq = _book_liquidity(d, float(liq_percentile), 2) if book_ready else None
 
-    st.subheader("2. BEST BUYER / SELLER — LIVE TOP OF BOOK")
+    st.subheader("2. BEST BUY / SELL PRICE LEVELS — LIVE TOP OF BOOK")
     if zone_book_valid:
-        best_bid_key = max(d["bids"], key=lambda price: float(price))
-        best_ask_key = min(d["asks"], key=lambda price: float(price))
-        best_bid_price = float(best_bid_key)
-        best_ask_price = float(best_ask_key)
-        best_bid_size = float(d["bids"][best_bid_key])
-        best_ask_size = float(d["asks"][best_ask_key])
-        depth_sum = best_bid_size + best_ask_size
-        microprice = (
-            (best_ask_price * best_bid_size + best_bid_price * best_ask_size) / depth_sum
-            if depth_sum > 0 else None
-        )
-        q1, q2, q3, q4, q5 = st.columns(5)
-        q1.metric("Best buyer — top BID", f"{best_bid_price:,.1f}")
-        q2.metric("Best seller — top ASK", f"{best_ask_price:,.1f}")
-        q3.metric("Top bid size", f"{best_bid_size:,.0f} contracts")
-        q4.metric("Top ask size", f"{best_ask_size:,.0f} contracts")
-        q5.metric("Size-weighted microprice", "—" if microprice is None else f"{microprice:,.2f}")
-        st.caption(
-            "Quotes are the best visible prices in the current sequence-synced, CRC32-valid and fresh aggregated L2 book. "
-            "Microprice weights each opposite quote by displayed size; it is an order-book reference, not an executable fill price."
-        )
+        quote_levels = best_visible_quote_levels(d.get("bids"), d.get("asks"))
+        best_bid = quote_levels["best_bid"]
+        best_ask = quote_levels["best_ask"]
+        if best_bid is None or best_ask is None:
+            st.info("A usable best BUY and best SELL price level is not available in the current synchronized L2 snapshot.")
+        else:
+            best_bid_price = best_bid["price"]
+            best_ask_price = best_ask["price"]
+            best_bid_size = best_bid["size_contracts"]
+            best_ask_size = best_ask["size_contracts"]
+            depth_sum = best_bid_size + best_ask_size
+            microprice = (
+                (best_ask_price * best_bid_size + best_bid_price * best_ask_size) / depth_sum
+                if depth_sum > 0 else None
+            )
+            spread = best_ask_price - best_bid_price
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric(
+                "Best BUY price level (highest BID)",
+                f"{best_bid_price:,.1f}",
+                delta=f"{best_bid_size:,.0f} contracts resting at this level",
+                delta_color="off",
+            )
+            q2.metric(
+                "Best SELL price level (lowest ASK)",
+                f"{best_ask_price:,.1f}",
+                delta=f"{best_ask_size:,.0f} contracts resting at this level",
+                delta_color="off",
+            )
+            q3.metric("Displayed ASK − BID spread", f"{spread:,.1f} points")
+            q4.metric("Size-weighted microprice", "—" if microprice is None else f"{microprice:,.2f}")
+            st.caption(
+                "Best BUY is the highest visible BID; Best SELL is the lowest visible ASK. "
+                "Each contract count is the resting size at that exact price level, not depth summed across levels or executed trade volume. "
+                "Quotes are shown only from a fresh, sequence-synced, gap-free and CRC32-valid aggregated L2 book. "
+                "Displayed liquidity can be changed or cancelled; microprice is an order-book reference, not an executable fill price."
+            )
     else:
-        st.info("Best bid/ask depth and microprice are withheld until the live L2 book is fresh, sequence-synced, gap-free and CRC32-valid.")
+        st.info("Best BUY/SELL price levels are withheld until the live L2 book is fresh, sequence-synced, gap-free and CRC32-valid.")
 
     premium_discount = (
         build_premium_discount_map(
