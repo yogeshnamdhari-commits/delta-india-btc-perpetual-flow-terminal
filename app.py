@@ -2155,7 +2155,7 @@ with st.sidebar:
         value=True,
         help="Marks potential exhaustion only when a completed candle rejects a new local extreme and same-candle aggressor flow confirms the pressure. Context labels, not entry signals.",
     )
-    show_flow_panel = st.checkbox("Order-flow & liquidity panel", value=True)
+    st.caption("Core trading panels (open interest, best BID/ASK, premium/discount and order blocks) are always shown below the price chart.")
     show_depth_heat = st.checkbox("Depth heatmap (captured only)", value=False)
     ob_lookback = st.slider("Order-block lookback (candles)", 30, 400, 150, 10)
     ob_displacement = st.slider("Displacement threshold (× ATR)", 0.3, 3.0, 1.0, 0.1)
@@ -2607,72 +2607,10 @@ def render_book_panel(compact: bool = False) -> None:
 def render_tape_cvd_panel() -> None:
     """Executed-trade tape and session CVD proxy."""
     d = feed.snapshot()
-    tape_col, cvd_col = st.columns([1, 1], gap="large")
-    with tape_col:
-        st.subheader("Executed BUY / SELL activity")
-        activity_df = pd.DataFrame(
-            summarize_trade_prints(d.get("trade_log", []), CONTRACT_VALUE_BTC)
-        )
-        st.dataframe(
-            activity_df.style.format({
-                "Trade prints": "{:,.0f}",
-                "Contracts": "{:,.0f}",
-                "BTC equivalent": "{:,.4f}",
-                "Approx USD value": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
-            }),
-            hide_index=True, use_container_width=True, height=105,
-        )
-        st.caption(
-            "Counts are classified public execution prints, not unique parent orders. "
-            "Totals cover the retained in-memory tape (up to 20,000 prints) and reset "
-            "when the feed process restarts. Approx. USD value = contracts × 0.001 BTC × execution price."
-        )
 
-        st.subheader("Recent executed trades")
-        trades = d["trades"]
-        if trades:
-            tape_df = pd.DataFrame(trades)
-            tape_df = tape_df[["time", "side", "price", "size"]].copy()
-            tape_df["Value (USD)"] = (
-                pd.to_numeric(tape_df["price"], errors="coerce")
-                * pd.to_numeric(tape_df["size"], errors="coerce")
-                * CONTRACT_VALUE_BTC
-            )
-            st.dataframe(
-                tape_df.style.format({
-                    "price": "{:,.2f}",
-                    "size": "{:,.0f}",
-                    "Value (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
-                }),
-                hide_index=True, use_container_width=True, height=360,
-            )
-        else:
-            st.info("Waiting for BTCUSD trades from the public trade feed.")
-        st.caption("Tape side is inferred from Delta's buyer_role: taker-buyer = buy-aggressor; maker-buyer = sell-aggressor.")
-
-    with cvd_col:
-        st.subheader("Session CVD proxy")
-        cvd = d["cvd"]
-        if cvd:
-            cvd_df = pd.DataFrame(cvd)
-            cvd_df["time"] = pd.to_datetime(cvd_df["time"], utc=True).dt.tz_convert("Asia/Kolkata")
-            fig_cvd = go.Figure()
-            fig_cvd.add_trace(go.Scatter(x=cvd_df["time"], y=cvd_df["cvd"], mode="lines", name="CVD proxy"))
-            fig_cvd.update_layout(height=300, margin=dict(l=8, r=8, t=15, b=8), template="plotly_dark", xaxis_title="Time (IST)", yaxis_title="Cumulative signed contracts", showlegend=False)
-            fig_cvd.update_xaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
-            fig_cvd.update_yaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
-            st.plotly_chart(fig_cvd, use_container_width=True, key="btcusd_cvd_chart",
-                            config={"displaylogo": False})
-        else:
-            st.info("CVD starts collecting when this app receives trades; it is not historical CVD.")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Buy-aggressor contracts", _fmt(d["buy_contracts"], 0))
-        c2.metric("Sell-aggressor contracts", _fmt(d["sell_contracts"], 0))
-        c3.metric("Net session delta", _fmt(d["cvd_value"], 0))
-        st.caption("CVD is a client-side proxy collected since this dashboard started. It resets on restart and should not be treated as a verified exchange-calculated metric.")
-
+    st.subheader("1. OPEN INTEREST + EXECUTED BUY/SELL FLOW")
     st.divider()
-    st.subheader("24-hour volume distribution and open interest")
+    st.subheader("Aggregate OI, directional taker flow and 24-hour volume")
     now_ts = time.time()
     ticker_metrics = load_daily_ticker_metrics()
     daily_volume_history = load_daily_volume_history()
@@ -2895,7 +2833,70 @@ def render_tape_cvd_panel() -> None:
         + ("—" if d.get("open_interest_change_6h_settlement") is None else f"{float(d['open_interest_change_6h_settlement']):+,.0f} settlement units")
     )
 
+    st.subheader("Executed trades and session CVD")
+    tape_col, cvd_col = st.columns([1, 1], gap="large")
+    with tape_col:
+        st.subheader("Executed BUY / SELL activity")
+        activity_df = pd.DataFrame(
+            summarize_trade_prints(d.get("trade_log", []), CONTRACT_VALUE_BTC)
+        )
+        st.dataframe(
+            activity_df.style.format({
+                "Trade prints": "{:,.0f}",
+                "Contracts": "{:,.0f}",
+                "BTC equivalent": "{:,.4f}",
+                "Approx USD value": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
+            }),
+            hide_index=True, use_container_width=True, height=105,
+        )
+        st.caption(
+            "Counts are classified public execution prints, not unique parent orders. "
+            "Totals cover the retained in-memory tape (up to 20,000 prints) and reset "
+            "when the feed process restarts. Approx. USD value = contracts × 0.001 BTC × execution price."
+        )
 
+        st.subheader("Recent executed trades")
+        trades = d["trades"]
+        if trades:
+            tape_df = pd.DataFrame(trades)
+            tape_df = tape_df[["time", "side", "price", "size"]].copy()
+            tape_df["Value (USD)"] = (
+                pd.to_numeric(tape_df["price"], errors="coerce")
+                * pd.to_numeric(tape_df["size"], errors="coerce")
+                * CONTRACT_VALUE_BTC
+            )
+            st.dataframe(
+                tape_df.style.format({
+                    "price": "{:,.2f}",
+                    "size": "{:,.0f}",
+                    "Value (USD)": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
+                }),
+                hide_index=True, use_container_width=True, height=360,
+            )
+        else:
+            st.info("Waiting for BTCUSD trades from the public trade feed.")
+        st.caption("Tape side is inferred from Delta's buyer_role: taker-buyer = buy-aggressor; maker-buyer = sell-aggressor.")
+
+    with cvd_col:
+        st.subheader("Session CVD proxy")
+        cvd = d["cvd"]
+        if cvd:
+            cvd_df = pd.DataFrame(cvd)
+            cvd_df["time"] = pd.to_datetime(cvd_df["time"], utc=True).dt.tz_convert("Asia/Kolkata")
+            fig_cvd = go.Figure()
+            fig_cvd.add_trace(go.Scatter(x=cvd_df["time"], y=cvd_df["cvd"], mode="lines", name="CVD proxy"))
+            fig_cvd.update_layout(height=300, margin=dict(l=8, r=8, t=15, b=8), template="plotly_dark", xaxis_title="Time (IST)", yaxis_title="Cumulative signed contracts", showlegend=False)
+            fig_cvd.update_xaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
+            fig_cvd.update_yaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
+            st.plotly_chart(fig_cvd, use_container_width=True, key="btcusd_cvd_chart",
+                            config={"displaylogo": False})
+        else:
+            st.info("CVD starts collecting when this app receives trades; it is not historical CVD.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Buy-aggressor contracts", _fmt(d["buy_contracts"], 0))
+        c2.metric("Sell-aggressor contracts", _fmt(d["sell_contracts"], 0))
+        c3.metric("Net session delta", _fmt(d["cvd_value"], 0))
+        st.caption("CVD is a client-side proxy collected since this dashboard started. It resets on restart and should not be treated as a verified exchange-calculated metric.")
 
 @st.fragment(run_every=2.0)
 def render_flow_panel() -> None:
@@ -2927,6 +2928,7 @@ def render_flow_panel() -> None:
                                      ob_zone_basis, eq_tolerance)
     liq = _book_liquidity(d, float(liq_percentile), 2) if book_ready else None
 
+    st.subheader("2. BEST BUYER / SELLER — LIVE TOP OF BOOK")
     if zone_book_valid:
         best_bid_key = max(d["bids"], key=lambda price: float(price))
         best_ask_key = min(d["asks"], key=lambda price: float(price))
@@ -2951,6 +2953,165 @@ def render_flow_panel() -> None:
         )
     else:
         st.info("Best bid/ask depth and microprice are withheld until the live L2 book is fresh, sequence-synced, gap-free and CRC32-valid.")
+
+    premium_discount = (
+        build_premium_discount_map(
+            (pa or {}).get("swings", []),
+            _f(d.get("last_price")),
+            max_pair_bars=max(1, int(ob_lookback)),
+        )
+        if _f(d.get("last_price")) is not None
+        else {"status": "UNAVAILABLE — CURRENT PRICE MISSING", "location": "UNAVAILABLE"}
+    )
+    with st.expander("3. PREMIUM / DISCOUNT — CONFIRMED SWING DEALING RANGE", expanded=True):
+        if premium_discount.get("status") != "AVAILABLE":
+            st.info(premium_discount.get("status", "Premium/discount range unavailable."))
+        else:
+            pd1, pd2, pd3, pd4 = st.columns(4)
+            pd1.metric("Confirmed range high", f'{premium_discount["range_high"]:,.1f}')
+            pd2.metric("Equilibrium (50%)", f'{premium_discount["equilibrium"]:,.1f}')
+            pd3.metric("Confirmed range low", f'{premium_discount["range_low"]:,.1f}')
+            pd4.metric(
+                "Current location",
+                premium_discount["location"],
+                help=f'Current price position: {premium_discount["position_pct"]:.1f}% of the dealing range.',
+            )
+            pd_rows = [
+                {
+                    "Dealing-range area": "PREMIUM",
+                    "Lower boundary": premium_discount["premium_low"],
+                    "Upper boundary": premium_discount["premium_high"],
+                    "Interpretation": "Upper half: equilibrium to confirmed swing high",
+                },
+                {
+                    "Dealing-range area": "DISCOUNT",
+                    "Lower boundary": premium_discount["discount_low"],
+                    "Upper boundary": premium_discount["discount_high"],
+                    "Interpretation": "Lower half: confirmed swing low to equilibrium",
+                },
+            ]
+            st.dataframe(
+                pd.DataFrame(pd_rows).style.format({
+                    "Lower boundary": "{:,.1f}",
+                    "Upper boundary": "{:,.1f}",
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "Range source: the most recent valid pair of opposite-kind, confirmed swing pivots from completed "
+                f"candles (maximum pivot separation {int(ob_lookback)} bars). Equilibrium is the 50% midpoint. "
+                "A price outside the selected range is labelled ABOVE RANGE or BELOW RANGE, not forced into "
+                "premium/discount. These are price-location zones, not resting-order counts or entry signals."
+            )
+
+    with st.expander("4. ORDER BLOCKS — EXECUTED BUY/SELL + VISIBLE BID/ASK DEPTH", expanded=True):
+        zones = (pa or {}).get("zones", [])
+        last_price = _f(d.get("last_price"))
+        zone_rows = []
+        for z in zones:
+            top = _f(z.get("top"))
+            bottom = _f(z.get("bottom"))
+            if top is None or bottom is None or top < bottom:
+                continue
+            midpoint = (top + bottom) / 2.0
+            distance = (midpoint - last_price) if last_price is not None else None
+            displacement = _f(z.get("displacement_x_atr"))
+            strength = measure_zone_strength(
+                z,
+                closed,
+                d.get("trade_log", []),
+                d.get("bids", {}),
+                d.get("asks", {}),
+                book_valid=zone_book_valid,
+                contract_value_btc=CONTRACT_VALUE_BTC,
+            )
+
+            def execution_strength_text(flow: dict[str, Any]) -> str:
+                contracts = float(flow["contracts"])
+                return (
+                    f'{int(flow["prints"]):,} prints · '
+                    f'{contracts:,.0f} contracts · '
+                    f'{contracts * CONTRACT_VALUE_BTC:,.4f} BTC eq. · '
+                    f'${float(flow["usd"]):,.0f}'
+                )
+
+            def resting_strength_text(
+                side_name: str,
+                flow: dict[str, Any] | None,
+                levels: int | None,
+            ) -> str:
+                if flow is None or levels is None:
+                    return "UNAVAILABLE — book not fresh/verified"
+                return (
+                    f'{side_name}: {levels:,} levels · '
+                    f'{float(flow["contracts"]):,.0f} contracts · '
+                    f'${float(flow["usd"]):,.0f}'
+                )
+
+            aligned = strength["aligned"]
+            opposing = strength["opposing"]
+            ratio = strength["aligned_opposing_usd_ratio"]
+            aligned_text = resting_strength_text(
+                strength["aligned_side"], aligned, strength["aligned_levels"]
+            )
+            opposing_side = "ASK" if strength["aligned_side"] == "BID" else "BID"
+            opposing_text = resting_strength_text(
+                opposing_side, opposing, strength["opposing_levels"]
+            )
+            bid_depth_text = aligned_text if strength["aligned_side"] == "BID" else opposing_text
+            ask_depth_text = aligned_text if strength["aligned_side"] == "ASK" else opposing_text
+            zone_rows.append({
+                "Order block": "BULLISH DEMAND" if z.get("direction") == "bullish" else "BEARISH SUPPLY",
+                "Lower": bottom,
+                "Upper": top,
+                "Midpoint": midpoint,
+                "Width (pts)": top - bottom,
+                "Zone location": classify_price_in_dealing_range(midpoint, premium_discount),
+                "Formation candle volume": strength["formation_volume"],
+                "Executed BUY in zone": execution_strength_text(strength["buy"]),
+                "Executed SELL in zone": execution_strength_text(strength["sell"]),
+                "Visible BID depth": bid_depth_text,
+                "Visible ASK depth": ask_depth_text,
+                "Aligned / opposing USD depth": ratio,
+                "Displacement (x ATR)": displacement,
+                "Distance to mid (pts)": distance,
+                "Status": str(z.get("status", "unknown")).upper(),
+                "Confirmed (IST)": _ist_str(z.get("confirmed_time")),
+            })
+        zone_rows.sort(key=lambda r: (
+            r["Status"] == "INVALIDATED",
+            abs(r["Distance to mid (pts)"]) if r["Distance to mid (pts)"] is not None else float("inf"),
+            -(r["Displacement (x ATR)"] or 0.0),
+        ))
+        if zone_rows:
+            st.dataframe(
+                pd.DataFrame(zone_rows[:12]).style.format({
+                    "Lower": "{:,.1f}",
+                    "Upper": "{:,.1f}",
+                    "Midpoint": "{:,.1f}",
+                    "Width (pts)": "{:,.1f}",
+                    "Formation candle volume": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+                    "Aligned / opposing USD depth": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
+                    "Displacement (x ATR)": "{:.2f}",
+                    "Distance to mid (pts)": "{:+,.1f}",
+                }, na_rep="—"),
+                hide_index=True, use_container_width=True, height=360,
+            )
+        else:
+            st.caption("No confirmed supply/demand zones in the current completed-candle lookback.")
+        st.caption(
+            "The zone is a confirmed price-action-derived order-block candidate, not an exchange-labelled institutional order. "
+            "Formation volume is the exchange candle's reported volume field for the origin candle. "
+            "Executed BUY/SELL figures count retained classified public trade prints and contracts inside the zone "
+            "(up to 20,000 captured prints; process restart resets this in-memory window). "
+            "Resting depth is the current synchronized L2 snapshot inside the zone: each count is a visible price level, "
+            "not an individual order because the public book aggregates size by price. "
+            "USD notional = contracts × 0.001 BTC/contract × observed execution or resting price. "
+            "Aligned depth means BID liquidity for DEMAND and ASK liquidity for SUPPLY; the ratio compares its USD notional "
+            "with the opposing side. The book columns are withheld when the L2 feed is stale, unsynchronized, gap-affected "
+            "or CRC-invalid. Resting orders can be cancelled or moved; none of these measures is a probability or guarantee."
+        )
 
     with st.expander("Authentic market-wide liquidation levels", expanded=True):
         st.warning(
@@ -3494,165 +3655,6 @@ def render_flow_panel() -> None:
                 "A confirmed price sweep is a stop-hunt candidate, not proof that stop orders actually existed or were triggered. "
                 "Overshoot and reclaim timing are measured from completed candles."
             )
-    premium_discount = (
-        build_premium_discount_map(
-            (pa or {}).get("swings", []),
-            _f(d.get("last_price")),
-            max_pair_bars=max(1, int(ob_lookback)),
-        )
-        if _f(d.get("last_price")) is not None
-        else {"status": "UNAVAILABLE — CURRENT PRICE MISSING", "location": "UNAVAILABLE"}
-    )
-    with st.expander("Premium / discount — confirmed swing dealing range", expanded=True):
-        if premium_discount.get("status") != "AVAILABLE":
-            st.info(premium_discount.get("status", "Premium/discount range unavailable."))
-        else:
-            pd1, pd2, pd3, pd4 = st.columns(4)
-            pd1.metric("Confirmed range high", f'{premium_discount["range_high"]:,.1f}')
-            pd2.metric("Equilibrium (50%)", f'{premium_discount["equilibrium"]:,.1f}')
-            pd3.metric("Confirmed range low", f'{premium_discount["range_low"]:,.1f}')
-            pd4.metric(
-                "Current location",
-                premium_discount["location"],
-                help=f'Current price position: {premium_discount["position_pct"]:.1f}% of the dealing range.',
-            )
-            pd_rows = [
-                {
-                    "Dealing-range area": "PREMIUM",
-                    "Lower boundary": premium_discount["premium_low"],
-                    "Upper boundary": premium_discount["premium_high"],
-                    "Interpretation": "Upper half: equilibrium to confirmed swing high",
-                },
-                {
-                    "Dealing-range area": "DISCOUNT",
-                    "Lower boundary": premium_discount["discount_low"],
-                    "Upper boundary": premium_discount["discount_high"],
-                    "Interpretation": "Lower half: confirmed swing low to equilibrium",
-                },
-            ]
-            st.dataframe(
-                pd.DataFrame(pd_rows).style.format({
-                    "Lower boundary": "{:,.1f}",
-                    "Upper boundary": "{:,.1f}",
-                }),
-                hide_index=True,
-                use_container_width=True,
-            )
-            st.caption(
-                "Range source: the most recent valid pair of opposite-kind, confirmed swing pivots from completed "
-                f"candles (maximum pivot separation {int(ob_lookback)} bars). Equilibrium is the 50% midpoint. "
-                "A price outside the selected range is labelled ABOVE RANGE or BELOW RANGE, not forced into "
-                "premium/discount. These are price-location zones, not resting-order counts or entry signals."
-            )
-
-    with st.expander("Order blocks + supply/demand — executed BUY/SELL and resting depth", expanded=True):
-        zones = (pa or {}).get("zones", [])
-        last_price = _f(d.get("last_price"))
-        zone_rows = []
-        for z in zones:
-            top = _f(z.get("top"))
-            bottom = _f(z.get("bottom"))
-            if top is None or bottom is None or top < bottom:
-                continue
-            midpoint = (top + bottom) / 2.0
-            distance = (midpoint - last_price) if last_price is not None else None
-            displacement = _f(z.get("displacement_x_atr"))
-            strength = measure_zone_strength(
-                z,
-                closed,
-                d.get("trade_log", []),
-                d.get("bids", {}),
-                d.get("asks", {}),
-                book_valid=zone_book_valid,
-                contract_value_btc=CONTRACT_VALUE_BTC,
-            )
-
-            def execution_strength_text(flow: dict[str, Any]) -> str:
-                contracts = float(flow["contracts"])
-                return (
-                    f'{int(flow["prints"]):,} prints · '
-                    f'{contracts:,.0f} contracts · '
-                    f'{contracts * CONTRACT_VALUE_BTC:,.4f} BTC eq. · '
-                    f'${float(flow["usd"]):,.0f}'
-                )
-
-            def resting_strength_text(
-                side_name: str,
-                flow: dict[str, Any] | None,
-                levels: int | None,
-            ) -> str:
-                if flow is None or levels is None:
-                    return "UNAVAILABLE — book not fresh/verified"
-                return (
-                    f'{side_name}: {levels:,} levels · '
-                    f'{float(flow["contracts"]):,.0f} contracts · '
-                    f'${float(flow["usd"]):,.0f}'
-                )
-
-            aligned = strength["aligned"]
-            opposing = strength["opposing"]
-            ratio = strength["aligned_opposing_usd_ratio"]
-            aligned_text = resting_strength_text(
-                strength["aligned_side"], aligned, strength["aligned_levels"]
-            )
-            opposing_side = "ASK" if strength["aligned_side"] == "BID" else "BID"
-            opposing_text = resting_strength_text(
-                opposing_side, opposing, strength["opposing_levels"]
-            )
-            bid_depth_text = aligned_text if strength["aligned_side"] == "BID" else opposing_text
-            ask_depth_text = aligned_text if strength["aligned_side"] == "ASK" else opposing_text
-            zone_rows.append({
-                "Order block": "BULLISH DEMAND" if z.get("direction") == "bullish" else "BEARISH SUPPLY",
-                "Lower": bottom,
-                "Upper": top,
-                "Midpoint": midpoint,
-                "Width (pts)": top - bottom,
-                "Zone location": classify_price_in_dealing_range(midpoint, premium_discount),
-                "Formation candle volume": strength["formation_volume"],
-                "Executed BUY in zone": execution_strength_text(strength["buy"]),
-                "Executed SELL in zone": execution_strength_text(strength["sell"]),
-                "Visible BID depth": bid_depth_text,
-                "Visible ASK depth": ask_depth_text,
-                "Aligned / opposing USD depth": ratio,
-                "Displacement (x ATR)": displacement,
-                "Distance to mid (pts)": distance,
-                "Status": str(z.get("status", "unknown")).upper(),
-                "Confirmed (IST)": _ist_str(z.get("confirmed_time")),
-            })
-        zone_rows.sort(key=lambda r: (
-            r["Status"] == "INVALIDATED",
-            abs(r["Distance to mid (pts)"]) if r["Distance to mid (pts)"] is not None else float("inf"),
-            -(r["Displacement (x ATR)"] or 0.0),
-        ))
-        if zone_rows:
-            st.dataframe(
-                pd.DataFrame(zone_rows[:12]).style.format({
-                    "Lower": "{:,.1f}",
-                    "Upper": "{:,.1f}",
-                    "Midpoint": "{:,.1f}",
-                    "Width (pts)": "{:,.1f}",
-                    "Formation candle volume": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
-                    "Aligned / opposing USD depth": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
-                    "Displacement (x ATR)": "{:.2f}",
-                    "Distance to mid (pts)": "{:+,.1f}",
-                }, na_rep="—"),
-                hide_index=True, use_container_width=True, height=360,
-            )
-        else:
-            st.caption("No confirmed supply/demand zones in the current completed-candle lookback.")
-        st.caption(
-            "The zone is a confirmed price-action-derived order-block candidate, not an exchange-labelled institutional order. "
-            "Formation volume is the exchange candle's reported volume field for the origin candle. "
-            "Executed BUY/SELL figures count retained classified public trade prints and contracts inside the zone "
-            "(up to 20,000 captured prints; process restart resets this in-memory window). "
-            "Resting depth is the current synchronized L2 snapshot inside the zone: each count is a visible price level, "
-            "not an individual order because the public book aggregates size by price. "
-            "USD notional = contracts × 0.001 BTC/contract × observed execution or resting price. "
-            "Aligned depth means BID liquidity for DEMAND and ASK liquidity for SUPPLY; the ratio compares its USD notional "
-            "with the opposing side. The book columns are withheld when the L2 feed is stale, unsynchronized, gap-affected "
-            "or CRC-invalid. Resting orders can be cancelled or moved; none of these measures is a probability or guarantee."
-        )
-
     with st.expander("Buy / sell exhaustion (1-minute candle + observed tape)", expanded=True):
         exhaustion = orderflow.detect_exhaustion_labels(
             closed,
@@ -3887,9 +3889,8 @@ else:
 st.markdown("---")
 render_tape_cvd_panel()
 
-if show_flow_panel:
-    st.markdown("---")
-    st.subheader("Order flow & liquidity")
+st.markdown("---")
+st.subheader("TRADING PANELS — ORDER FLOW, LIQUIDITY & DEALING RANGE")
     st.caption(
         "Observed resting liquidity comes from the live sequence- and CRC32-synchronized order book; "
         "resting orders can be cancelled, moved or replenished at any time and may not execute. "
