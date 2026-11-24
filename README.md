@@ -67,6 +67,17 @@ The test suite covers deterministic parser, signal-contract, feed-fault, logging
 - Open interest and funding rate, when delivered by the feed
 - Feed age, sequence gaps, checksum failures and reconnect status
 
+## Dashboard layout — four core trading panels
+
+The four core panels are placed immediately after the BTCUSD chart and live order book and are always rendered; there is no sidebar toggle that hides the order-flow workspace.
+
+1. **1. OPEN INTEREST + EXECUTED BUY/SELL FLOW** — aggregate outstanding contracts, 24-hour OI change and value, plus separate captured BUY-taker and SELL-taker prints/contracts/BTC-equivalent/notional. Long-side and short-side OI are displayed as **NOT PUBLISHED** because Delta's public ticker exposes aggregate OI, not separate long/short position totals.
+2. **2. BEST BUYER / SELLER — LIVE TOP OF BOOK** — best visible BID/ASK, displayed quantities and microprice. Values are withheld unless the order book is fresh, synchronized, gap-free and CRC32-valid.
+3. **3. PREMIUM / DISCOUNT — CONFIRMED SWING DEALING RANGE** — confirmed swing high, 50% equilibrium, swing low, current location and upper/lower half boundaries.
+4. **4. ORDER BLOCKS — EXECUTED BUY/SELL + VISIBLE BID/ASK DEPTH** — completed-candle price-action order-block candidates with captured executed BUY/SELL prints, contracts, BTC equivalent, approximate notional and current visible BID/ASK depth when the book passes integrity checks.
+
+The longer trade tape, session CVD, breakout, liquidity and microstructure diagnostics follow these core panels. Order-block candidates are price-action-derived, not exchange-identified institutional orders. Executed taker trades and aggregate resting depth are shown as separate measurements.
+
 ## Safety / interpretation notes
 
 - Public market data should not need Delta API credentials. **Do not paste API keys or secrets into this app.**
