@@ -116,16 +116,14 @@ def summarize_daily_utc_flow(
         }
 
         if captured:
+            # Flow records are keyed by UTC minute start. Include the
+            # process-start minute bucket because the feed can capture
+            # trades later in that minute even though its key precedes
+            # the exact process-start timestamp. The in-memory map is
+            # process-local, so this does not backfill pre-start trades.
+            first_observed_minute = max(day_start, int(started // 60) * 60)
             for raw_minute, raw_flow in flow_map.items():
                 minute = _epoch(raw_minute)
-                # Flow records are keyed by UTC minute start. Include the
-                # process-start minute bucket because the feed can capture
-                # trades later in that minute even though its key precedes
-                # the exact process-start timestamp. The in-memory map is
-                # process-local, so this does not backfill pre-start trades.
-                first_observed_minute = max(
-                    day_start, int(started // 60) * 60
-                )
                 if minute is None or minute < first_observed_minute or minute >= day_end:
                     continue
                 if not isinstance(raw_flow, Mapping):
