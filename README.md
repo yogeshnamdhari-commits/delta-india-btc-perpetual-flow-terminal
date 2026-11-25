@@ -101,6 +101,7 @@ The test suite covers deterministic parser, signal-contract, feed-fault, logging
 - Session-only signed-volume/CVD proxy
 - Open interest and funding rate, when delivered by the feed
 - Feed age, sequence gaps, checksum failures and reconnect status
+- BTCUSD daily-candle volume and ticker session volume as separate raw API fields; the quantity basis is unverified and the values are not normalized or treated as directly comparable
 
 ## Dashboard layout — four core trading panels
 
@@ -174,7 +175,8 @@ Select **OpenAI API (separate API billing)** in the panel. Configure `OPENAI_API
 
 The order-flow workspace groups the following read-only market context:
 
-- **Daily taker BUY/SELL BTC:** UTC calendar-day and rolling-24h totals show captured classified BUY and SELL taker prints, contracts, BTC-equivalent quantity, notional, net delta, observed trade minutes and process-window status. These are captured process observations, not an exchange-complete historical tape; public trades have no per-trade sequence and are not backfilled.
+- **Daily taker BUY/SELL BTC:** UTC calendar-day and rolling-24h totals show captured classified BUY and SELL taker prints, contracts, BTC-equivalent quantity, notional, net delta, observed trade minutes and process-window status. If the process starts mid-minute, the first UTC minute bucket is included because it contains trades actually received after startup; the in-memory map is process-local and does not backfill pre-start trades. These are captured process observations, not an exchange-complete historical tape; public trades have no per-trade sequence and are not backfilled.
+- **BTCUSD volume units:** daily-candle volume and ticker session volume are shown as separate raw API fields. Their exact quantity basis is not confirmed by the field definitions currently used by this app, so values are not normalized, added together or directly compared. The UI labels them "raw API units" rather than assuming contracts or BTC.
 - **Order blocks and supply/demand:** confirmed completed-candle price-action zones are labelled bullish demand / bearish supply. For each zone, the app separately reports observed executed BUY-taker and SELL-taker prints/contracts/notional in the zone, plus currently visible aligned and opposing L2 resting depth when the book is fresh and integrity-verified. These are algorithmic price-action zones, not exchange-labelled institutional orders.
 - **Best buyer and seller:** the best visible BID/ASK prices, top-level displayed sizes and a size-weighted microprice are shown only when the L2 book is sequence-synchronized, fresh, gap-free and CRC32-valid. Microprice is a reference statistic, not a guaranteed fill.
 - **Who is taking liquidity:** the live 1m/5m/15m taker panel identifies buyers lifting resting asks versus sellers hitting resting bids and displays prints, contracts, shares, dominance and approximate notional.
