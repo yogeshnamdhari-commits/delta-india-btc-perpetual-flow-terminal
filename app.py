@@ -27,7 +27,7 @@ from okx_history_panel import render_okx_history_panel
 from binance_panel import render_binance_cross_venue_panel
 from trade_activity import summarize_trade_prints
 from zone_strength import measure_zone_strength
-from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
+from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h, summarize_oi_funding_bias
 from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
@@ -2707,6 +2707,83 @@ def render_open_interest_panel() -> None:
         "OI value (USD)",
         "—" if oi_value_usd is None else f"${float(oi_value_usd):,.2f}",
         help="Independently calculated as outstanding contracts × 0.001 BTC per contract × current Delta mark price.",
+    )
+
+    # A transparent positioning-context heuristic: 24h mark-price direction +
+    # 24h aggregate-OI change. Funding is shown separately as the payer side,
+    # never used alone to manufacture a BUY/SELL direction.
+    channel_seen = d.get("channel_last_seen") or {}
+    ticker_seen = _f(channel_seen.get("ticker"))
+    ticker_age = max(0.0, now_ts - ticker_seen) if ticker_seen is not None else None
+    ticker_fresh = (
+        str(d.get("connection", "")).lower() == "connected"
+        and ticker_age is not None
+        and ticker_age <= float(CHANNEL_STALE_SECONDS.get("ticker") or 8)
+    )
+    ticker_24h = d.get("ticker_24h") or {}
+    price_change_pct = _f(ticker_24h.get("mark_change_pct")) if ticker_fresh else None
+    oi_change_pct_for_bias = oi_24h.get("change_pct") if ticker_fresh else None
+    funding_seen = _f(channel_seen.get("funding_rate"))
+    funding_available = (
+        str(d.get("connection", "")).lower() == "connected"
+        and funding_seen is not None
+        and d.get("funding_rate") is not None
+    )
+    funding_rate_raw = _f(d.get("funding_rate")) if funding_available else None
+    funding_interval_seconds = _f(d.get("funding_interval_seconds")) if funding_available else None
+    positioning = summarize_oi_funding_bias(
+        price_change_pct,
+        oi_change_pct_for_bias,
+        funding_rate_raw,
+        funding_interval_seconds,
+        neutral_threshold_pct=0.05,
+    )
+    st.markdown("**Open-interest + funding positioning context (24h heuristic)**")
+    bias_col, funding_col, components_col = st.columns(3)
+    bias_col.metric(
+        "Price + OI context bias",
+        positioning["context_bias"],
+        help=(
+            "BUY BIAS CANDIDATE = 24h mark price rising and aggregate OI rising. "
+            "SELL BIAS CANDIDATE = 24h mark price falling and aggregate OI rising. "
+            "If OI falls, the result is MIXED / WAIT because the move may be position closing. "
+            "This is context only, not an entry signal."
+        ),
+    )
+    funding_value_text = (
+        "—" if positioning["funding_rate_pct"] is None
+        else f"{positioning['funding_rate_pct']:+.5f}%"
+    )
+    funding_interval_text = (
+        "interval unavailable" if positioning["funding_interval_hours"] is None
+        else f"per {positioning['funding_interval_hours']:g}h interval"
+    )
+    funding_col.metric(
+        "Funding payer",
+        positioning["funding_payer"],
+        delta=f"{funding_value_text} · {funding_interval_text}" if positioning["funding_rate_pct"] is not None else None,
+        help=(
+            "Positive funding: LONGS PAY SHORTS. Negative funding: SHORTS PAY LONGS. "
+            "The rate is a carry transfer, not a standalone BUY or SELL signal."
+        ),
+    )
+    price_text = "—" if positioning["price_change_pct"] is None else f"{positioning['price_change_pct']:+.2f}%"
+    oi_text = "—" if positioning["oi_change_pct"] is None else f"{positioning['oi_change_pct']:+.2f}%"
+    components_col.metric(
+        "24h price / OI change",
+        f"{price_text} / {oi_text}",
+        help="Price uses Delta ticker 24h mark-price change. OI uses current aggregate contracts versus the nearest hourly OI close at the 24h cutoff.",
+    )
+    funding_age_text = (
+        "Funding channel not yet observed"
+        if funding_seen is None
+        else f"Funding channel last updated {max(0.0, now_ts - funding_seen):.0f}s ago"
+    )
+    st.caption(
+        f"{positioning['price_oi_regime']}. {positioning['context_explanation']} "
+        f"{positioning['funding_context']} {funding_age_text}. "
+        "Aggregate OI is not split into long/short positions; price/OI combinations are candidates only, "
+        "and funding does not flip the price/OI context or create an entry signal."
     )
 
     reported_oi_value_usd = ticker_metrics.get("reported_open_interest_value_usd")
