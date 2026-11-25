@@ -2683,13 +2683,13 @@ def render_open_interest_panel() -> None:
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric(
         "Latest daily candle volume",
-        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} contract units",
-        help="BTCUSD 1d candle volume in Delta exchange API contract units (not yet BTC-normalized). The newest candle may still be forming. Do not directly add or compare with ticker session volume without unit conversion.",
+        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} raw API units",
+        help="BTCUSD 1d candle volume exactly as returned by Delta's public history API. The quantity basis is not confirmed here and no BTC/contract normalization is applied. The newest candle may still be forming. Do not assume it shares a unit with ticker session volume.",
     )
     m2.metric(
         "Ticker session volume",
-        "—" if volume is None else f"{float(volume):,.0f} API units",
-        help="Live ticker session volume field. Delta may report this in a different quantity base than daily-candle volume. Do not directly add or compare without unit conversion.",
+        "—" if volume is None else f"{float(volume):,.0f} raw API units",
+        help="Live ticker session volume exactly as returned by Delta's public ticker API. Its quantity basis is not confirmed here; treat it as a separate raw field from daily-candle volume.",
     )
     m3.metric(
         "Ticker turnover (USD)",
@@ -2755,14 +2755,19 @@ def render_open_interest_panel() -> None:
         daily_volume_df["Daily candle (UTC)"] = pd.to_datetime(
             daily_volume_df["time"], unit="s", utc=True
         ).dt.strftime("%Y-%m-%d")
-        daily_volume_df = daily_volume_df.rename(columns={"volume": "BTCUSD volume (API units)"})
+        daily_volume_df = daily_volume_df.rename(columns={"volume": "BTCUSD volume (raw API units)"})
         st.dataframe(
-            daily_volume_df[["Daily candle (UTC)", "BTCUSD volume (API units)"]].style.format(
-                {"BTCUSD volume (API units)": "{:,.0f}"}
+            daily_volume_df[["Daily candle (UTC)", "BTCUSD volume (raw API units)"]].style.format(
+                {"BTCUSD volume (raw API units)": "{:,.0f}"}
             ),
             hide_index=True,
             use_container_width=True,
             height=190,
+        )
+        st.caption(
+            "Daily-candle volume is shown as raw API units (quantity basis unverified). "
+            "Ticker session volume is a separate raw API field; the two values are not assumed "
+            "to share a unit and are not normalized or compared directly."
         )
     else:
         st.info("BTCUSD daily-candle volume history is unavailable; the live ticker session volume is shown separately.")
