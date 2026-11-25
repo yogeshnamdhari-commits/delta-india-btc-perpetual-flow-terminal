@@ -2673,7 +2673,7 @@ def render_open_interest_panel() -> None:
         pct = oi_24h.get("change_pct")
         oi_change_text = f"{change:+,.0f} contracts"
         if pct is not None:
-            oi_change_text += f" ({float(pct):+.2f}%)"
+            oi_change_text += f" ({float(pct):+.1f}%)"
 
     latest_daily_volume = daily_volume_history[-1] if daily_volume_history else None
     latest_daily_volume_time = (
@@ -2683,12 +2683,13 @@ def render_open_interest_panel() -> None:
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric(
         "Latest daily candle volume",
-        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} API units",
-        help=f"BTCUSD 1d candle timestamp: {latest_daily_volume_time}. The newest candle may still be forming.",
+        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} contract units",
+        help="BTCUSD 1d candle volume in Delta exchange API contract units (not yet BTC-normalized). The newest candle may still be forming. Do not directly add or compare with ticker session volume without unit conversion.",
     )
     m2.metric(
         "Ticker session volume",
         "—" if volume is None else f"{float(volume):,.0f} API units",
+        help="Live ticker session volume field. Delta may report this in a different quantity base than daily-candle volume. Do not directly add or compare without unit conversion.",
     )
     m3.metric(
         "Ticker turnover (USD)",
@@ -2696,7 +2697,7 @@ def render_open_interest_panel() -> None:
     )
     m4.metric(
         "Aggregate open interest",
-        "—" if current_oi is None else f"{float(current_oi):,.0f} contracts",
+        "—" if current_oi is None else f"{float(current_oi):,.4f} contracts",
     )
     m5.metric(
         "Aggregate OI change (24h)",
@@ -2704,7 +2705,7 @@ def render_open_interest_panel() -> None:
     )
     m6.metric(
         "OI value (USD)",
-        "—" if oi_value_usd is None else f"${float(oi_value_usd):,.0f}",
+        "—" if oi_value_usd is None else f"${float(oi_value_usd):,.2f}",
         help="Independently calculated as outstanding contracts × 0.001 BTC per contract × current Delta mark price.",
     )
 
@@ -2713,7 +2714,7 @@ def render_open_interest_panel() -> None:
     oi_discrepancy_pct = ticker_metrics.get("open_interest_value_usd_discrepancy_pct")
     if oi_value_usd is not None and current_oi is not None and oi_mark_price is not None:
         st.caption(
-            f"OI USD notional calculation: {float(current_oi):,.0f} contracts × "
+            f"OI USD notional calculation: {float(current_oi):,.4f} contracts × "
             f"{CONTRACT_VALUE_BTC:g} BTC/contract × ${float(oi_mark_price):,.2f} mark price."
         )
         if reported_oi_value_usd is not None and oi_discrepancy_pct is not None and abs(float(oi_discrepancy_pct)) >= 5.0:
@@ -2835,6 +2836,8 @@ def render_open_interest_panel() -> None:
             "App window coverage": item["app_window_coverage_pct"],
             "Capture status": item["capture_status"],
         })
+    # Newest UTC date first so the current day is immediately visible.
+    daily_rows.reverse()
     st.dataframe(
         pd.DataFrame(daily_rows).style.format({
             "BUY prints": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
@@ -2847,7 +2850,7 @@ def render_open_interest_panel() -> None:
             "Minutes with trades": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
             "App window coverage": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
         }, na_rep="—"),
-        hide_index=True, use_container_width=True, height=135,
+        hide_index=True, use_container_width=True, height=280,
     )
     st.caption(
         "The table shows the latest seven UTC calendar dates, computed from classified Delta public taker prints captured by this app process. "
