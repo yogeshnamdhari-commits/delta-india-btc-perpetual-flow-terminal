@@ -1,5 +1,7 @@
 import pytest
 
+from daily_metrics import summarize_aggressor_flow
+
 from market_microstructure import (
     analyze_orderbook_events,
     best_visible_quote_levels,
@@ -30,6 +32,52 @@ def test_daily_utc_flow_reports_buy_sell_contracts_and_btc_equivalent():
     assert row["sell_btc"] == pytest.approx(0.08)
     assert row["net_delta_contracts"] == pytest.approx(40)
     assert row["captured_by_process"] is True
+
+
+
+def test_daily_utc_flow_includes_first_partial_minute_and_matches_rolling_flow():
+    now = 1_800_000_000.0
+    day = int(now // 86_400) * 86_400
+    process_started_at = float(day + 3_600 + 37)
+    first_observed_minute = day + 3_600
+    next_minute = day + 3_660
+    flow = {
+        first_observed_minute: {
+            "buy_count": 3, "sell_count": 2,
+            "buy_contracts": 13.5, "sell_contracts": 8.5,
+            "buy_usd": 810_000, "sell_usd": 510_000,
+        },
+        next_minute: {
+            "buy_count": 2, "sell_count": 1,
+            "buy_contracts": 7.0, "sell_contracts": 2.0,
+            "buy_usd": 420_000, "sell_usd": 120_000,
+        },
+    }
+    now = float(day + 3_720)
+
+    daily = summarize_daily_utc_flow(
+        flow,
+        now_ts=now,
+        feed_started_at=process_started_at,
+        trade_last_seen=now - 1,
+        connection_status="connected",
+        days=1,
+    )["days"][0]
+    rolling = summarize_aggressor_flow(
+        flow,
+        now_ts=now,
+        feed_started_at=process_started_at,
+    )
+
+    # The first minute key precedes the exact process start by 37 seconds,
+    # but its in-memory records were produced by trades received after startup.
+    assert daily["buy_prints"] == rolling["buy_count"] == 5
+    assert daily["sell_prints"] == rolling["sell_count"] == 3
+    assert daily["buy_contracts"] == pytest.approx(rolling["buy_contracts"])
+    assert daily["sell_contracts"] == pytest.approx(rolling["sell_contracts"])
+    assert daily["buy_usd"] == pytest.approx(rolling["buy_usd"])
+    assert daily["sell_usd"] == pytest.approx(rolling["sell_usd"])
+    assert daily["minutes_with_trades"] == rolling["minutes_with_trades"] == 2
 
 
 def test_daily_flow_marks_previous_day_unobserved_instead_of_fabricating_zero():
