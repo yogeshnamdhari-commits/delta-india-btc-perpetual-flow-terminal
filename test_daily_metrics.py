@@ -8,7 +8,7 @@ from daily_metrics import (
 )
 
 
-def test_parse_ticker_payload_normalizes_official_24h_fields():
+def test_parse_ticker_payload_derives_contract_notional_and_flags_bad_exchange_value():
     result = parse_ticker_payload({
         "success": True,
         "result": {
@@ -16,20 +16,40 @@ def test_parse_ticker_payload_normalizes_official_24h_fields():
             "volume": 123456,
             "turnover": 987654321,
             "turnover_symbol": "USD",
-            "oi": "250000",
-            "oi_value_usd": "1250000000",
+            "oi": "602",
+            "mark_price": "59541",
+            "oi_value_usd": "35843701",
             "timestamp": 1793923200000000,
         },
     })
 
-    assert result == {
-        "symbol": "BTCUSD",
-        "volume": 123456.0,
-        "turnover_usd": 987654321.0,
-        "open_interest_contracts": 250000.0,
-        "open_interest_value_usd": 1250000000.0,
-        "timestamp": 1793923200,
-    }
+    calculated = 602 * 0.001 * 59541
+    assert result["symbol"] == "BTCUSD"
+    assert result["volume"] == 123456.0
+    assert result["turnover_usd"] == 987654321.0
+    assert result["open_interest_contracts"] == 602.0
+    assert result["open_interest_mark_price"] == 59541.0
+    assert result["open_interest_value_usd"] == pytest.approx(calculated)
+    assert result["reported_open_interest_value_usd"] == 35843701.0
+    assert result["open_interest_value_usd_discrepancy_pct"] == pytest.approx(
+        (35843701 / calculated - 1) * 100
+    )
+    assert result["timestamp"] == 1793923200
+
+
+def test_parse_ticker_payload_does_not_use_unverified_reported_oi_value_without_mark_price():
+    result = parse_ticker_payload({
+        "result": {
+            "symbol": "BTCUSD",
+            "oi": "30",
+            "oi_value_usd": "999999",
+        },
+    })
+    assert result["open_interest_contracts"] == 30
+    assert result["open_interest_value_usd"] is None
+    assert result["reported_open_interest_value_usd"] == 999999
+    assert result["open_interest_mark_price"] is None
+    assert result["open_interest_value_usd_discrepancy_pct"] is None
 
 
 def test_parse_ticker_payload_selects_requested_symbol_from_list():
@@ -43,14 +63,20 @@ def test_parse_ticker_payload_selects_requested_symbol_from_list():
     assert result["volume"] == 10
     assert result["turnover_usd"] == 20
     assert result["open_interest_contracts"] == 30
+    assert result["open_interest_value_usd"] is None
 
 
 def test_parse_ticker_payload_does_not_invent_missing_or_invalid_values():
     result = parse_ticker_payload({"result": {"symbol": "BTCUSD", "volume": "nan", "oi": -1}})
     assert result["volume"] is None
     assert result["open_interest_contracts"] is None
+    assert result["open_interest_value_usd"] is None
     assert result["turnover_usd"] is None
 
+
+def test_parse_ticker_payload_rejects_invalid_contract_multiplier():
+    with pytest.raises(ValueError):
+        parse_ticker_payload({}, contract_value_btc=0)
 
 def test_summarize_aggressor_flow_uses_only_rolling_24h_buckets():
     now = 200_000.0
