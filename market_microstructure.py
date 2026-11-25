@@ -78,9 +78,12 @@ def summarize_daily_utc_flow(
     """Return current and previous UTC-day captured taker totals.
 
     app_window_coverage_pct measures only how much of the elapsed UTC-day
-    window falls after this process started. It is not a packet-loss or
-    uninterrupted-feed metric. Numeric totals are None when the process did
-    not observe any part of a day; unobserved history is never filled with zero.
+    window falls after this process started. The first minute bucket is rounded
+    down to its UTC minute boundary so trades actually captured after startup
+    within that partial minute are included. The in-memory flow map is created
+    by this process; no pre-start trade history is backfilled. Coverage is not a
+    packet-loss or uninterrupted-feed metric. Numeric totals are None when the
+    process did not observe any part of a day; unobserved history is never zero-filled.
     """
     now = _finite(now_ts)
     started = _finite(feed_started_at)
@@ -115,9 +118,17 @@ def summarize_daily_utc_flow(
         if captured:
             for raw_minute, raw_flow in flow_map.items():
                 minute = _epoch(raw_minute)
-                if minute is None or minute < observed_start or minute >= day_end:
+                # Flow records are keyed by UTC minute start. Include the
+                # process-start minute bucket because the feed can capture
+                # trades later in that minute even though its key precedes
+                # the exact process-start timestamp. The in-memory map is
+                # process-local, so this does not backfill pre-start trades.
+                first_observed_minute = max(
+                    day_start, int(started // 60) * 60
+                )
+                if minute is None or minute < first_observed_minute or minute >= day_end:
                     continue
-                if minute < day_start or not isinstance(raw_flow, Mapping):
+                if not isinstance(raw_flow, Mapping):
                     continue
                 minute_active = False
                 for side in ("buy", "sell"):
