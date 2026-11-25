@@ -226,6 +226,85 @@ def summarize_aggressor_flow(
     }
 
 
+
+def summarize_oi_funding_bias(
+    price_change_pct: Any,
+    oi_change_pct: Any,
+    funding_rate: Any,
+    funding_interval_seconds: Any = None,
+    *,
+    neutral_threshold_pct: float = 0.05,
+) -> dict[str, Any]:
+    """Describe 24h price/OI context and funding payer side without making a signal.
+
+    funding_rate is the raw fractional rate from Delta's funding WebSocket;
+    the returned percentage is rate × 100 for display. Positive funding means
+    longs pay shorts; negative funding means shorts pay longs.
+
+    Price/OI interpretations are heuristic context only. Aggregate OI cannot
+    identify which side opened or closed, and funding is a carry transfer, not
+    a directional entry signal.
+    """
+    price_pct = _number(price_change_pct)
+    oi_pct = _number(oi_change_pct)
+    funding = _number(funding_rate)
+    interval = _number(funding_interval_seconds)
+    threshold = _number(neutral_threshold_pct)
+    if threshold is None or threshold < 0:
+        raise ValueError("neutral_threshold_pct must be finite and non-negative")
+
+    if price_pct is None or oi_pct is None:
+        context_bias = "UNAVAILABLE — PRICE/OI DATA MISSING"
+        price_oi_regime = "WAIT — insufficient price or OI history"
+        context_explanation = "A directional context cannot be calculated without both 24h price change and 24h aggregate OI change."
+    elif abs(price_pct) <= threshold or abs(oi_pct) <= threshold:
+        context_bias = "MIXED / WAIT"
+        price_oi_regime = f"NEUTRAL — price or OI change is inside the ±{threshold:.2f}% noise band"
+        context_explanation = "Price and aggregate OI are not both expanding beyond the configured neutral band."
+    elif price_pct > 0 and oi_pct > 0:
+        context_bias = "BUY BIAS CANDIDATE"
+        price_oi_regime = "PRICE UP + OI UP — participation expanding with the advance"
+        context_explanation = "A conventional bullish price/OI combination; it does not prove that new long positions dominate."
+    elif price_pct < 0 and oi_pct > 0:
+        context_bias = "SELL BIAS CANDIDATE"
+        price_oi_regime = "PRICE DOWN + OI UP — participation expanding with the decline"
+        context_explanation = "A conventional bearish price/OI combination; it does not prove that new short positions dominate."
+    elif price_pct > 0 and oi_pct < 0:
+        context_bias = "MIXED / WAIT"
+        price_oi_regime = "PRICE UP + OI DOWN — possible short covering / deleveraging"
+        context_explanation = "The advance occurs while aggregate positions contract; treat it as possible short covering, not confirmed fresh-long buildup."
+    else:
+        context_bias = "MIXED / WAIT"
+        price_oi_regime = "PRICE DOWN + OI DOWN — possible long deleveraging"
+        context_explanation = "The decline occurs while aggregate positions contract; treat it as possible long deleveraging, not confirmed fresh-short buildup."
+
+    if funding is None:
+        funding_payer = "UNAVAILABLE"
+        funding_context = "Funding data is unavailable; no funding-side interpretation is made."
+    elif funding > 0:
+        funding_payer = "LONGS PAY SHORTS"
+        funding_context = "Positive funding means long positions pay shorts; this is a long carry cost, not an automatic SELL signal."
+    elif funding < 0:
+        funding_payer = "SHORTS PAY LONGS"
+        funding_context = "Negative funding means short positions pay longs; this is a short carry cost, not an automatic BUY signal."
+    else:
+        funding_payer = "NEAR ZERO"
+        funding_context = "Funding is zero; there is no payer-side tilt from the sign."
+
+    interval_hours = interval / 3600.0 if interval is not None and interval > 0 else None
+    return {
+        "context_bias": context_bias,
+        "price_oi_regime": price_oi_regime,
+        "context_explanation": context_explanation,
+        "price_change_pct": price_pct,
+        "oi_change_pct": oi_pct,
+        "funding_rate_pct": funding * 100.0 if funding is not None else None,
+        "funding_payer": funding_payer,
+        "funding_context": funding_context,
+        "funding_interval_hours": interval_hours,
+        "is_directional_candidate": context_bias in {"BUY BIAS CANDIDATE", "SELL BIAS CANDIDATE"},
+    }
+
 def summarize_open_interest_24h(
     history_rows: Sequence[Mapping[str, Any]] | None,
     current_oi_contracts: Any,
