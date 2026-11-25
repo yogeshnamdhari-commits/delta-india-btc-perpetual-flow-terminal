@@ -72,21 +72,30 @@ def parse_ticker_payload(
     if turnover_usd is None and str(row.get("turnover_symbol", "")).upper() == "USD":
         turnover_usd = _number(row.get("turnover"))
     oi = _number(row.get("oi"))
+    oi_contracts = _number(row.get("oi_contracts"))
     reported_oi_value_usd = _number(row.get("oi_value_usd"))
     mark_price = _number(row.get("mark_price"))
     if mark_price is None or mark_price <= 0:
         mark_price = None
     timestamp = _epoch_seconds(row.get("timestamp"))
 
-    valid_oi = oi if oi is not None and oi >= 0 else None
+    # REST oi field is reported in thousands of contracts; oi_contracts is
+    # the raw contract count and matches the WebSocket oi_contracts field.
+    # Use oi_contracts as authoritative; fall back to oi x 1000 only when
+    # oi_contracts is absent but oi is present.
+    valid_oi_contracts = (
+        oi_contracts
+        if oi_contracts is not None and oi_contracts >= 0
+        else (oi * 1000.0 if oi is not None and oi >= 0 else None)
+    )
     valid_reported_oi_value = (
         reported_oi_value_usd
         if reported_oi_value_usd is not None and reported_oi_value_usd >= 0
         else None
     )
     calculated_oi_value_usd = (
-        valid_oi * contract_btc * mark_price
-        if valid_oi is not None and mark_price is not None
+        valid_oi_contracts * contract_btc * mark_price
+        if valid_oi_contracts is not None and mark_price is not None
         else None
     )
     discrepancy_pct = (
@@ -103,7 +112,9 @@ def parse_ticker_payload(
         "symbol": symbol,
         "volume": volume if volume is not None and volume >= 0 else None,
         "turnover_usd": turnover_usd if turnover_usd is not None and turnover_usd >= 0 else None,
-        "open_interest_contracts": valid_oi,
+        "open_interest_contracts": valid_oi_contracts,
+        "oi_field_contracts": oi if oi is not None and oi >= 0 else None,
+        "oi_contracts_field": oi_contracts if oi_contracts is not None and oi_contracts >= 0 else None,
         "open_interest_value_usd": calculated_oi_value_usd,
         "reported_open_interest_value_usd": valid_reported_oi_value,
         "open_interest_mark_price": mark_price,

@@ -23,11 +23,14 @@ def test_parse_ticker_payload_derives_contract_notional_and_flags_bad_exchange_v
         },
     })
 
-    calculated = 602 * 0.001 * 59541
+    # REST oi field is in thousands of contracts; fallback multiplies by 1000.
+    calculated = 602 * 1000 * 0.001 * 59541
     assert result["symbol"] == "BTCUSD"
     assert result["volume"] == 123456.0
     assert result["turnover_usd"] == 987654321.0
-    assert result["open_interest_contracts"] == 602.0
+    assert result["open_interest_contracts"] == 602000.0
+    assert result["oi_field_contracts"] == 602.0
+    assert result["oi_contracts_field"] is None
     assert result["open_interest_mark_price"] == 59541.0
     assert result["open_interest_value_usd"] == pytest.approx(calculated)
     assert result["reported_open_interest_value_usd"] == 35843701.0
@@ -35,6 +38,30 @@ def test_parse_ticker_payload_derives_contract_notional_and_flags_bad_exchange_v
         (35843701 / calculated - 1) * 100
     )
     assert result["timestamp"] == 1793923200
+
+
+def test_parse_ticker_payload_uses_oi_contracts_field_when_present():
+    result = parse_ticker_payload({
+        "result": {
+            "symbol": "BTCUSD",
+            "volume": 123456,
+            "turnover": 987654321,
+            "turnover_symbol": "USD",
+            "oi": "638.4310",
+            "oi_contracts": "638431",
+            "mark_price": "58753.56577027",
+            "oi_value_usd": "37520526.0269",
+            "timestamp": 1795624049978671,
+        },
+    })
+
+    calculated = 638431 * 0.001 * 58753.56577027
+    assert result["open_interest_contracts"] == 638431.0
+    assert result["oi_field_contracts"] == 638.4310
+    assert result["oi_contracts_field"] == 638431.0
+    assert result["open_interest_value_usd"] == pytest.approx(calculated)
+    # Discrepancy should be tiny once oi_contracts is used correctly.
+    assert abs(result["open_interest_value_usd_discrepancy_pct"]) < 0.1
 
 
 def test_parse_ticker_payload_does_not_use_unverified_reported_oi_value_without_mark_price():
@@ -45,7 +72,7 @@ def test_parse_ticker_payload_does_not_use_unverified_reported_oi_value_without_
             "oi_value_usd": "999999",
         },
     })
-    assert result["open_interest_contracts"] == 30
+    assert result["open_interest_contracts"] == 30000
     assert result["open_interest_value_usd"] is None
     assert result["reported_open_interest_value_usd"] == 999999
     assert result["open_interest_mark_price"] is None
@@ -62,7 +89,8 @@ def test_parse_ticker_payload_selects_requested_symbol_from_list():
     result = parse_ticker_payload(payload)
     assert result["volume"] == 10
     assert result["turnover_usd"] == 20
-    assert result["open_interest_contracts"] == 30
+    assert result["open_interest_contracts"] == 30000
+    assert result["oi_field_contracts"] == 30
     assert result["open_interest_value_usd"] is None
 
 
