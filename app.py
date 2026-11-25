@@ -317,7 +317,9 @@ def load_daily_ticker_metrics() -> dict[str, Any]:
             timeout=6,
         )
         response.raise_for_status()
-        return parse_ticker_payload(response.json(), SYMBOL)
+        return parse_ticker_payload(
+            response.json(), SYMBOL, contract_value_btc=CONTRACT_VALUE_BTC
+        )
     except (requests.RequestException, ValueError, TypeError):
         _logger.warning("Daily ticker REST snapshot unavailable", exc_info=True)
         return parse_ticker_payload({}, SYMBOL)
@@ -2703,7 +2705,31 @@ def render_open_interest_panel() -> None:
     m6.metric(
         "OI value (USD)",
         "—" if oi_value_usd is None else f"${float(oi_value_usd):,.0f}",
+        help="Independently calculated as outstanding contracts × 0.001 BTC per contract × current Delta mark price.",
     )
+
+    reported_oi_value_usd = ticker_metrics.get("reported_open_interest_value_usd")
+    oi_mark_price = ticker_metrics.get("open_interest_mark_price")
+    oi_discrepancy_pct = ticker_metrics.get("open_interest_value_usd_discrepancy_pct")
+    if oi_value_usd is not None and current_oi is not None and oi_mark_price is not None:
+        st.caption(
+            f"OI USD notional calculation: {float(current_oi):,.0f} contracts × "
+            f"{CONTRACT_VALUE_BTC:g} BTC/contract × ${float(oi_mark_price):,.2f} mark price."
+        )
+        if reported_oi_value_usd is not None and oi_discrepancy_pct is not None and abs(float(oi_discrepancy_pct)) >= 5.0:
+            reported_ratio = float(reported_oi_value_usd) / float(oi_value_usd) if oi_value_usd > 0 else None
+            ratio_text = f" ({reported_ratio:,.1f}× the calculated value)" if reported_ratio is not None else ""
+            st.warning(
+                "Delta's reported oi_value_usd does not reconcile with the BTCUSD contract multiplier. "
+                f"Reported API field: ${float(reported_oi_value_usd):,.0f}; "
+                f"contract-based notional: ${float(oi_value_usd):,.0f}{ratio_text}. "
+                "The metric above uses the contract-based calculation; the raw API field is retained only for diagnostics."
+            )
+    elif reported_oi_value_usd is not None:
+        st.caption(
+            "OI USD notional is withheld because a valid contract count and mark price are not both available; "
+            "the unverified exchange-reported OI USD field is not displayed."
+        )
 
     st.markdown("**Open interest side availability**")
     oi_long_col, oi_short_col = st.columns(2)
