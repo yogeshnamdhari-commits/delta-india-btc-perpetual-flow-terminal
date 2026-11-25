@@ -4,6 +4,7 @@ from daily_metrics import (
     parse_daily_volume_candles,
     parse_ticker_payload,
     summarize_aggressor_flow,
+    summarize_oi_funding_bias,
     summarize_open_interest_24h,
 )
 
@@ -201,3 +202,57 @@ def test_parse_daily_volume_candles_sorts_and_discards_invalid_rows():
 def test_parse_daily_volume_candles_handles_empty_or_unexpected_payload():
     assert parse_daily_volume_candles({}) == []
     assert parse_daily_volume_candles({"result": "bad"}) == []
+
+
+def test_summarize_oi_funding_bias_marks_rising_price_and_oi_as_buy_candidate():
+    result = summarize_oi_funding_bias(
+        price_change_pct=1.2,
+        oi_change_pct=2.4,
+        funding_rate=0.0001,
+        funding_interval_seconds=28_800,
+    )
+    assert result["context_bias"] == "BUY BIAS CANDIDATE"
+    assert "PRICE UP + OI UP" in result["price_oi_regime"]
+    assert result["funding_payer"] == "LONGS PAY SHORTS"
+    assert result["funding_rate_pct"] == pytest.approx(0.01)
+    assert result["funding_interval_hours"] == pytest.approx(8)
+    assert result["is_directional_candidate"] is True
+    assert "not an automatic SELL signal" in result["funding_context"]
+
+
+def test_summarize_oi_funding_bias_marks_falling_price_and_rising_oi_as_sell_candidate():
+    result = summarize_oi_funding_bias(
+        price_change_pct=-1.1,
+        oi_change_pct=1.8,
+        funding_rate=-0.0002,
+        funding_interval_seconds=14_400,
+    )
+    assert result["context_bias"] == "SELL BIAS CANDIDATE"
+    assert "PRICE DOWN + OI UP" in result["price_oi_regime"]
+    assert result["funding_payer"] == "SHORTS PAY LONGS"
+    assert result["funding_rate_pct"] == pytest.approx(-0.02)
+    assert result["funding_interval_hours"] == pytest.approx(4)
+
+
+def test_summarize_oi_funding_bias_does_not_promote_deleveraging_to_buy_or_sell():
+    short_covering = summarize_oi_funding_bias(1.0, -0.8, 0.0)
+    long_deleveraging = summarize_oi_funding_bias(-1.0, -0.8, 0.0)
+    assert short_covering["context_bias"] == "MIXED / WAIT"
+    assert "short covering" in short_covering["price_oi_regime"].lower()
+    assert long_deleveraging["context_bias"] == "MIXED / WAIT"
+    assert "long deleveraging" in long_deleveraging["price_oi_regime"].lower()
+
+
+def test_summarize_oi_funding_bias_withholds_direction_when_inputs_missing_or_flat():
+    missing = summarize_oi_funding_bias(None, 1.0, None)
+    flat = summarize_oi_funding_bias(0.02, 1.0, 0.0)
+    assert missing["context_bias"] == "UNAVAILABLE — PRICE/OI DATA MISSING"
+    assert missing["funding_payer"] == "UNAVAILABLE"
+    assert flat["context_bias"] == "MIXED / WAIT"
+    assert flat["funding_payer"] == "NEAR ZERO"
+    assert flat["is_directional_candidate"] is False
+
+
+def test_summarize_oi_funding_bias_rejects_invalid_neutral_threshold():
+    with pytest.raises(ValueError):
+        summarize_oi_funding_bias(1.0, 1.0, 0.0, neutral_threshold_pct=-0.1)
