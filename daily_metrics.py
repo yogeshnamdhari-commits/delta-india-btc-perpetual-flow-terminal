@@ -24,14 +24,35 @@ def _epoch_seconds(value: Any) -> int | None:
     return int(number)
 
 
-def parse_ticker_payload(payload: Any, symbol: str = "BTCUSD") -> dict[str, Any]:
-    """Normalize the public REST ticker response without inventing missing fields."""
+def parse_ticker_payload(
+    payload: Any,
+    symbol: str = "BTCUSD",
+    *,
+    contract_value_btc: float = 0.001,
+) -> dict[str, Any]:
+    """Normalize ticker fields and independently derive BTCUSD OI USD notional.
+
+    Delta documents OI as the outstanding contract count. For BTCUSD,
+    contract_value_btc is the BTC amount per contract, so the defensible USD
+    notional is contracts × BTC per contract × mark price.
+
+    The exchange-reported oi_value_usd is retained for diagnostics only.
+    It is not used as the displayed value because it can disagree with the
+    product contract multiplier by orders of magnitude.
+    """
+    contract_btc = _number(contract_value_btc)
+    if contract_btc is None or contract_btc <= 0:
+        raise ValueError("contract_value_btc must be finite and positive")
+
     empty = {
         "symbol": symbol,
         "volume": None,
         "turnover_usd": None,
         "open_interest_contracts": None,
         "open_interest_value_usd": None,
+        "reported_open_interest_value_usd": None,
+        "open_interest_mark_price": None,
+        "open_interest_value_usd_discrepancy_pct": None,
         "timestamp": None,
     }
     if not isinstance(payload, Mapping):
@@ -51,20 +72,44 @@ def parse_ticker_payload(payload: Any, symbol: str = "BTCUSD") -> dict[str, Any]
     if turnover_usd is None and str(row.get("turnover_symbol", "")).upper() == "USD":
         turnover_usd = _number(row.get("turnover"))
     oi = _number(row.get("oi"))
-    oi_value_usd = _number(row.get("oi_value_usd"))
+    reported_oi_value_usd = _number(row.get("oi_value_usd"))
+    mark_price = _number(row.get("mark_price"))
+    if mark_price is None or mark_price <= 0:
+        mark_price = None
     timestamp = _epoch_seconds(row.get("timestamp"))
+
+    valid_oi = oi if oi is not None and oi >= 0 else None
+    valid_reported_oi_value = (
+        reported_oi_value_usd
+        if reported_oi_value_usd is not None and reported_oi_value_usd >= 0
+        else None
+    )
+    calculated_oi_value_usd = (
+        valid_oi * contract_btc * mark_price
+        if valid_oi is not None and mark_price is not None
+        else None
+    )
+    discrepancy_pct = (
+        (valid_reported_oi_value / calculated_oi_value_usd - 1.0) * 100.0
+        if (
+            valid_reported_oi_value is not None
+            and calculated_oi_value_usd is not None
+            and calculated_oi_value_usd > 0
+        )
+        else None
+    )
 
     return {
         "symbol": symbol,
         "volume": volume if volume is not None and volume >= 0 else None,
         "turnover_usd": turnover_usd if turnover_usd is not None and turnover_usd >= 0 else None,
-        "open_interest_contracts": oi if oi is not None and oi >= 0 else None,
-        "open_interest_value_usd": (
-            oi_value_usd if oi_value_usd is not None and oi_value_usd >= 0 else None
-        ),
+        "open_interest_contracts": valid_oi,
+        "open_interest_value_usd": calculated_oi_value_usd,
+        "reported_open_interest_value_usd": valid_reported_oi_value,
+        "open_interest_mark_price": mark_price,
+        "open_interest_value_usd_discrepancy_pct": discrepancy_pct,
         "timestamp": timestamp,
     }
-
 
 def parse_daily_volume_candles(payload: Any) -> list[dict[str, int | float]]:
     """Normalize BTCUSD 1d candles; volume follows the exchange candle window."""
