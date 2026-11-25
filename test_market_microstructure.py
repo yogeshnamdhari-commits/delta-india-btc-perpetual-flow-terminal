@@ -36,8 +36,7 @@ def test_daily_utc_flow_reports_buy_sell_contracts_and_btc_equivalent():
 
 
 def test_daily_utc_flow_includes_first_partial_minute_and_matches_rolling_flow():
-    now = 1_800_000_000.0
-    day = int(now // 86_400) * 86_400
+    day = int(1_800_000_000 // 86_400) * 86_400
     process_started_at = float(day + 3_600 + 37)
     first_observed_minute = day + 3_600
     next_minute = day + 3_660
@@ -45,12 +44,12 @@ def test_daily_utc_flow_includes_first_partial_minute_and_matches_rolling_flow()
         first_observed_minute: {
             "buy_count": 3, "sell_count": 2,
             "buy_contracts": 13.5, "sell_contracts": 8.5,
-            "buy_usd": 810_000, "sell_usd": 510_000,
+            "buy_usd": 810, "sell_usd": 510,
         },
         next_minute: {
             "buy_count": 2, "sell_count": 1,
             "buy_contracts": 7.0, "sell_contracts": 2.0,
-            "buy_usd": 420_000, "sell_usd": 120_000,
+            "buy_usd": 420, "sell_usd": 120,
         },
     }
     now = float(day + 3_720)
@@ -77,6 +76,7 @@ def test_daily_utc_flow_includes_first_partial_minute_and_matches_rolling_flow()
     assert daily["sell_contracts"] == pytest.approx(rolling["sell_contracts"])
     assert daily["buy_usd"] == pytest.approx(rolling["buy_usd"])
     assert daily["sell_usd"] == pytest.approx(rolling["sell_usd"])
+    assert daily["net_delta_contracts"] == pytest.approx(10.0)
     assert daily["minutes_with_trades"] == rolling["minutes_with_trades"] == 2
 
 
