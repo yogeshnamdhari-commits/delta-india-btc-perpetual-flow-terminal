@@ -237,8 +237,8 @@ def test_summarize_oi_funding_bias_marks_falling_price_and_rising_oi_as_sell_can
 
 
 def test_summarize_oi_funding_bias_does_not_promote_deleveraging_to_buy_or_sell():
-    short_covering = summarize_oi_funding_bias(1.0, -0.8, 0.0)
-    long_deleveraging = summarize_oi_funding_bias(-1.0, -0.8, 0.0)
+    short_covering = summarize_oi_funding_bias(1.0, -0.8, 0.0, oi_validation_passed=True)
+    long_deleveraging = summarize_oi_funding_bias(-1.0, -0.8, 0.0, oi_validation_passed=True)
     assert short_covering["context_bias"] == "MIXED / WAIT"
     assert "short covering" in short_covering["price_oi_regime"].lower()
     assert long_deleveraging["context_bias"] == "MIXED / WAIT"
@@ -246,8 +246,8 @@ def test_summarize_oi_funding_bias_does_not_promote_deleveraging_to_buy_or_sell(
 
 
 def test_summarize_oi_funding_bias_withholds_direction_when_inputs_missing_or_flat():
-    missing = summarize_oi_funding_bias(None, 1.0, None)
-    flat = summarize_oi_funding_bias(0.02, 1.0, 0.0)
+    missing = summarize_oi_funding_bias(None, 1.0, None, oi_validation_passed=True)
+    flat = summarize_oi_funding_bias(0.02, 1.0, 0.0, oi_validation_passed=True)
     assert missing["context_bias"] == "UNAVAILABLE — PRICE/OI DATA MISSING"
     assert missing["funding_payer"] == "UNAVAILABLE"
     assert flat["context_bias"] == "MIXED / WAIT"
