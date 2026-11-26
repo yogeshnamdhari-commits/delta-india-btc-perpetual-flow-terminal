@@ -78,6 +78,7 @@ class _FakeStreamlit:
     def warning(self, value, *args, **kwargs): self.messages.append(("warning", str(value)))
     def error(self, value, *args, **kwargs): self.messages.append(("error", str(value)))
     def caption(self, value, *args, **kwargs): self.messages.append(("caption", str(value)))
+    def markdown(self, value, *args, **kwargs): self.messages.append(("markdown", str(value)))
     def write(self, value, *args, **kwargs): self.messages.append(("write", str(value)))
 
 

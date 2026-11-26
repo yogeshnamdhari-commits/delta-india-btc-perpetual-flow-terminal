@@ -221,7 +221,7 @@ def evaluate_entry_confirmation(snapshot: Any, result: Any, *, feed_data: dict[s
     retest = _retest(snapshot, result, signal)
     if retest["observed"]: passed.append("optional structure retest/hold observed")
     liquidity_behavior = _liquidity_behavior(
-        list(data.get("depth_level_events", [])),
+        list(feed.get("depth_level_events", [])),
         list(getattr(snapshot, "recent_trades", [])),
         snapshot.ts_utc,
         tick_size=float(cfg.get("tick_size", 0.5)),
