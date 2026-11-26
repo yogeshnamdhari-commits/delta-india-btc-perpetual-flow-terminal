@@ -2830,21 +2830,27 @@ def render_open_interest_panel() -> None:
             else f"Funding channel stale ({funding_age:.0f}s); rate withheld"
         )
     )
-    if oi_baseline_valid:
+    if oi_history_validation["valid"]:
         rest_pair_diff_text = (
             "not supplied" if oi_history_validation["rest_field_diff_pct"] is None
             else f"{oi_history_validation['rest_field_diff_pct']:.3f}%"
         )
         st.caption(
-            f"OI scale validation: VERIFIED — historical candle scale ×{oi_history_validation['history_scale_factor']:g} "
+            f"OI history scale VERIFIED — candle scale ×{oi_history_validation['history_scale_factor']:g} "
             f"to raw contracts; REST oi × 1000 vs oi_contracts difference {rest_pair_diff_text}; "
             f"REST vs WebSocket OI difference {oi_history_validation['rest_ws_diff_pct']:.3f}%; "
-            f"historical/live alignment difference {oi_history_validation['history_alignment_diff_pct']:.3f}%; "
-            "24h baseline is valid."
+            f"historical/live alignment difference {oi_history_validation['history_alignment_diff_pct']:.3f}%."
         )
+        if oi_baseline_valid:
+            st.caption("24h OI baseline validation: PASS.")
+        else:
+            st.warning(
+                "Historical OI units are verified, but a valid 24h baseline is unavailable. "
+                "The normalized OI chart may be shown; the 24h percentage and BUY/SELL bias candidates are suppressed."
+            )
     else:
         st.warning(
-            "OI scale / 24h baseline validation failed. Historical OI chart and 24h OI percentage are withheld; "
+            "OI scale validation failed. Historical OI chart and 24h OI percentage are withheld; "
             f"BUY/SELL bias candidates are suppressed. Reason: {oi_history_validation['reason']}"
         )
     if funding_cap["status"] == "AT OR ABOVE CAP":
