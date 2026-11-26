@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -89,6 +90,7 @@ _NS = {
     "ZoneInfo": ZoneInfo,
     "threading": threading,
     "time": time,
+    "math": math,
     "json": json,
     "os": os,
     "zlib": zlib,

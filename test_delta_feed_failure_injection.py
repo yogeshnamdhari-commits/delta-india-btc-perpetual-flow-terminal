@@ -1,6 +1,6 @@
 """Fault-injection tests run against DeltaFeed's actual class body without booting Streamlit or opening sockets."""
 from __future__ import annotations
-import ast, json, logging, threading, time, zlib
+import ast, json, logging, math, threading, time, zlib
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,7 +25,7 @@ class DummyLogger:
 class FakeWebSocketApp: pass
 
 NS = {
-    "Any": Any, "threading": threading, "time": time, "deque": deque,
+    "Any": Any, "threading": threading, "time": time, "math": math, "deque": deque,
     "datetime": datetime, "timezone": timezone, "ZoneInfo": ZoneInfo,
     "json": json, "zlib": zlib,
     "websocket": SimpleNamespace(WebSocketApp=FakeWebSocketApp),
