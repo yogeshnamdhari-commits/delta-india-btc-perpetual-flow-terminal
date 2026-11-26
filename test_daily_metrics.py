@@ -212,6 +212,7 @@ def test_summarize_oi_funding_bias_marks_rising_price_and_oi_as_buy_candidate():
         oi_change_pct=2.4,
         funding_rate=0.0001,
         funding_interval_seconds=28_800,
+        oi_validation_passed=True,
     )
     assert result["context_bias"] == "BUY BIAS CANDIDATE"
     assert "PRICE UP + OI UP" in result["price_oi_regime"]
@@ -228,6 +229,7 @@ def test_summarize_oi_funding_bias_marks_falling_price_and_rising_oi_as_sell_can
         oi_change_pct=1.8,
         funding_rate=-0.0002,
         funding_interval_seconds=14_400,
+        oi_validation_passed=True,
     )
     assert result["context_bias"] == "SELL BIAS CANDIDATE"
     assert "PRICE DOWN + OI UP" in result["price_oi_regime"]
@@ -371,6 +373,16 @@ def test_normalize_oi_history_fails_closed_when_no_candidate_scale_aligns():
     assert result["normalized_history"] == []
     assert "does not align" in result["reason"]
 
+
+
+def test_oi_funding_bias_defaults_to_unavailable_without_explicit_validation():
+    result = summarize_oi_funding_bias(
+        price_change_pct=2.0,
+        oi_change_pct=3.0,
+        funding_rate=0.001,
+    )
+    assert result["context_bias"] == "UNAVAILABLE — OI SCALE / BASELINE NOT VALIDATED"
+    assert result["is_directional_candidate"] is False
 
 def test_oi_funding_bias_is_suppressed_when_scale_or_baseline_is_unverified():
     result = summarize_oi_funding_bias(
