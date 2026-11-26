@@ -198,7 +198,7 @@ def run_probe(duration_seconds: float, streamlit_url: str,
                     stats["book_snapshots"] += 1
                     book_sequence = incoming_sequence
                 elif action == "update":
-                    if book_sequence is None or incoming_sequence != book_sequence + 1 or not book_verified:
+                    if book_sequence is None or incoming_sequence != book_sequence + 1:
                         stats["sequence_gaps"] += 1
                         book_verified = False
                         continue
