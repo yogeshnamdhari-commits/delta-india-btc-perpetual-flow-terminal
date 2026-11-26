@@ -185,6 +185,16 @@ class MarketSnapshot:
     bid_liquidity: List[LiquidityLevel] = field(default_factory=list)
     atr_5m: Optional[float] = None
     atr_15m: Optional[float] = None
+    # Optional independent V2 context; the frozen baseline ignores these fields.
+    candles_1h: List[Candle] = field(default_factory=list)
+    best_bid_size: Optional[float] = None
+    best_ask_size: Optional[float] = None
+    queue_imbalance: Optional[float] = None
+    microprice_edge_bps: Optional[float] = None
+    order_flow_imbalance_ratio: Optional[float] = None
+    open_interest_contracts: Optional[float] = None
+    funding_rate: Optional[float] = None
+    mark_index_basis_bps: Optional[float] = None
 
     def __post_init__(self):
         if not math.isfinite(self.last_price) or not math.isfinite(self.bid) or not math.isfinite(self.ask):
@@ -193,8 +203,19 @@ class MarketSnapshot:
             raise ValueError("Invalid spread")
         # Normalise candle ordering so callers cannot pass newest-first data by
         # accident, and reject duplicated bar timestamps outright.
-        for name in ("candles_1m", "candles_5m", "candles_15m"):
+        for name in ("candles_1m", "candles_5m", "candles_15m", "candles_1h"):
             object.__setattr__(self, name, _validate_series(name, getattr(self, name)))
+        for name in ("best_bid_size", "best_ask_size", "open_interest_contracts"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"Invalid {name}")
+        for name in ("queue_imbalance", "microprice_edge_bps", "order_flow_imbalance_ratio",
+                     "funding_rate", "mark_index_basis_bps"):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"Invalid {name}")
+        if self.queue_imbalance is not None and not -1.0 <= self.queue_imbalance <= 1.0:
+            raise ValueError("queue_imbalance must be between -1 and 1")
         trades = sorted(self.recent_trades, key=lambda t: t.ts_utc)
         object.__setattr__(self, "recent_trades", trades)
         for tr in trades:
@@ -219,6 +240,10 @@ class SignalResult:
     risk_distance: Optional[float] = None
     reward_distance: Optional[float] = None
     risk_reward_ratio: Optional[float] = None
+    swept_level: Optional[float] = None
+    structure_break_level: Optional[float] = None
+    order_block_top: Optional[float] = None
+    order_block_bottom: Optional[float] = None
     setup_timeframe: Optional[str] = None
     setup_candle_timestamp: Optional[datetime] = None
     confirmation_conditions_passed: List[str] = field(default_factory=list)
@@ -620,12 +645,14 @@ def _evaluate(snap: MarketSnapshot, cfg: Dict[str, Any]) -> Tuple[SignalResult, 
     _validate_series("candles_1m", snap.candles_1m)
     _validate_series("candles_5m", snap.candles_5m)
     _validate_series("candles_15m", snap.candles_15m)
+    _validate_series("candles_1h", snap.candles_1h)
     now = snap.ts_utc
     res = SignalResult(generated_at_utc=now)
     res.input_candle_timestamps = {
         '1m': [c.ts_utc for c in snap.candles_1m],
         '5m': [c.ts_utc for c in snap.candles_5m],
         '15m': [c.ts_utc for c in snap.candles_15m],
+        '1h': [c.ts_utc for c in snap.candles_1h],
     }
     res.expires_at_utc = (snap.candles_1m[-1].ts_utc + timedelta(minutes=cfg["expiry_1m_candles"])
                           if snap.candles_1m else now + timedelta(minutes=cfg["expiry_1m_candles"]))
@@ -689,6 +716,11 @@ def _evaluate(snap: MarketSnapshot, cfg: Dict[str, Any]) -> Tuple[SignalResult, 
 
     direction = trend
     setup, passed, failed = detect_setup(snap, cfg, direction)
+    if setup is not None:
+        res.swept_level = setup.swept_level
+        res.structure_break_level = setup.structure_ref
+        res.order_block_top = setup.order_block.top
+        res.order_block_bottom = setup.order_block.bottom
     res.confirmation_conditions_passed = passed
     if setup is None:
         res.signal, res.state = Signal.WAIT, SignalState.WAIT
@@ -830,6 +862,8 @@ def _time_consistent(snap: MarketSnapshot) -> bool:
     if snap.candles_15m and snap.candles_15m[-1].ts_utc > snap.ts_utc:
         return False
     if snap.candles_5m and snap.candles_5m[-1].ts_utc > snap.ts_utc:
+        return False
+    if snap.candles_1h and snap.candles_1h[-1].ts_utc > snap.ts_utc:
         return False
     if last_candle > snap.ts_utc:
         return False

@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from signal_engine import SignalEngine
-from signal_integration_bridge import _seed_candle_history, _to_utc, build_market_snapshot, evaluate_feed_snapshot, evaluate_live_signal
+from signal_integration_bridge import _feed_health, _seed_candle_history, _to_utc, build_market_snapshot, evaluate_feed_snapshot, evaluate_live_signal
 
 UTC = timezone.utc
 
@@ -118,3 +118,47 @@ class TestFeedToDecisionPipeline(unittest.TestCase):
         self.assertTrue(r["metadata"]["engine_evaluated"] or r["decision"]=="BLOCKED")
 
 if __name__=="__main__": unittest.main()
+
+
+class TestBridgeMarketInputCompleteness(unittest.TestCase):
+    def test_analytics_trade_log_is_used_with_subsecond_timestamps(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["trades"] = data["trades"][-120:]
+        data["trade_log"] = [
+            (now.timestamp() - 299.875 + i * 0.125, 100000.0 + (i % 3) * 0.5,
+             1.0, "buy" if i % 2 == 0 else "sell")
+            for i in range(2400)
+        ]
+        snap = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertEqual(len(snap.recent_trades), 2400)
+        self.assertNotEqual(snap.recent_trades[0].ts_utc.microsecond, 0)
+        self.assertGreaterEqual((snap.recent_trades[-1].ts_utc -
+                                 snap.recent_trades[0].ts_utc).total_seconds(), 299.0)
+
+    def test_bridge_supplies_confirmed_swings_and_verified_l2_liquidity(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["asks"] = {"100001.0": "25", "100002.0": "40"}
+        data["bids"] = {"99999.0": "30", "99998.5": "50"}
+        data["ask_size"] = 25.0
+        data["bid_size"] = 30.0
+        data["book_last_update_at"] = now.timestamp() - 0.5
+        snap = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertTrue(snap.swings_5m)
+        self.assertTrue(snap.ask_liquidity and snap.bid_liquidity)
+        self.assertGreater(snap.best_ask_size, 0)
+        self.assertGreater(snap.best_bid_size, 0)
+
+    def test_quiet_ob_updates_do_not_make_book_stale(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        seen = dict(data["channel_last_seen"])
+        seen["ob_updates"] = now.timestamp() - 15.0
+        data["channel_last_seen"] = seen
+        health = _feed_health(data, now)
+        self.assertTrue(health["market_fresh"])
+        self.assertTrue(health["book_synced"])
+        self.assertTrue(health["checksum_verified"])
+        self.assertTrue(health["channel_freshness"]["ticker"])
+        self.assertTrue(health["channel_freshness"]["trades"])
