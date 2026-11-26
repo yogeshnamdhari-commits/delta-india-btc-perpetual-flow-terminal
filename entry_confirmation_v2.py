@@ -73,7 +73,7 @@ def _flow(trades: list[Any], direction: str) -> dict[str, Any]:
     share = buy_share if direction == "BUY" else sell_share
     response_ok = response > 0.5 if direction == "BUY" else response < -0.5
     enough = (count >= int(_env_float("ENTRY_CONFIRMATION_MIN_FLOW_TRADES", 20))
-              and span >= float(_env_float("ENTRY_CONFIRMATION_MIN_FLOW_SPAN_SECONDS", 60)))
+              and span >= float(_env_float("ENTRY_CONFIRMATION_MIN_FLOW_SPAN_SECONDS", 240)))
     dominance = share >= float(_env_float("ENTRY_CONFIRMATION_MIN_FLOW_DOMINANCE", 0.60))
     return {"status": "ALIGNED" if enough and dominance and response_ok else "INSUFFICIENT_OR_CONFLICTING",
             "aligned": bool(enough and dominance and response_ok), "trade_count": count,

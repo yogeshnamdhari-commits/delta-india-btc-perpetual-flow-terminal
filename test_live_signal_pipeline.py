@@ -23,7 +23,9 @@ def healthy_feed(now: datetime, *, candles: int = 1100) -> dict:
     return {"connection": "connected", "last_price": 100000.0, "bid": 99999.5,
             "ask": 100000.5, "book_synced": True, "sequence_gap_unresolved": False,
             "checksum_ok": True, "book_seq": 9001,
-            "channel_last_seen": {"ticker": seen, "ob_updates": seen, "trades": seen},
+            "channel_last_seen": {"ticker": seen, "ob_l1": seen, "ob_updates": seen, "trades": seen},
+            "asks": {"100000.5": "2"}, "bids": {"99999.5": "2"},
+            "ob_l1_bid": 99999.5, "ob_l1_ask": 100000.5,
             "last_market_message_at": seen, "trades": trades, "candles": rows,
             "total_disconnects": 0, "total_reconnects": 1}
 
@@ -151,7 +153,7 @@ class TestBridgeMarketInputCompleteness(unittest.TestCase):
         target, _source = _select_target(snap, None, 100000.5, "bullish")
         self.assertEqual(target, 100001.0)
 
-    def test_quiet_ob_updates_do_not_make_book_stale(self):
+    def test_quiet_ob_updates_do_not_make_book_stale_when_ob_l1_is_fresh(self):
         now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
         data = healthy_feed(now)
         seen = dict(data["channel_last_seen"])
@@ -161,8 +163,25 @@ class TestBridgeMarketInputCompleteness(unittest.TestCase):
         self.assertTrue(health["market_fresh"])
         self.assertTrue(health["book_synced"])
         self.assertTrue(health["checksum_verified"])
+        self.assertTrue(health["book_top_consistent"])
         self.assertTrue(health["channel_freshness"]["ticker"])
         self.assertTrue(health["channel_freshness"]["trades"])
+        self.assertTrue(health["channel_freshness"]["ob_l1"])
+
+    def test_stale_ob_l1_blocks_even_if_incremental_book_is_synchronized(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        seen = dict(data["channel_last_seen"])
+        seen["ob_l1"] = now.timestamp() - 12.0
+        data["channel_last_seen"] = seen
+        self.assertFalse(_feed_health(data, now)["market_fresh"])
+
+    def test_l1_l2_top_of_book_divergence_blocks_signal_market_freshness(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["ob_l1_bid"] = 99998.5
+        self.assertFalse(_feed_health(data, now)["book_top_consistent"])
+        self.assertFalse(_feed_health(data, now)["market_fresh"])
 
 
     def test_ofi_requires_minimum_event_count_and_observation_span(self):

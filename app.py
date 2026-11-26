@@ -669,6 +669,7 @@ class DeltaFeed:
             "payload": {
                 "channels": [
                     {"name": "ticker", "symbols": [SYMBOL]},
+                    {"name": "ob_l1", "symbols": [SYMBOL]},
                     {"name": "ob_updates", "symbols": [SYMBOL]},
                     {"name": "trades", "symbols": [SYMBOL]},
                     {"name": "mark_price", "symbols": [f"MARK:{SYMBOL}"]},
@@ -982,6 +983,11 @@ class DeltaFeed:
                 else:
                     self.data["checksum_ok"] = True if expected is not None else None
                     self.data["checksum_msg"] = "CRC32 verified" if expected is not None else "Exchange did not include checksum"
+                    if expected is None:
+                        # An unchecksummed incremental update breaks the verified
+                        # OFI sample epoch; raw records remain archived as unverified.
+                        self.data["ofi_events"].clear()
+                        self.data["depth_level_events"].clear()
                     self.data["sequence_gap_unresolved"] = False
                     self.data["book_updates"] += 1
                     self.data["ob_updates"] += 1
@@ -989,7 +995,10 @@ class DeltaFeed:
                     self.data["book_version"] = self.data.get("book_version", 0) + 1
                     update_time = time.time()
                     self.data["book_last_update_at"] = update_time
-                    if action == "update" and prior_bid[0] is not None and prior_ask[0] is not None:
+                    if (action == "update" and prior_bid[0] is not None and prior_ask[0] is not None
+                            and expected_int is not None and calculated == expected_int):
+                        # Only derive OFI/liquidity candidates from CRC-verified updates.
+                        # The raw full log below still records unchecksummed deltas as unverified.
                         # Keep price-level deltas with sequence + local receive time.
                         # L2 is aggregated by price; these observations are not order IDs.
                         for side_name, raw_levels, before_book, after_book in (
@@ -1037,7 +1046,7 @@ class DeltaFeed:
                         "action": "update" if action == "update" else "snapshot",
                         "seq": msg.get("seq"),
                         "cs": msg.get("cs"),
-                        "crc_ok": expected is None or (expected_int is not None and calculated == expected_int),
+                        "crc_ok": expected is not None and expected_int is not None and calculated == expected_int,
                         "checksummed": expected is not None,
                         "levels_a": msg.get("a", []),
                         "levels_b": msg.get("b", []),
@@ -1344,10 +1353,29 @@ class DeltaFeed:
                         }, to_full_log=True)
 
             elif kind == "ob_l1" and msg.get("sy") == SYMBOL:
-                self.data["ask"] = _f(msg.get("ap"), self.data["ask"])
-                self.data["ask_size"] = _f(msg.get("as"), self.data["ask_size"])
-                self.data["bid"] = _f(msg.get("bp"), self.data["bid"])
-                self.data["bid_size"] = _f(msg.get("bs"), self.data["bid_size"])
+                ob_ask = _f(msg.get("ap"))
+                ob_ask_size = _f(msg.get("as"))
+                ob_bid = _f(msg.get("bp"))
+                ob_bid_size = _f(msg.get("bs"))
+                if (ob_ask is not None and ob_bid is not None and ob_ask > ob_bid
+                        and ob_ask_size is not None and ob_ask_size > 0
+                        and ob_bid_size is not None and ob_bid_size > 0):
+                    self.data["ob_l1_ask"] = ob_ask
+                    self.data["ob_l1_ask_size"] = ob_ask_size
+                    self.data["ob_l1_bid"] = ob_bid
+                    self.data["ob_l1_bid_size"] = ob_bid_size
+                    self.data["ob_l1_last_update_at"] = now
+                    self.data["ask"] = ob_ask
+                    self.data["ask_size"] = ob_ask_size
+                    self.data["bid"] = ob_bid
+                    self.data["bid_size"] = ob_bid_size
+                    _log_event({
+                        "event": "channel_message", "channel": "ob_l1",
+                        "bid": ob_bid, "bid_size": ob_bid_size,
+                        "ask": ob_ask, "ask_size": ob_ask_size,
+                        "last_book_update_ts_us": msg.get("lts"),
+                        "server_publish_ts_us": msg.get("ts"),
+                    }, to_full_log=True)
 
             elif kind == "mark_price" and msg.get("sy") == f"MARK:{SYMBOL}":
                 self.data["mark_price"] = _f(msg.get("p"), self.data["mark_price"])

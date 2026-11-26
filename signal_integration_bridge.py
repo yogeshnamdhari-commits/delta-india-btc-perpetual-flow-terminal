@@ -80,7 +80,8 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 
 
 # ob_updates is change-driven, not a heartbeat. Book integrity stays a separate gate.
-_REQUIRED_CHANNEL_MAX_AGE_SECONDS = {"ticker": 8.0, "trades": 20.0}
+# ob_l1 is an independent top-of-book heartbeat (max unchanged-data interval 5s).
+_REQUIRED_CHANNEL_MAX_AGE_SECONDS = {"ticker": 8.0, "trades": 20.0, "ob_l1": 8.0}
 _SEED_HISTORY_CACHE: dict[str, Any] = {"path": None, "loaded_at": 0.0, "candles": []}
 _SEED_HISTORY_CACHE_TTL_SECONDS = 300.0
 
@@ -102,7 +103,21 @@ def _feed_health(feed_data: dict[str, Any], now: datetime) -> dict[str, Any]:
             age = None
         channel_age_seconds[channel] = age
         channel_freshness[channel] = age is not None and 0.0 <= age <= max_age
-    market_fresh = connection_healthy and all(channel_freshness.values())
+    asks = feed_data.get("asks", {}) or {}
+    bids = feed_data.get("bids", {}) or {}
+    l1_bid = _safe_float(feed_data.get("ob_l1_bid"), 0.0)
+    l1_ask = _safe_float(feed_data.get("ob_l1_ask"), 0.0)
+    try:
+        l2_best_bid = max(float(price) for price, size in bids.items() if _safe_float(size, 0.0) > 0)
+        l2_best_ask = min(float(price) for price, size in asks.items() if _safe_float(size, 0.0) > 0)
+        book_top_consistent = (
+            l1_bid > 0 and l1_ask > l1_bid
+            and abs(l1_bid - l2_best_bid) <= 0.5000001
+            and abs(l1_ask - l2_best_ask) <= 0.5000001
+        )
+    except (ValueError, TypeError):
+        book_top_consistent = False
+    market_fresh = connection_healthy and all(channel_freshness.values()) and book_top_consistent
     try:
         book_seen = channel_times.get("ob_updates")
         book_update_age = (now - _to_utc(book_seen)).total_seconds() if book_seen is not None else None
@@ -122,6 +137,7 @@ def _feed_health(feed_data: dict[str, Any], now: datetime) -> dict[str, Any]:
         "book_synced": book_synced,
         "sequence_gap_unresolved": sequence_gap_unresolved,
         "checksum_verified": checksum_verified,
+        "book_top_consistent": book_top_consistent,
         "feed_age_seconds": market_age,
         "book_update_age_seconds": book_update_age,
     }

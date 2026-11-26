@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 import pytest
-from entry_confirmation_v2 import evaluate_entry_confirmation, _liquidity_behavior
+from entry_confirmation_v2 import evaluate_entry_confirmation, _flow, _liquidity_behavior
 
 UTC = timezone.utc
 
@@ -103,3 +103,19 @@ def test_liquidity_behavior_rejects_invalid_tick_or_window():
         _liquidity_behavior([],[],now,tick_size=0)
     with pytest.raises(ValueError):
         _liquidity_behavior([],[],now,window_seconds=0)
+
+
+
+def test_trade_flow_must_cover_most_of_the_five_minute_window(monkeypatch):
+    monkeypatch.setenv("ENTRY_CONFIRMATION_MIN_FLOW_SPAN_SECONDS", "240")
+    now=datetime(2026,11,1,tzinfo=UTC)
+    full_span=[SimpleNamespace(ts_utc=now-timedelta(seconds=240-i*12),
+        price=100.0+i*0.1, size=1.0,
+        side_aggressor="BUY_TAKER" if i % 3 else "SELL_TAKER")
+        for i in range(21)]
+    full=_flow(full_span,"BUY")
+    short=_flow(full_span[5:],"BUY")
+    assert full["aligned"] is True
+    assert full["span_seconds"] >= 240
+    assert short["aligned"] is False
+    assert short["span_seconds"] < 240
