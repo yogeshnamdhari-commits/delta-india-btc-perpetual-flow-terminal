@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from signal_engine import SignalEngine
+from signal_engine import SignalEngine, _select_target
 from signal_integration_bridge import _feed_health, _seed_candle_history, _to_utc, build_market_snapshot, evaluate_feed_snapshot, evaluate_live_signal
 
 UTC = timezone.utc
@@ -149,6 +149,8 @@ class TestBridgeMarketInputCompleteness(unittest.TestCase):
         self.assertTrue(snap.ask_liquidity and snap.bid_liquidity)
         self.assertGreater(snap.best_ask_size, 0)
         self.assertGreater(snap.best_bid_size, 0)
+        target, _source = _select_target(snap, None, 100000.5, "bullish")
+        self.assertEqual(target, 100001.0)
 
     def test_quiet_ob_updates_do_not_make_book_stale(self):
         now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)

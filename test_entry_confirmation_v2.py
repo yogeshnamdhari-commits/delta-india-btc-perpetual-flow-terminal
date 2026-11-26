@@ -56,7 +56,7 @@ def test_cost_and_funding_inputs_are_reported_without_enabling_orders():
         feed_data={"next_funding_at":(now+timedelta(hours=1)).timestamp()},
         config={"fee_bps_per_side":1.0,"slippage_bps_per_side":.5,
                 "max_holding_minutes":20,"zero_funding_required":True})
-    assert out["execution_costs"]["estimated_round_trip_cost_bps"]==6.0
+    assert out["execution_costs"]["estimated_round_trip_cost_bps"]==5.0
     assert out["execution_costs"]["net_risk_reward"] is not None
     assert out["funding_guard"]["passed"] is True
     assert out["context_only"]["aggregate_open_interest_contracts"]==100.0

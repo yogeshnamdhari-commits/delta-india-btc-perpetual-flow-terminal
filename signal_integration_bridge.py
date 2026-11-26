@@ -522,14 +522,22 @@ def evaluate_feed_snapshot(feed_data: dict[str, Any], *, feed_state: dict[str, A
     if warmup and not failed:
         result_dict["reason_codes"] = ["WARMUP_INSUFFICIENT_CANDLES"]
         result_dict["human_readable_explanation"] = f"Warming up: 5m {count_5m}/{min_5m_candles}; 15m {count_15m}/{min_15m_candles}."
-    try:
-        from entry_confirmation_v2 import evaluate_entry_confirmation
-        v2_result = evaluate_entry_confirmation(snapshot, result, feed_data=feed_data)
-    except Exception as exc:
+    if decision in ("BUY", "SELL"):
+        try:
+            from entry_confirmation_v2 import evaluate_entry_confirmation
+            v2_result = evaluate_entry_confirmation(snapshot, result, feed_data=feed_data)
+        except Exception as exc:
+            v2_result = {
+                "version": "entry-confirmation-v2-shadow",
+                "state": "WAIT_CONFIRMATION_ENGINE_ERROR",
+                "reason_codes": [type(exc).__name__],
+                "shadow_only": True, "live_orders_allowed": False,
+            }
+    else:
         v2_result = {
             "version": "entry-confirmation-v2-shadow",
-            "state": "WAIT_CONFIRMATION_ENGINE_ERROR",
-            "reason_codes": [type(exc).__name__],
+            "state": "WAIT_BASELINE_DECISION_NOT_CONFIRMABLE",
+            "reason_codes": ["BASELINE_DECISION_" + str(decision)],
             "shadow_only": True, "live_orders_allowed": False,
         }
     return {
