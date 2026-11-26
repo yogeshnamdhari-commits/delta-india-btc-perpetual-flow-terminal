@@ -27,7 +27,7 @@ from okx_history_panel import render_okx_history_panel
 from binance_panel import render_binance_cross_venue_panel
 from trade_activity import summarize_trade_prints
 from zone_strength import measure_zone_strength
-from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h, summarize_oi_funding_bias
+from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h, summarize_oi_funding_bias, validate_and_normalize_open_interest_history, summarize_funding_cap
 from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
@@ -227,6 +227,7 @@ CHANNEL_STALE_SECONDS = {
 }
 BOOK_TICK = 0.5                # BTCUSD tick size (Delta product metadata, verified 2026-10-12)
 CONTRACT_VALUE_BTC = 0.001     # 1 contract = 0.001 BTC (Delta product metadata, verified 2026-10-12)
+BTCUSD_FUNDING_CAP_PCT = 1.00   # Delta India BTCUSD published funding cap: +/-1.00%; recheck contract specs when changed
 LIQ_BAND_DISTANCE = 2          # tick multiples around a cluster when flagging nearby resting liquidity
 
 st.set_page_config(
@@ -2655,20 +2656,64 @@ def render_open_interest_panel() -> None:
         contract_value_btc=CONTRACT_VALUE_BTC,
         window_seconds=86_400,
     )
-    current_oi = ticker_metrics.get("open_interest_contracts")
-    if current_oi is None:
-        current_oi = d.get("open_interest_contracts")
+    channel_seen = d.get("channel_last_seen") or {}
+    ws_ticker_seen = _f(channel_seen.get("ticker"))
+    ws_ticker_age = max(0.0, now_ts - ws_ticker_seen) if ws_ticker_seen is not None else None
+    ws_ticker_fresh = (
+        str(d.get("connection", "")).lower() == "connected"
+        and ws_ticker_age is not None
+        and ws_ticker_age <= float(CHANNEL_STALE_SECONDS.get("ticker") or 8)
+    )
+    rest_oi_timestamp = _f(ticker_metrics.get("timestamp"))
+    rest_oi_age = max(0.0, now_ts - rest_oi_timestamp) if rest_oi_timestamp is not None else None
+    rest_ticker_fresh = rest_oi_age is not None and rest_oi_age <= 60.0
+    rest_oi_raw = ticker_metrics.get("oi_field_contracts") if rest_ticker_fresh else None
+    rest_oi_contracts_raw = ticker_metrics.get("oi_contracts_field") if rest_ticker_fresh else None
+    websocket_oi_contracts = (
+        _f(d.get("open_interest_contracts")) if ws_ticker_fresh else None
+    )
+    current_oi = ticker_metrics.get("open_interest_contracts") if rest_ticker_fresh else None
+    if current_oi is None and ws_ticker_fresh:
+        current_oi = websocket_oi_contracts
+
+    oi_history_validation = validate_and_normalize_open_interest_history(
+        oi_history,
+        current_oi,
+        rest_oi=rest_oi_raw,
+        rest_oi_contracts=rest_oi_contracts_raw,
+        websocket_oi_contracts=websocket_oi_contracts,
+        now_ts=now_ts,
+        max_history_age_seconds=7_200,
+        max_rest_field_diff_pct=1.0,
+        max_rest_ws_diff_pct=2.0,
+        max_history_alignment_diff_pct=5.0,
+    )
+    normalized_oi_history = (
+        oi_history_validation["normalized_history"]
+        if oi_history_validation["valid"] else []
+    )
+    current_oi = (
+        oi_history_validation["current_oi_contracts"]
+        if oi_history_validation["source_values_valid"] else None
+    )
     oi_24h = summarize_open_interest_24h(
-        oi_history, current_oi, now_ts=now_ts, window_seconds=86_400
+        normalized_oi_history, current_oi, now_ts=now_ts, window_seconds=86_400
+    )
+    oi_baseline_valid = (
+        bool(oi_history_validation["valid"])
+        and oi_24h.get("baseline_contracts") is not None
+        and float(oi_24h.get("baseline_contracts") or 0) > 0
+        and oi_24h.get("change_pct") is not None
+        and oi_24h.get("baseline_timestamp") is not None
     )
     ws_turnover_usd = (d.get("ticker_24h") or {}).get("turnover_usd")
     volume = ticker_metrics.get("volume")
     turnover_usd = ticker_metrics.get("turnover_usd")
     if turnover_usd is None:
         turnover_usd = ws_turnover_usd
-    oi_value_usd = ticker_metrics.get("open_interest_value_usd")
-    oi_change_text = "Unavailable"
-    if oi_24h.get("change_contracts") is not None:
+    oi_value_usd = ticker_metrics.get("open_interest_value_usd") if oi_history_validation["source_values_valid"] and rest_ticker_fresh else None
+    oi_change_text = "UNAVAILABLE — OI VALIDATION FAILED"
+    if oi_baseline_valid and oi_24h.get("change_contracts") is not None:
         change = float(oi_24h["change_contracts"])
         pct = oi_24h.get("change_pct")
         oi_change_text = f"{change:+,.0f} contracts"
@@ -2712,17 +2757,9 @@ def render_open_interest_panel() -> None:
     # A transparent positioning-context heuristic: 24h mark-price direction +
     # 24h aggregate-OI change. Funding is shown separately as the payer side,
     # never used alone to manufacture a BUY/SELL direction.
-    channel_seen = d.get("channel_last_seen") or {}
-    ticker_seen = _f(channel_seen.get("ticker"))
-    ticker_age = max(0.0, now_ts - ticker_seen) if ticker_seen is not None else None
-    ticker_fresh = (
-        str(d.get("connection", "")).lower() == "connected"
-        and ticker_age is not None
-        and ticker_age <= float(CHANNEL_STALE_SECONDS.get("ticker") or 8)
-    )
     ticker_24h = d.get("ticker_24h") or {}
-    price_change_pct = _f(ticker_24h.get("mark_change_pct")) if ticker_fresh else None
-    oi_change_pct_for_bias = oi_24h.get("change_pct") if ticker_fresh else None
+    price_change_pct = _f(ticker_24h.get("mark_change_pct")) if ws_ticker_fresh else None
+    oi_change_pct_for_bias = oi_24h.get("change_pct") if oi_baseline_valid and ws_ticker_fresh else None
     funding_seen = _f(channel_seen.get("funding_rate"))
     funding_available = (
         str(d.get("connection", "")).lower() == "connected"
@@ -2737,6 +2774,14 @@ def render_open_interest_panel() -> None:
         funding_rate_raw,
         funding_interval_seconds,
         neutral_threshold_pct=0.05,
+        oi_validation_passed=oi_baseline_valid,
+    )
+    funding_cap = summarize_funding_cap(
+        funding_rate_raw,
+        BTCUSD_FUNDING_CAP_PCT,
+        funding_interval_seconds,
+        warning_utilization_pct=80.0,
+        high_utilization_pct=90.0,
     )
     st.markdown("**Open-interest + funding positioning context (24h heuristic)**")
     bias_col, funding_col, components_col = st.columns(3)
@@ -2779,11 +2824,43 @@ def render_open_interest_panel() -> None:
         if funding_seen is None
         else f"Funding channel last updated {max(0.0, now_ts - funding_seen):.0f}s ago"
     )
+    if oi_baseline_valid:
+        st.caption(
+            f"OI scale validation: VERIFIED — historical candle scale ×{oi_history_validation['history_scale_factor']:g} "
+            f"to raw contracts; REST oi × 1000 vs oi_contracts difference "
+            f"{oi_history_validation['rest_field_diff_pct']:.3f}%; REST vs WebSocket OI difference "
+            f"{oi_history_validation['rest_ws_diff_pct']:.3f}%; 24h baseline is valid."
+        )
+    else:
+        st.warning(
+            "OI scale / 24h baseline validation failed. Historical OI chart and 24h OI percentage are withheld; "
+            f"BUY/SELL bias candidates are suppressed. Reason: {oi_history_validation['reason']}"
+        )
+    if funding_cap["status"] == "AT OR ABOVE CAP":
+        st.error(
+            f"FUNDING AT/ABOVE BTCUSD CAP: {funding_cap['funding_rate_pct']:+.5f}% of ±"
+            f"{funding_cap['funding_cap_pct']:.2f}% cap "
+            f"({funding_cap['cap_utilization_pct']:.1f}% utilization). {funding_cap['message']}"
+        )
+    elif funding_cap["status"] == "NEAR CAP":
+        st.error(
+            f"FUNDING NEAR BTCUSD CAP: {funding_cap['funding_rate_pct']:+.5f}% of ±"
+            f"{funding_cap['funding_cap_pct']:.2f}% cap "
+            f"({funding_cap['cap_utilization_pct']:.1f}% utilization). {funding_cap['message']}"
+        )
+    elif funding_cap["status"] == "APPROACHING CAP":
+        st.warning(
+            f"FUNDING APPROACHING BTCUSD CAP: {funding_cap['funding_rate_pct']:+.5f}% of ±"
+            f"{funding_cap['funding_cap_pct']:.2f}% cap "
+            f"({funding_cap['cap_utilization_pct']:.1f}% utilization). {funding_cap['message']}"
+        )
     st.caption(
         f"{positioning['price_oi_regime']}. {positioning['context_explanation']} "
         f"{positioning['funding_context']} {funding_age_text}. "
         "Aggregate OI is not split into long/short positions; price/OI combinations are candidates only, "
-        "and funding does not flip the price/OI context or create an entry signal."
+        "and funding does not flip the price/OI context or create an entry signal. "
+        f"BTCUSD cap reference: ±{BTCUSD_FUNDING_CAP_PCT:.2f}% per product interval; "
+        "recheck Delta contract specifications for changes."
     )
 
     reported_oi_value_usd = ticker_metrics.get("reported_open_interest_value_usd")
@@ -2943,7 +3020,7 @@ def render_open_interest_panel() -> None:
     )
 
     oi_chart_rows = oi_24h.get("history") or []
-    if len(oi_chart_rows) >= 2:
+    if oi_history_validation["valid"] and len(oi_chart_rows) >= 2:
         oi_chart_df = pd.DataFrame(oi_chart_rows)
         oi_chart_df["Time (IST)"] = pd.to_datetime(
             oi_chart_df["time"], unit="s", utc=True
@@ -2960,14 +3037,17 @@ def render_open_interest_panel() -> None:
             margin=dict(l=8, r=8, t=12, b=8),
             template="plotly_dark",
             xaxis_title="Time (IST)",
-            yaxis_title="Open interest (contracts)",
+            yaxis_title="Open interest (normalized raw contracts)",
             showlegend=False,
         )
         oi_fig.update_xaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
         oi_fig.update_yaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
         st.plotly_chart(oi_fig, use_container_width=True, key="btcusd_oi_24h_chart")
     else:
-        st.info("24-hour OI history is unavailable from Delta at the moment; current OI is shown when the ticker is available.")
+        st.info(
+            "Open-interest history chart is withheld because its unit scale or live-source reconciliation "
+            "has not been verified. Current OI is shown only when the REST/WebSocket source check passes."
+        )
     st.caption(
         "Open interest is aggregate outstanding contracts. It is not split into BUY-side and SELL-side OI: "
         "every open contract has both a long and a short counterparty. The directional table above is taker-aggressor traded volume, not long/short positioning. "
