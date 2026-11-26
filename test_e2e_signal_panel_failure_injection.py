@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -78,6 +79,7 @@ class _FakeStreamlit:
     def warning(self, value, *args, **kwargs): self.messages.append(("warning", str(value)))
     def error(self, value, *args, **kwargs): self.messages.append(("error", str(value)))
     def caption(self, value, *args, **kwargs): self.messages.append(("caption", str(value)))
+    def markdown(self, value, *args, **kwargs): self.messages.append(("markdown", str(value)))
     def write(self, value, *args, **kwargs): self.messages.append(("write", str(value)))
 
 
@@ -88,6 +90,7 @@ _NS = {
     "ZoneInfo": ZoneInfo,
     "threading": threading,
     "time": time,
+    "math": math,
     "json": json,
     "os": os,
     "zlib": zlib,
@@ -149,12 +152,15 @@ def _healthy_feed(now: float):
         "checksum_msg": "CRC32 verified (synthetic fixture)",
         "asks": {"100000.5": "2"},
         "bids": {"99999.5": "2"},
+        "ob_l1_bid": 99999.5,
+        "ob_l1_ask": 100000.5,
         "channel_last_seen": {
             "ticker": seen,
+            "ob_l1": seen,
             "ob_updates": seen,
             "trades": seen,
         },
-        "channel_message_counts": {"ticker": 1, "ob_updates": 1, "trades": 20},
+        "channel_message_counts": {"ticker": 1, "ob_l1": 1, "ob_updates": 1, "trades": 20},
         "total_messages_received": 22,
         "total_disconnects": 0,
         "total_reconnects": 0,
@@ -256,6 +262,16 @@ class TestEndToEndSignalPanelFailureRecovery(unittest.TestCase):
                 "q": [100000.5, 2, 99999.5, 2],
                 "m": 100000.0,
             }],
+        }))
+        self.feed._on_message(socket, json.dumps({
+            "type": "ob_l1",
+            "sy": "BTCUSD",
+            "ap": "100000.5",
+            "as": "2",
+            "bp": "99999.5",
+            "bs": "2",
+            "lts": int(time.time() * 1_000_000),
+            "ts": int(time.time() * 1_000_000),
         }))
         self.feed._on_message(socket, json.dumps({
             "type": "trades",
@@ -364,7 +380,8 @@ class TestEndToEndSignalPanelFailureRecovery(unittest.TestCase):
         self.assertEqual(trade["symbol"], "BTCUSD")
         self.assertEqual(trade["exchange_trade_ts_us"], trade_ts_us)
         self.assertEqual(trade["server_publish_ts_us"], server_ts_us)
-        self.assertEqual(trade["ts"], trade_ts_us // 1_000_000)
+        self.assertAlmostEqual(trade["ts"], trade_ts_us / 1_000_000.0, places=6)
+        self.assertNotEqual(trade["ts"], float(trade_ts_us // 1_000_000))
         self.assertTrue(trade.get("ts_utc"), "local capture timestamp should remain present")
 
 

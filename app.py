@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -522,6 +523,7 @@ class DeltaFeed:
             "asks": {},
             "bids": {},
             "book_seq": None,
+            "book_last_update_at": None,
             "book_synced": False,
             "sequence_gap_unresolved": True,
             "checksum_ok": None,
@@ -547,7 +549,9 @@ class DeltaFeed:
             "total_reconnects": 0,
             # --- order-flow tracking (added 2026-10-13 upgrade) ---
             "book_version": 0,            # bumped on every applied book message (render cache key)
-            "trade_log": deque(maxlen=20000),     # (exchange_ts, price, contracts, buy/sell)
+            "trade_log": deque(maxlen=100000),    # exchange time (fractional seconds), price, contracts, side
+            "ofi_events": deque(maxlen=20000),     # sequence/checksum-qualified L1 OFI events
+            "depth_level_events": deque(maxlen=50000),  # price-level changes for absorption/refill candidates
             # Per-minute aggressor aggregates retain timestamp-aligned flow after
             # individual prints roll out of trade_log. Bounded to 30 days in memory;
             # never persisted or backfilled.
@@ -601,6 +605,9 @@ class DeltaFeed:
             copy["bids"] = dict(self.data["bids"])
             copy["channel_last_seen"] = dict(self.data["channel_last_seen"])
             copy["trade_log"] = list(self.data["trade_log"])
+            copy["ofi_events"] = list(self.data["ofi_events"])
+            copy["depth_level_events"] = list(self.data["depth_level_events"])
+            copy["book_last_update_at"] = self.data.get("book_last_update_at")
             copy["trade_flow_minutes"] = {
                 int(minute): dict(flow)
                 for minute, flow in self.data["trade_flow_minutes"].items()
@@ -662,6 +669,7 @@ class DeltaFeed:
             "payload": {
                 "channels": [
                     {"name": "ticker", "symbols": [SYMBOL]},
+                    {"name": "ob_l1", "symbols": [SYMBOL]},
                     {"name": "ob_updates", "symbols": [SYMBOL]},
                     {"name": "trades", "symbols": [SYMBOL]},
                     {"name": "mark_price", "symbols": [f"MARK:{SYMBOL}"]},
@@ -883,7 +891,19 @@ class DeltaFeed:
             return
 
         with self.lock:
+            prior_bid_book = dict(self.data["bids"])
+            prior_ask_book = dict(self.data["asks"])
+            prior_bids = [(float(p), _f(q, 0.0) or 0.0) for p, q in self.data["bids"].items()
+                          if (_f(q, 0.0) or 0.0) > 0]
+            prior_asks = [(float(p), _f(q, 0.0) or 0.0) for p, q in self.data["asks"].items()
+                          if (_f(q, 0.0) or 0.0) > 0]
+            prior_bid = max(prior_bids, key=lambda x: x[0]) if prior_bids else (None, None)
+            prior_ask = min(prior_asks, key=lambda x: x[0]) if prior_asks else (None, None)
             if action == "snapshot":
+                # A full snapshot starts a new sequence epoch. Do not combine
+                # pre-resync OFI/depth events with deltas from this new book.
+                self.data["ofi_events"].clear()
+                self.data["depth_level_events"].clear()
                 self.data["asks"] = {}
                 self.data["bids"] = {}
                 self._apply_levels(self.data["asks"], msg.get("a", []))
@@ -932,6 +952,8 @@ class DeltaFeed:
                 return
 
             if do_resub:
+                self.data["ofi_events"].clear()
+                self.data["depth_level_events"].clear()
                 self._send_resubscribe(resync_reason)
             else:
                 expected = msg.get("cs")
@@ -946,6 +968,8 @@ class DeltaFeed:
                     self.data["book_synced"] = False
                     self.data["sequence_gap_unresolved"] = True
                     self.data["checksum_msg"] = f"CRC mismatch (expected {expected}, calculated {calculated}); reloading book"
+                    self.data["ofi_events"].clear()
+                    self.data["depth_level_events"].clear()
                     resync_reason = self.data["checksum_msg"]
                     do_resub = True
                     _logger.error("Order-book CRC32 mismatch: expected=%s calculated=%s; resubscribing", expected, calculated)
@@ -959,11 +983,61 @@ class DeltaFeed:
                 else:
                     self.data["checksum_ok"] = True if expected is not None else None
                     self.data["checksum_msg"] = "CRC32 verified" if expected is not None else "Exchange did not include checksum"
+                    if expected is None:
+                        # An unchecksummed incremental update breaks the verified
+                        # OFI sample epoch; raw records remain archived as unverified.
+                        self.data["ofi_events"].clear()
+                        self.data["depth_level_events"].clear()
                     self.data["sequence_gap_unresolved"] = False
                     self.data["book_updates"] += 1
                     self.data["ob_updates"] += 1
                     self.data["book_synced"] = True
                     self.data["book_version"] = self.data.get("book_version", 0) + 1
+                    update_time = time.time()
+                    self.data["book_last_update_at"] = update_time
+                    if (action == "update" and prior_bid[0] is not None and prior_ask[0] is not None
+                            and expected_int is not None and calculated == expected_int):
+                        # Only derive OFI/liquidity candidates from CRC-verified updates.
+                        # The raw full log below still records unchecksummed deltas as unverified.
+                        # Keep price-level deltas with sequence + local receive time.
+                        # L2 is aggregated by price; these observations are not order IDs.
+                        for side_name, raw_levels, before_book, after_book in (
+                            ("bid", msg.get("b", []), prior_bid_book, self.data["bids"]),
+                            ("ask", msg.get("a", []), prior_ask_book, self.data["asks"]),
+                        ):
+                            if not isinstance(raw_levels, list):
+                                continue
+                            for level in raw_levels:
+                                if not isinstance(level, (list, tuple)) or len(level) < 2:
+                                    continue
+                                price_key = str(level[0])
+                                old_size = _f(before_book.get(price_key), 0.0) or 0.0
+                                new_size = _f(after_book.get(price_key), 0.0) or 0.0
+                                delta_size = new_size - old_size
+                                if delta_size:
+                                    self.data["depth_level_events"].append({
+                                        "ts": update_time, "seq": incoming_seq, "side": side_name,
+                                        "price": _f(level[0], 0.0), "previous_size": old_size,
+                                        "new_size": new_size, "delta": delta_size,
+                                    })
+                        bid_rows = [(float(p), _f(q, 0.0) or 0.0) for p, q in self.data["bids"].items()
+                                    if (_f(q, 0.0) or 0.0) > 0]
+                        ask_rows = [(float(p), _f(q, 0.0) or 0.0) for p, q in self.data["asks"].items()
+                                    if (_f(q, 0.0) or 0.0) > 0]
+                        new_bid = max(bid_rows, key=lambda x: x[0]) if bid_rows else (None, None)
+                        new_ask = min(ask_rows, key=lambda x: x[0]) if ask_rows else (None, None)
+                        if new_bid[0] is not None and new_ask[0] is not None:
+                            bid_flow = (new_bid[1] if new_bid[0] > prior_bid[0] else
+                                        new_bid[1] - prior_bid[1] if new_bid[0] == prior_bid[0] else
+                                        -prior_bid[1])
+                            ask_flow = (-new_ask[1] if new_ask[0] < prior_ask[0] else
+                                        prior_ask[1] - new_ask[1] if new_ask[0] == prior_ask[0] else
+                                        prior_ask[1])
+                            depth_ref = max(prior_bid[1] + prior_ask[1] + new_bid[1] + new_ask[1], 1.0)
+                            self.data["ofi_events"].append({
+                                "ts": update_time, "seq": incoming_seq,
+                                "ofi": bid_flow + ask_flow, "depth_ref": depth_ref,
+                            })
                     if not self._checksum_logged:
                         self._checksum_logged = True
                         _logger.info("Order-book CRC32 verified against exchange checksum (cs=%s)", calculated)
@@ -972,10 +1046,13 @@ class DeltaFeed:
                         "action": "update" if action == "update" else "snapshot",
                         "seq": msg.get("seq"),
                         "cs": msg.get("cs"),
-                        "crc_ok": expected is None or (expected_int is not None and calculated == expected_int),
-                        "checksummed": expected is not None
-                    })
-                    self.data["last_market_message_at"] = time.time()
+                        "crc_ok": expected is not None and expected_int is not None and calculated == expected_int,
+                        "checksummed": expected is not None,
+                        "levels_a": msg.get("a", []),
+                        "levels_b": msg.get("b", []),
+                        "received_at_epoch": update_time,
+                    }, to_full_log=True)
+                    self.data["last_market_message_at"] = update_time
                     self.data["last_market_type"] = "ob_updates"
 
     def _increment_message_count(self, channel: str) -> None:
@@ -1163,7 +1240,14 @@ class DeltaFeed:
                     self.data["last_price"] = price
                     self.data["trade_count"] += 1
                     self.data["cvd_value"] += signed
-                    trade_ts = _ts_seconds(msg.get("t")) or int(now)
+                    # Preserve Delta trade event time at sub-second precision.
+                    try:
+                        raw_trade_ts = float(msg.get("t"))
+                        trade_ts = raw_trade_ts / 1_000_000.0 if raw_trade_ts >= 1e14 else raw_trade_ts
+                        if not math.isfinite(trade_ts) or trade_ts <= 0:
+                            trade_ts = now
+                    except (TypeError, ValueError, OverflowError):
+                        trade_ts = now
                     self.data["trades"].appendleft({
                         "time": datetime.fromtimestamp(trade_ts, timezone.utc).astimezone(TZ_IST).strftime("%H:%M:%S.%f")[:-3],
                         "side": side,
@@ -1269,10 +1353,29 @@ class DeltaFeed:
                         }, to_full_log=True)
 
             elif kind == "ob_l1" and msg.get("sy") == SYMBOL:
-                self.data["ask"] = _f(msg.get("ap"), self.data["ask"])
-                self.data["ask_size"] = _f(msg.get("as"), self.data["ask_size"])
-                self.data["bid"] = _f(msg.get("bp"), self.data["bid"])
-                self.data["bid_size"] = _f(msg.get("bs"), self.data["bid_size"])
+                ob_ask = _f(msg.get("ap"))
+                ob_ask_size = _f(msg.get("as"))
+                ob_bid = _f(msg.get("bp"))
+                ob_bid_size = _f(msg.get("bs"))
+                if (ob_ask is not None and ob_bid is not None and ob_ask > ob_bid
+                        and ob_ask_size is not None and ob_ask_size > 0
+                        and ob_bid_size is not None and ob_bid_size > 0):
+                    self.data["ob_l1_ask"] = ob_ask
+                    self.data["ob_l1_ask_size"] = ob_ask_size
+                    self.data["ob_l1_bid"] = ob_bid
+                    self.data["ob_l1_bid_size"] = ob_bid_size
+                    self.data["ob_l1_last_update_at"] = now
+                    self.data["ask"] = ob_ask
+                    self.data["ask_size"] = ob_ask_size
+                    self.data["bid"] = ob_bid
+                    self.data["bid_size"] = ob_bid_size
+                    _log_event({
+                        "event": "channel_message", "channel": "ob_l1",
+                        "bid": ob_bid, "bid_size": ob_bid_size,
+                        "ask": ob_ask, "ask_size": ob_ask_size,
+                        "last_book_update_ts_us": msg.get("lts"),
+                        "server_publish_ts_us": msg.get("ts"),
+                    }, to_full_log=True)
 
             elif kind == "mark_price" and msg.get("sy") == f"MARK:{SYMBOL}":
                 self.data["mark_price"] = _f(msg.get("p"), self.data["mark_price"])
@@ -4595,9 +4698,9 @@ def _render_signal_panel() -> None:
         shadow._persist_shadow_trade(expired_trade)
 
     if decision == "BUY":
-        st.success("CONFIRMED BUY · Analysis only — no order has been placed")
+        st.success("BASELINE BUY SIGNAL · Analysis only — no order has been placed")
     elif decision == "SELL":
-        st.success("CONFIRMED SELL · Analysis only — no order has been placed")
+        st.success("BASELINE SELL SIGNAL · Analysis only — no order has been placed")
     elif decision == "WAIT":
         st.info("WAIT · No confirmed entry signal")
     else:
@@ -4608,6 +4711,22 @@ def _render_signal_panel() -> None:
     c3.metric("CRC verified", str(decision_record.get("crc_valid", False)))
     age = decision_record.get("feed_age_seconds")
     c4.metric("Last market message age", "—" if age is None else f"{float(age):.2f}s")
+    v2 = decision_record.get("entry_confirmation_v2") or {}
+    st.markdown("**V2 entry confirmation — shadow assessment**")
+    v2_status = v2.get("state", "UNAVAILABLE")
+    st.caption(f"V2 status: {v2_status} · shadow-only · live orders disabled")
+    if v2_status == "PAPER_REVIEW_CANDIDATE":
+        st.success("V2 evidence gates passed for paper review only; this is not live-trading approval.")
+    elif v2.get("reason_codes"):
+        st.caption("V2 gates waiting: " + "; ".join(str(x) for x in v2.get("reason_codes", [])))
+    v2_costs = v2.get("execution_costs") or {}
+    v2_cols = st.columns(3)
+    v2_cols[0].metric("1h context", (v2.get("timeframe_context") or {}).get("1h", {}).get("state", "—"))
+    net_rr = v2_costs.get("net_risk_reward")
+    v2_cols[1].metric("Net RR", "—" if net_rr is None else f"{float(net_rr):.2f}:1")
+    cost_ready = (v2_costs.get("fee_bps_per_side") is not None
+                  and v2_costs.get("slippage_bps_per_side") is not None)
+    v2_cols[2].metric("Execution cost model", "configured" if cost_ready else "missing")
     if decision in ("BUY", "SELL"):
         fields = (("Proposed entry", "proposed_entry"), ("Stop-loss", "stop_loss"),
                   ("Take-profit", "take_profit"), ("Risk/reward", "risk_reward_ratio"))

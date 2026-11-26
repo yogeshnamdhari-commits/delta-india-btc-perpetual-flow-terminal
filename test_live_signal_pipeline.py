@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from signal_engine import SignalEngine
-from signal_integration_bridge import _seed_candle_history, _to_utc, build_market_snapshot, evaluate_feed_snapshot, evaluate_live_signal
+from signal_engine import SignalEngine, _select_target
+from signal_integration_bridge import _feed_health, _seed_candle_history, _to_utc, build_market_snapshot, evaluate_feed_snapshot, evaluate_live_signal
 
 UTC = timezone.utc
 
@@ -23,7 +23,9 @@ def healthy_feed(now: datetime, *, candles: int = 1100) -> dict:
     return {"connection": "connected", "last_price": 100000.0, "bid": 99999.5,
             "ask": 100000.5, "book_synced": True, "sequence_gap_unresolved": False,
             "checksum_ok": True, "book_seq": 9001,
-            "channel_last_seen": {"ticker": seen, "ob_updates": seen, "trades": seen},
+            "channel_last_seen": {"ticker": seen, "ob_l1": seen, "ob_updates": seen, "trades": seen},
+            "asks": {"100000.5": "2"}, "bids": {"99999.5": "2"},
+            "ob_l1_bid": 99999.5, "ob_l1_ask": 100000.5,
             "last_market_message_at": seen, "trades": trades, "candles": rows,
             "total_disconnects": 0, "total_reconnects": 1}
 
@@ -117,4 +119,103 @@ class TestFeedToDecisionPipeline(unittest.TestCase):
         self.assertIn(r["decision"],("WAIT","BUY","SELL","BLOCKED"))
         self.assertTrue(r["metadata"]["engine_evaluated"] or r["decision"]=="BLOCKED")
 
-if __name__=="__main__": unittest.main()
+
+
+class TestBridgeMarketInputCompleteness(unittest.TestCase):
+    def test_analytics_trade_log_is_used_with_subsecond_timestamps(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["trades"] = data["trades"][-120:]
+        data["trade_log"] = [
+            (now.timestamp() - 299.875 + i * 0.125, 100000.0 + (i % 3) * 0.5,
+             1.0, "buy" if i % 2 == 0 else "sell")
+            for i in range(2400)
+        ]
+        snap = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertEqual(len(snap.recent_trades), 2400)
+        self.assertNotEqual(snap.recent_trades[0].ts_utc.microsecond, 0)
+        self.assertGreaterEqual((snap.recent_trades[-1].ts_utc -
+                                 snap.recent_trades[0].ts_utc).total_seconds(), 299.0)
+
+    def test_bridge_supplies_confirmed_swings_and_verified_l2_liquidity(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["asks"] = {"100001.0": "25", "100002.0": "40"}
+        data["bids"] = {"99999.0": "30", "99998.5": "50"}
+        data["ask_size"] = 25.0
+        data["bid_size"] = 30.0
+        data["book_last_update_at"] = now.timestamp() - 0.5
+        snap = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertTrue(snap.swings_5m)
+        self.assertTrue(snap.ask_liquidity and snap.bid_liquidity)
+        self.assertGreater(snap.best_ask_size, 0)
+        self.assertGreater(snap.best_bid_size, 0)
+        target, _source = _select_target(snap, None, 100000.5, "bullish")
+        self.assertEqual(target, 100001.0)
+
+    def test_quiet_ob_updates_do_not_make_book_stale_when_ob_l1_is_fresh(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        seen = dict(data["channel_last_seen"])
+        seen["ob_updates"] = now.timestamp() - 15.0
+        data["channel_last_seen"] = seen
+        health = _feed_health(data, now)
+        self.assertTrue(health["market_fresh"])
+        self.assertTrue(health["book_synced"])
+        self.assertTrue(health["checksum_verified"])
+        self.assertTrue(health["book_top_consistent"])
+        self.assertTrue(health["channel_freshness"]["ticker"])
+        self.assertTrue(health["channel_freshness"]["trades"])
+        self.assertTrue(health["channel_freshness"]["ob_l1"])
+
+    def test_stale_ob_l1_blocks_even_if_incremental_book_is_synchronized(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        seen = dict(data["channel_last_seen"])
+        seen["ob_l1"] = now.timestamp() - 12.0
+        data["channel_last_seen"] = seen
+        self.assertFalse(_feed_health(data, now)["market_fresh"])
+
+    def test_l1_l2_top_of_book_divergence_blocks_signal_market_freshness(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["ob_l1_bid"] = 99998.5
+        self.assertFalse(_feed_health(data, now)["book_top_consistent"])
+        self.assertFalse(_feed_health(data, now)["market_fresh"])
+
+
+    def test_ofi_requires_minimum_event_count_and_observation_span(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["ofi_events"] = [
+            {"ts": now.timestamp() - 60 + i * 3, "ofi": 3.0, "depth_ref": 100.0}
+            for i in range(21)
+        ]
+        snap = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertEqual(snap.order_flow_imbalance_event_count, 21)
+        self.assertAlmostEqual(snap.order_flow_imbalance_span_seconds, 60.0)
+        self.assertAlmostEqual(snap.order_flow_imbalance_ratio, 0.03)
+        data["ofi_events"] = data["ofi_events"][:10]
+        snap_small = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertIsNone(snap_small.order_flow_imbalance_ratio)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+    def test_ofi_requires_minimum_event_count_and_observation_span(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["ofi_events"] = [
+            {"ts": now.timestamp() - 60 + i * 3, "ofi": 3.0, "depth_ref": 100.0}
+            for i in range(21)
+        ]
+        snap = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertEqual(snap.order_flow_imbalance_event_count, 21)
+        self.assertAlmostEqual(snap.order_flow_imbalance_span_seconds, 60.0)
+        self.assertAlmostEqual(snap.order_flow_imbalance_ratio, 0.03)
+
+        data["ofi_events"] = data["ofi_events"][:10]
+        snap_small = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertIsNone(snap_small.order_flow_imbalance_ratio)

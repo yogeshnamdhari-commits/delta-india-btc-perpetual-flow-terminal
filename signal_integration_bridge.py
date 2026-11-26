@@ -20,8 +20,13 @@ try:
         AGGRESSOR_SELL,
         ChecksumState,
         Candle,
+        LiquidityLevel,
         MarketSnapshot,
         SignalEngine,
+        Swing,
+        DEFAULT_CONFIG,
+        compute_atr,
+        derive_swings,
         SignalResult,
         Trade,
     )
@@ -74,7 +79,9 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
-_REQUIRED_CHANNEL_MAX_AGE_SECONDS = {"ticker": 8.0, "ob_updates": 3.0, "trades": 20.0}
+# ob_updates is change-driven, not a heartbeat. Book integrity stays a separate gate.
+# ob_l1 is an independent top-of-book heartbeat (max unchanged-data interval 5s).
+_REQUIRED_CHANNEL_MAX_AGE_SECONDS = {"ticker": 8.0, "trades": 20.0, "ob_l1": 8.0}
 _SEED_HISTORY_CACHE: dict[str, Any] = {"path": None, "loaded_at": 0.0, "candles": []}
 _SEED_HISTORY_CACHE_TTL_SECONDS = 300.0
 
@@ -96,7 +103,26 @@ def _feed_health(feed_data: dict[str, Any], now: datetime) -> dict[str, Any]:
             age = None
         channel_age_seconds[channel] = age
         channel_freshness[channel] = age is not None and 0.0 <= age <= max_age
-    market_fresh = connection_healthy and all(channel_freshness.values())
+    asks = feed_data.get("asks", {}) or {}
+    bids = feed_data.get("bids", {}) or {}
+    l1_bid = _safe_float(feed_data.get("ob_l1_bid"), 0.0)
+    l1_ask = _safe_float(feed_data.get("ob_l1_ask"), 0.0)
+    try:
+        l2_best_bid = max(float(price) for price, size in bids.items() if _safe_float(size, 0.0) > 0)
+        l2_best_ask = min(float(price) for price, size in asks.items() if _safe_float(size, 0.0) > 0)
+        book_top_consistent = (
+            l1_bid > 0 and l1_ask > l1_bid
+            and abs(l1_bid - l2_best_bid) <= 0.5000001
+            and abs(l1_ask - l2_best_ask) <= 0.5000001
+        )
+    except (ValueError, TypeError):
+        book_top_consistent = False
+    market_fresh = connection_healthy and all(channel_freshness.values()) and book_top_consistent
+    try:
+        book_seen = channel_times.get("ob_updates")
+        book_update_age = (now - _to_utc(book_seen)).total_seconds() if book_seen is not None else None
+    except (TypeError, ValueError, OverflowError, OSError):
+        book_update_age = None
     checksum_verified = feed_data.get("checksum_ok") is True
     try:
         last_market = feed_data.get("last_market_message_at")
@@ -111,7 +137,9 @@ def _feed_health(feed_data: dict[str, Any], now: datetime) -> dict[str, Any]:
         "book_synced": book_synced,
         "sequence_gap_unresolved": sequence_gap_unresolved,
         "checksum_verified": checksum_verified,
+        "book_top_consistent": book_top_consistent,
         "feed_age_seconds": market_age,
+        "book_update_age_seconds": book_update_age,
     }
 
 
@@ -175,8 +203,8 @@ def _aggregate_completed_candles(candles_1m, minutes, *, now=None):
     import time as _time_module
     from datetime import datetime, timezone
     
-    if minutes not in (5, 15):
-        raise ValueError("minutes must be 5 or 15")
+    if minutes not in (5, 15, 60):
+        raise ValueError("minutes must be 5, 15 or 60")
     if now is None:
         now_epoch = _time_module.time()
     elif isinstance(now, datetime):
@@ -241,22 +269,40 @@ def build_market_snapshot(
     spread_bps = ((ask - bid) / ((bid + ask) / 2) * 10000) if (bid + ask) > 0 else float("inf")
 
     recent_trades: list[Trade] = []
-    for row in (feed_data.get("trades", []) or [])[-1000:]:
+    # The 120-print deque serves the tape display. Use the wider analytics tape
+    # for the five-minute confirmation window and preserve fractional timestamps.
+    trade_rows = feed_data.get("trade_log")
+    if not trade_rows:
+        trade_rows = feed_data.get("trades", [])
+    cutoff_ts = now.timestamp() - 300.0
+    for row in list(trade_rows or [])[-100000:]:
         try:
-            ts_val = row.get("timestamp") or row.get("ts") or row.get("time_utc") or row.get("time")
-            if ts_val is None:
+            if isinstance(row, (tuple, list)) and len(row) >= 4:
+                ts_val, raw_price, raw_size, raw_side = row[:4]
+                side = str(raw_side).strip().lower()
+                aggressor = (AGGRESSOR_BUY if side in ("buy", "buy taker", "buy_taker")
+                             else AGGRESSOR_SELL if side in ("sell", "sell taker", "sell_taker")
+                             else None)
+                price, size = _safe_float(raw_price, 0.0), _safe_float(raw_size, 0.0)
+            elif isinstance(row, dict):
+                ts_val = (row.get("exchange_trade_ts_us") or row.get("timestamp_us")
+                          or row.get("timestamp") or row.get("ts") or row.get("time_utc") or row.get("time"))
+                price = _safe_float(row.get("price") or row.get("p"), 0.0)
+                size = _safe_float(row.get("size") or row.get("s"), 0.0)
+                role = str(row.get("buyer_role") or row.get("r", "")).strip().lower()
+                side = str(row.get("side") or "").strip().lower()
+                if role == "t" or side in ("buy", "buy taker", "buy_taker"):
+                    aggressor = AGGRESSOR_BUY
+                elif role == "m" or side in ("sell", "sell taker", "sell_taker"):
+                    aggressor = AGGRESSOR_SELL
+                else:
+                    aggressor = None
+            else:
+                continue
+            if ts_val is None or price <= 0 or size <= 0 or aggressor is None:
                 continue
             trade_ts = _to_utc(ts_val)
-            price = _safe_float(row.get("price") or row.get("p"), 0.0)
-            size = _safe_float(row.get("size") or row.get("s"), 0.0)
-            role = str(row.get("buyer_role") or row.get("r", "")).strip().lower()
-            if price <= 0 or size <= 0:
-                continue
-            if role == "t":
-                aggressor = AGGRESSOR_BUY
-            elif role == "m":
-                aggressor = AGGRESSOR_SELL
-            else:
+            if trade_ts.timestamp() < cutoff_ts or trade_ts > now:
                 continue
             recent_trades.append(Trade(trade_ts, price, size, aggressor))
         except (TypeError, ValueError, OverflowError, OSError):
@@ -289,6 +335,7 @@ def build_market_snapshot(
     candles_1m.sort(key=lambda candle: candle.ts_utc)
     candles_5m = _aggregate_completed_candles(candles_1m, 5, now=now)
     candles_15m = _aggregate_completed_candles(candles_1m, 15, now=now)
+    candles_1h = _aggregate_completed_candles(candles_1m, 60, now=now)
     if len(candles_15m) < 55:
         seed_path = history_path or os.environ.get(
             "DELTA_EVENT_LOG_FILE", "/Users/targetmobile/Downloads/delta_feed_events.jsonl")
@@ -299,17 +346,86 @@ def build_market_snapshot(
                                 key=lambda c: c.ts_utc)
             candles_5m = _aggregate_completed_candles(candles_1m, 5, now=now)
             candles_15m = _aggregate_completed_candles(candles_1m, 15, now=now)
+            candles_1h = _aggregate_completed_candles(candles_1m, 60, now=now)
     checksum_value = feed_data.get("checksum_ok")
     checksum_state = (ChecksumState.VERIFIED if checksum_value is True else
                       ChecksumState.FAILED if checksum_value is False else ChecksumState.UNAVAILABLE)
+    swing_points = (derive_swings(candles_5m, DEFAULT_CONFIG["swing_lookback_bars"])
+                    if len(candles_5m) >= 2 * DEFAULT_CONFIG["swing_lookback_bars"] + 1 else [])
+    swings_5m = [Swing(ts_utc=x.ts_utc, price=x.price, kind=x.kind,
+                       confirmed_ts_utc=x.confirmed_ts_utc) for x in swing_points]
+    book_valid = (health["book_synced"] and not health["sequence_gap_unresolved"]
+                  and health["checksum_verified"])
+    observed_at = (_to_utc(feed_data.get("book_last_update_at"))
+                   if feed_data.get("book_last_update_at") is not None else now)
+
+    def _levels(raw, side):
+        if not book_valid or not isinstance(raw, dict):
+            return []
+        values = []
+        for price_raw, size_raw in raw.items():
+            price, size = _safe_float(price_raw, 0.0), _safe_float(size_raw, 0.0)
+            if price > 0 and size > 0:
+                values.append((price, size))
+        values.sort(key=lambda item: item[0], reverse=(side == "bid"))
+        return [LiquidityLevel(price=p, contracts=q, side=side, observed_ts_utc=observed_at)
+                for p, q in values[:25]]
+
+    ask_liquidity = _levels(feed_data.get("asks", {}), "ask")
+    bid_liquidity = _levels(feed_data.get("bids", {}), "bid")
+    ask_size = ask_liquidity[0].contracts if ask_liquidity else (
+        _safe_float(feed_data.get("ask_size"), 0.0) if book_valid else None)
+    bid_size = bid_liquidity[0].contracts if bid_liquidity else (
+        _safe_float(feed_data.get("bid_size"), 0.0) if book_valid else None)
+    ask_size = ask_size if ask_size and ask_size > 0 else None
+    bid_size = bid_size if bid_size and bid_size > 0 else None
+    total_top_size = (ask_size or 0.0) + (bid_size or 0.0)
+    queue_imbalance = (((bid_size or 0.0) - (ask_size or 0.0)) / total_top_size
+                       if total_top_size > 0 else None)
+    microprice_edge_bps = None
+    if total_top_size > 0 and ask > bid:
+        mid = (ask + bid) / 2.0
+        microprice = (ask * (bid_size or 0.0) + bid * (ask_size or 0.0)) / total_top_size
+        microprice_edge_bps = (microprice - mid) / mid * 10000.0
+
+    ofi_rows = []
+    for event in (feed_data.get("ofi_events", []) or [])[-20000:]:
+        try:
+            event_ts = _to_utc(event.get("ts"))
+            if 0 <= (now - event_ts).total_seconds() <= 300:
+                ofi_rows.append(event)
+        except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+            continue
+    ofi_depth = sum(_safe_float(event.get("depth_ref"), 0.0) for event in ofi_rows)
+    ofi_value = sum(_safe_float(event.get("ofi"), 0.0) for event in ofi_rows)
+    ofi_times = [_to_utc(event.get("ts")) for event in ofi_rows if event.get("ts") is not None]
+    ofi_span = ((max(ofi_times) - min(ofi_times)).total_seconds() if len(ofi_times) >= 2 else 0.0)
+    # Do not promote a handful of burst updates into a five-minute OFI signal.
+    ofi_ratio = (ofi_value / ofi_depth if ofi_depth > 0 and len(ofi_rows) >= 20
+                 and ofi_span >= 60.0 else None)
+    mark = _safe_float(feed_data.get("mark_price"), 0.0)
+    index = _safe_float(feed_data.get("index_price"), 0.0)
+    basis_bps = ((mark - index) / index * 10000.0) if mark > 0 and index > 0 else None
+    oi_raw, funding_raw = feed_data.get("open_interest_contracts"), feed_data.get("funding_rate")
+    oi = _safe_float(oi_raw, 0.0) if oi_raw is not None else None
+    oi = oi if oi and oi > 0 else None
+    funding = _safe_float(funding_raw, 0.0) if funding_raw is not None else None
+
     return MarketSnapshot(
         ts_utc=now, last_price=last_price, bid=bid, ask=ask,
         candles_1m=candles_1m, candles_5m=candles_5m, candles_15m=candles_15m,
+        candles_1h=candles_1h,
         book_synced=health["book_synced"], connection_healthy=health["connection_healthy"],
         sequence_gap_unresolved=health["sequence_gap_unresolved"], checksum_state=checksum_state,
         market_fresh=health["market_fresh"], spread_bps=spread_bps, recent_trades=recent_trades,
-        completed_candle_timestamps={}, swings_5m=(), order_blocks_5m=(), ask_liquidity=(),
-        bid_liquidity=(), atr_5m=None, atr_15m=None,
+        completed_candle_timestamps={}, swings_5m=swings_5m, order_blocks_5m=(),
+        ask_liquidity=ask_liquidity, bid_liquidity=bid_liquidity,
+        atr_5m=compute_atr(candles_5m, 14), atr_15m=compute_atr(candles_15m, 14),
+        best_bid_size=bid_size, best_ask_size=ask_size, queue_imbalance=queue_imbalance,
+        microprice_edge_bps=microprice_edge_bps, order_flow_imbalance_ratio=ofi_ratio,
+        order_flow_imbalance_event_count=len(ofi_rows),
+        order_flow_imbalance_span_seconds=ofi_span,
+        open_interest_contracts=oi, funding_rate=funding, mark_index_basis_bps=basis_bps,
     )
 
 
@@ -331,6 +447,10 @@ def _result_to_dict(result) -> dict[str, Any]:
         "risk_distance": getattr(result, "risk_distance", None),
         "reward_distance": getattr(result, "reward_distance", None),
         "risk_reward_ratio": getattr(result, "risk_reward_ratio", None),
+        "swept_level": getattr(result, "swept_level", None),
+        "structure_break_level": getattr(result, "structure_break_level", None),
+        "order_block_top": getattr(result, "order_block_top", None),
+        "order_block_bottom": getattr(result, "order_block_bottom", None),
         "reason_codes": list(getattr(result, "reason_codes", [])),
         "human_readable_explanation": getattr(result, "human_readable_explanation", ""),
         "confirmation_conditions_passed": list(getattr(result, "confirmation_conditions_passed", [])),
@@ -424,6 +544,24 @@ def evaluate_feed_snapshot(feed_data: dict[str, Any], *, feed_state: dict[str, A
     if warmup and not failed:
         result_dict["reason_codes"] = ["WARMUP_INSUFFICIENT_CANDLES"]
         result_dict["human_readable_explanation"] = f"Warming up: 5m {count_5m}/{min_5m_candles}; 15m {count_15m}/{min_15m_candles}."
+    if decision in ("BUY", "SELL"):
+        try:
+            from entry_confirmation_v2 import evaluate_entry_confirmation
+            v2_result = evaluate_entry_confirmation(snapshot, result, feed_data=feed_data)
+        except Exception as exc:
+            v2_result = {
+                "version": "entry-confirmation-v2-shadow",
+                "state": "WAIT_CONFIRMATION_ENGINE_ERROR",
+                "reason_codes": [type(exc).__name__],
+                "shadow_only": True, "live_orders_allowed": False,
+            }
+    else:
+        v2_result = {
+            "version": "entry-confirmation-v2-shadow",
+            "state": "WAIT_BASELINE_DECISION_NOT_CONFIRMABLE",
+            "reason_codes": ["BASELINE_DECISION_" + str(decision)],
+            "shadow_only": True, "live_orders_allowed": False,
+        }
     return {
         "ts_utc": now.isoformat(), "decision": decision,
         "signal_type": decision if decision in ("BUY", "SELL") else None,
@@ -438,10 +576,13 @@ def evaluate_feed_snapshot(feed_data: dict[str, Any], *, feed_state: dict[str, A
         "total_disconnects": feed_data.get("total_disconnects", 0),
         "total_reconnects": feed_data.get("total_reconnects", 0), "feed_state": merged,
         "engine_result": result_dict, "data_quality_gate_results": gates,
+        "entry_confirmation_v2": v2_result,
         "signal_id": getattr(result, "signal_id", None),
         "metadata": {"runtime_context": "live_signal", "source": "delta_feed", "engine_evaluated": True,
                      "failed_data_quality_gates": failed, "warmup_failed": warmup,
-                     "candles_5m": count_5m, "candles_15m": count_15m},
+                     "candles_5m": count_5m, "candles_15m": count_15m,
+                     "candles_1h": len(snapshot.candles_1h),
+                     "book_update_age_seconds": health.get("book_update_age_seconds")},
     }
 
 
