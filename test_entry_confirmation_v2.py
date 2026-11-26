@@ -1,6 +1,7 @@
 """Unit tests for independent V2 confirmation logic."""
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
+import pytest
 from entry_confirmation_v2 import evaluate_entry_confirmation, _liquidity_behavior
 
 UTC = timezone.utc
