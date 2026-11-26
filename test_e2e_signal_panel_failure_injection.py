@@ -152,12 +152,15 @@ def _healthy_feed(now: float):
         "checksum_msg": "CRC32 verified (synthetic fixture)",
         "asks": {"100000.5": "2"},
         "bids": {"99999.5": "2"},
+        "ob_l1_bid": 99999.5,
+        "ob_l1_ask": 100000.5,
         "channel_last_seen": {
             "ticker": seen,
+            "ob_l1": seen,
             "ob_updates": seen,
             "trades": seen,
         },
-        "channel_message_counts": {"ticker": 1, "ob_updates": 1, "trades": 20},
+        "channel_message_counts": {"ticker": 1, "ob_l1": 1, "ob_updates": 1, "trades": 20},
         "total_messages_received": 22,
         "total_disconnects": 0,
         "total_reconnects": 0,
@@ -259,6 +262,16 @@ class TestEndToEndSignalPanelFailureRecovery(unittest.TestCase):
                 "q": [100000.5, 2, 99999.5, 2],
                 "m": 100000.0,
             }],
+        }))
+        self.feed._on_message(socket, json.dumps({
+            "type": "ob_l1",
+            "sy": "BTCUSD",
+            "ap": "100000.5",
+            "as": "2",
+            "bp": "99999.5",
+            "bs": "2",
+            "lts": int(time.time() * 1_000_000),
+            "ts": int(time.time() * 1_000_000),
         }))
         self.feed._on_message(socket, json.dumps({
             "type": "trades",
