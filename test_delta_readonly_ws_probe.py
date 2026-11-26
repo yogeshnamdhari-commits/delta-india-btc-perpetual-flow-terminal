@@ -1,7 +1,7 @@
 """Unit tests for the standalone public-feed read-only probe."""
 from datetime import datetime, timezone
 
-from delta_readonly_ws_probe import apply_levels, book_checksum, epoch_seconds
+from delta_readonly_ws_probe import apply_levels, book_checksum, channel_freshness, epoch_seconds
 
 
 def test_timestamp_unit_conversion_for_delta_microseconds_and_seconds():
@@ -23,3 +23,17 @@ def test_apply_levels_updates_and_removes_zero_size_levels():
     book = {"100001.0": "3", "100002.0": "2"}
     apply_levels(book, [["100001.0", "5"], ["100002.0", "0"], ["100003.0", "4"]])
     assert book == {"100001.0": "5", "100003.0": "4"}
+
+
+
+def test_channel_liveness_is_checked_at_the_end_of_the_observation_window():
+    end = 1_800_000_000.0
+    checks, ages = channel_freshness({
+        "ticker": end - 1.0,
+        "ob_l1": end - 9.0,
+        "trades": end - 19.0,
+    }, end)
+    assert checks["ticker_fresh_at_end"] is True
+    assert checks["ob_l1_fresh_at_end"] is False
+    assert checks["trades_fresh_at_end"] is True
+    assert ages == {"ticker": 1.0, "ob_l1": 9.0, "trades": 19.0}

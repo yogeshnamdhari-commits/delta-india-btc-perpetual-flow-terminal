@@ -70,6 +70,19 @@ def book_checksum(asks: dict[str, str], bids: dict[str, str]) -> int:
     return zlib.crc32(f"{ask_text}|{bid_text}".encode("utf-8")) & 0xFFFFFFFF
 
 
+def channel_freshness(received_at: dict[str, float], now: float) -> tuple[dict[str, bool], dict[str, float | None]]:
+    """Check independent liveness channels at the end of the observation window."""
+    limits = {"ticker": 8.0, "ob_l1": 8.0, "trades": 20.0}
+    ages: dict[str, float | None] = {}
+    checks: dict[str, bool] = {}
+    for channel, limit in limits.items():
+        seen = received_at.get(channel)
+        age = max(0.0, now - seen) if seen is not None else None
+        ages[channel] = round(age, 3) if age is not None else None
+        checks[f"{channel}_fresh_at_end"] = age is not None and age <= limit
+    return checks, ages
+
+
 def check_streamlit_health(url: str, timeout: float = 3.0) -> dict[str, Any]:
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "delta-readonly-validation/1.0"})
@@ -139,6 +152,7 @@ def run_probe(duration_seconds: float, streamlit_url: str,
     l1_l2_differences: list[float] = []
     started_at = time.time()
     deadline = time.monotonic() + duration_seconds
+    last_channel_receive: dict[str, float] = {}
     ws = None
 
     subscription = {
@@ -182,6 +196,7 @@ def run_probe(duration_seconds: float, streamlit_url: str,
                 continue
             stats["channel_messages"][kind] = stats["channel_messages"].get(kind, 0) + 1
             now = time.time()
+            last_channel_receive[kind] = now
 
             if kind == "ob_updates" and message.get("sy", SYMBOL) == SYMBOL:
                 action = str(message.get("action", "")).lower()
@@ -275,6 +290,8 @@ def run_probe(duration_seconds: float, streamlit_url: str,
         stats["book_sequence_final"] = book_sequence
         stats["book_verified_at_end"] = book_verified
         stats["trade_window_seconds"] = round(time.time() - started_at, 2)
+        freshness_checks, freshness_ages = channel_freshness(last_channel_receive, time.time())
+        stats["channel_age_seconds_at_end"] = freshness_ages
         if l1_l2_differences:
             stats["l1_l2_mismatch_fraction"] = round(
                 sum(value > 1.000001 for value in l1_l2_differences) / len(l1_l2_differences), 4
@@ -300,7 +317,8 @@ def run_probe(duration_seconds: float, streamlit_url: str,
         "ob_l1_seen": stats["ob_l1_messages"] > 0,
         "ob_updates_snapshot_seen": stats["book_snapshots"] > 0,
         "book_crc_verified": stats["checksum_verified"] > 0
-            and stats["checksum_missing"] == 0 and stats["checksum_failures"] == 0,
+            and stats["checksum_missing"] == 0 and stats["checksum_failures"] == 0
+            and stats["book_verified_at_end"] is True,
         "no_orderbook_sequence_gaps": stats["sequence_gaps"] == 0,
         "l1_l2_top_of_book_compared": stats["l1_l2_comparison_samples"] > 0,
         "l1_l2_top_of_book_consistent": mismatch_fraction is not None and mismatch_fraction <= 0.10,
@@ -309,6 +327,9 @@ def run_probe(duration_seconds: float, streamlit_url: str,
         "funding_next_realization_available": stats["next_funding_realization_utc"] is not None,
         "existing_streamlit_health_http_200": stats["streamlit_health"].get("ok") is True,
     }
+    checks.update(freshness_checks if "freshness_checks" in locals() else {
+        "ticker_fresh_at_end": False, "ob_l1_fresh_at_end": False, "trades_fresh_at_end": False
+    })
     if stats["feed_health_file"].get("configured"):
         checks["existing_feed_health_heartbeat_ok"] = stats["feed_health_file"].get("ok") is True
     stats["checks"] = checks
