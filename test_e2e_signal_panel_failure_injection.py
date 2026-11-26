@@ -367,7 +367,8 @@ class TestEndToEndSignalPanelFailureRecovery(unittest.TestCase):
         self.assertEqual(trade["symbol"], "BTCUSD")
         self.assertEqual(trade["exchange_trade_ts_us"], trade_ts_us)
         self.assertEqual(trade["server_publish_ts_us"], server_ts_us)
-        self.assertEqual(trade["ts"], trade_ts_us // 1_000_000)
+        self.assertAlmostEqual(trade["ts"], trade_ts_us / 1_000_000.0, places=6)
+        self.assertNotEqual(trade["ts"], float(trade_ts_us // 1_000_000))
         self.assertTrue(trade.get("ts_utc"), "local capture timestamp should remain present")
 
 
