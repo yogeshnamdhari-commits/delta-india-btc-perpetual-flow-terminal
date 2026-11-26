@@ -53,3 +53,17 @@ PAPER_REVIEW_CANDIDATE is not live-trading approval. This implementation never p
 ## Safety
 
 Public read-only data and shadow analysis only. No private order APIs, order submission, deployment, service restart, merge or trading enablement. Project release remains NOT APPROVED pending independent historical and prospective validation.
+
+
+## Read-only Mac validation
+
+The one-shot WebSocket probe is available as delta_readonly_ws_probe.py. Run it from the target Mac after downloading that single file from this PR branch. It subscribes only to public market-data channels, observes for 30 seconds, compares ob_l1 with the CRC-verified ob_updates book, checks trade timestamp units and the next funding realization timestamp, and requests the existing local Streamlit health endpoint. It closes its temporary socket when finished and does not modify project files, touch the running collector, or submit orders.
+
+Example:
+
+~~~bash
+curl -fsSL "https://raw.githubusercontent.com/yogeshnamdhari-commits/delta-india-btc-perpetual-flow-terminal/feat/entry-confirmation-v2-shadow-20261126/delta_readonly_ws_probe.py" -o /tmp/delta_readonly_ws_probe.py
+python3 /tmp/delta_readonly_ws_probe.py --duration 30
+~~~
+
+A pass requires all reported checks to be true. When the existing feed-health heartbeat is configured, pass its current path through DELTA_FEED_HEALTH_FILE before running the probe. A missing or unconfigured heartbeat is reported as optional; the probe does not infer live feed health from the WebSocket test alone.

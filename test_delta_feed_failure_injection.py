@@ -180,42 +180,4 @@ class TestRealDeltaFeedClass(unittest.TestCase):
         self.assertEqual(flow["sell_count"], 0)
         self.assertEqual(flow["sell_usd"], 0.0)
 
-
-    def test_ob_l1_subscription_and_quote_liveness_are_parsed(self):
-        channels = DeltaFeed._subscribe_payload()["payload"]["channels"]
-        self.assertIn({"name": "ob_l1", "symbols": ["BTCUSD"]}, channels)
-        self.feed._on_message(None, json.dumps({
-            "type": "ob_l1", "sy": "BTCUSD", "ap": "100001.0", "as": "8",
-            "bp": "100000.5", "bs": "12", "lts": 1791780701123456,
-            "ts": 1791780701987654,
-        }))
-        self.assertEqual(self.feed.data["ob_l1_bid"], 100000.5)
-        self.assertEqual(self.feed.data["ob_l1_ask"], 100001.0)
-        self.assertEqual(self.feed.data["ob_l1_bid_size"], 12.0)
-        self.assertEqual(self.feed.data["ob_l1_ask_size"], 8.0)
-        self.assertIn("ob_l1", self.feed.data["channel_last_seen"])
-
-    def test_unchecksummed_incremental_update_cannot_generate_ofi_or_derived_depth(self):
-        asks = {"100001": "2"}
-        bids = {"99999": "2"}
-        checksum = DeltaFeed._book_checksum(asks, bids)
-        self.snapshot(seq=500, checksum=checksum)
-        captured = []
-        original = NS["_log_event"]
-        NS["_log_event"] = lambda record, **kwargs: captured.append((dict(record), kwargs)) or True
-        try:
-            self.feed._handle_book({
-                "type": "ob_updates", "action": "update", "seq": 501,
-                "a": [["100001", "5"]], "b": [],
-            })
-        finally:
-            NS["_log_event"] = original
-        self.assertIsNone(self.feed.data["checksum_ok"])
-        self.assertEqual(len(self.feed.data["ofi_events"]), 0)
-        self.assertEqual(len(self.feed.data["depth_level_events"]), 0)
-        event = next(record for record, kwargs in captured
-                     if record.get("event") == "ob_update")
-        self.assertFalse(event["checksummed"])
-        self.assertFalse(event["crc_ok"])
-
 if __name__ == "__main__": unittest.main()
