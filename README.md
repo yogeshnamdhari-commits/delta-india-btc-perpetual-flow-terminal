@@ -45,6 +45,41 @@ chmod +x start_mac.command
 
 The launcher creates a local virtual environment when needed, installs the listed Python packages, and launches the app on port 8502. Set `STREAMLIT_SERVER_PORT` before running it to use a different local port.
 
+## macOS LaunchAgent — continuous local service
+
+For a Mac that should keep collecting while the user session is logged in, install the supervised LaunchAgent:
+
+```bash
+./launchd/install.sh
+```
+
+The installer prepares the project virtual environment once, installs a per-user LaunchAgent under `~/Library/LaunchAgents`, starts the read-only dashboard on port 8502, and installs a separate 60-second watchdog. The main agent uses `KeepAlive` and `RunAtLoad`; the watchdog checks the Streamlit health endpoint and an atomic feed-worker heartbeat. If the dashboard becomes unresponsive, the heartbeat stops, or the WebSocket worker dies, it requests a supervised restart. A disconnected exchange/network is not by itself treated as a dead process: the feed worker retains its reconnect loop and signal data-quality gates remain fail-closed.
+
+The launcher uses absolute paths and `caffeinate -is` to inhibit idle sleep while the app runs (the system-sleep assertion applies on AC power). Keep the Mac powered, awake, online and the user logged in. Closing a MacBook lid, logging out, loss of power, network outages, exchange outages, and disk-full conditions can still interrupt capture. A user LaunchAgent starts at login; it is not a pre-login system daemon.
+
+Logs and state are kept outside the Git repository:
+- Feed/trade event capture: `~/Downloads/delta_feed_events.jsonl`
+- Decision log: `~/Downloads/signal_decisions.jsonl`
+- Service logs: `~/Library/Logs/DeltaBTCTerminal/`
+- Feed heartbeat and watchdog state: `~/Library/Application Support/DeltaBTCTerminal/`
+
+Check status and logs:
+
+```bash
+launchctl print gui/$(id -u)/com.yogesh.delta-btc-terminal
+launchctl print gui/$(id -u)/com.yogesh.delta-btc-terminal-watchdog
+tail -f ~/Library/Logs/DeltaBTCTerminal/streamlit.stdout.log
+tail -f ~/Library/Logs/DeltaBTCTerminal/watchdog.stdout.log
+```
+
+Remove the services without deleting captured data or logs:
+
+```bash
+./launchd/uninstall.sh
+```
+
+This improves process recovery; it does not guarantee uninterrupted 24/7 uptime or certify signal profitability. The watchdog restarts a dead/unresponsive application process or dead collector thread. A healthy collector that is disconnected from the exchange is allowed to reconnect and all stale/invalid data must continue to block signals. The app remains read-only and live trading remains unapproved until real-feed recovery and independent out-of-sample validation pass.
+
 ## Run automated tests
 
 Install the development/test dependencies in the project environment, then run the full suite:
@@ -66,6 +101,21 @@ The test suite covers deterministic parser, signal-contract, feed-fault, logging
 - Session-only signed-volume/CVD proxy
 - Open interest and funding rate, when delivered by the feed
 - Feed age, sequence gaps, checksum failures and reconnect status
+- BTCUSD daily-candle volume and ticker session volume as separate raw API fields; the quantity basis is unverified and the values are not normalized or treated as directly comparable
+
+## Dashboard layout — four core trading panels
+
+The four core panels are placed immediately after the BTCUSD chart and live order book and are always rendered; there is no sidebar toggle that hides the order-flow workspace.
+
+1. **1. OPEN INTEREST + EXECUTED BUY/SELL FLOW** — aggregate outstanding contracts, 24-hour OI change and value, plus separate captured BUY-taker and SELL-taker prints/contracts/BTC-equivalent/notional. Long-side and short-side OI are displayed as **NOT PUBLISHED** because Delta's public ticker exposes aggregate OI, not separate long/short position totals.
+   - **OI + funding context bias (heuristic):** a BUY-bias candidate is shown only when 24h mark price and aggregate OI both rise; a SELL-bias candidate is shown only when 24h mark price falls while aggregate OI rises. When OI contracts, the display stays MIXED / WAIT and labels possible short covering or long deleveraging. A ±0.05% neutral band suppresses tiny changes. Positive funding means longs pay shorts; negative funding means shorts pay longs. Funding is a carry-cost/payer-side context, does not flip the price/OI classification, and is never a standalone BUY/SELL signal. Aggregate OI cannot identify which side opened or closed.
+   - **Historical OI unit validation:** REST `oi` × 1,000 is checked against REST `oi_contracts`, then against a fresh WebSocket ticker `oi[0]`. The newest `OI:BTCUSD` hourly candle is compared with that reconciled live contract count to select a ×1 or ×1,000 normalization only when alignment is within 5% and the candle is no more than two hours old. The same verified scale is applied to the historical chart and 24-hour baseline. If source reconciliation, scale alignment, or the 24-hour baseline fails, the chart/percentage is withheld as applicable and BUY/SELL bias candidates are suppressed.
+   - **BTCUSD funding-cap warning:** the current Delta India BTCUSD contract specification lists a ±1.00% funding cap and an 8-hour rate-exchange interval. The dashboard warns at 80% cap utilization and raises a high-severity warning at 90%; at/above 100% it flags the observed rate against the cap. The rate is treated as stale after 180 seconds. The cap is a product-specific reference and must be rechecked when Delta updates contract specifications.
+2. **2. BEST BUYER / SELLER — LIVE TOP OF BOOK** — best visible BID/ASK, displayed quantities and microprice. Values are withheld unless the order book is fresh, synchronized, gap-free and CRC32-valid.
+3. **3. PREMIUM / DISCOUNT — CONFIRMED SWING DEALING RANGE** — confirmed swing high, 50% equilibrium, swing low, current location and upper/lower half boundaries.
+4. **4. ORDER BLOCKS — EXECUTED BUY/SELL + VISIBLE BID/ASK DEPTH** — completed-candle price-action order-block candidates with captured executed BUY/SELL prints, contracts, BTC equivalent, approximate notional and current visible BID/ASK depth when the book passes integrity checks.
+
+The longer trade tape, session CVD, breakout, liquidity and microstructure diagnostics follow these core panels. Order-block candidates are price-action-derived, not exchange-identified institutional orders. Executed taker trades and aggregate resting depth are shown as separate measurements.
 
 ## Safety / interpretation notes
 
@@ -124,6 +174,20 @@ Select **OpenAI API (separate API billing)** in the panel. Configure `OPENAI_API
 - Answers are generated commentary, not validated trading signals or a guarantee of profitability. Live data alone cannot certify historical completeness or out-of-sample results.
 - Unit tests for the context packer and provider-response parsing can be run with `python -m unittest test_ai_analyst.py`.
 
+## Trading-focused execution and order-flow panels
+
+The order-flow workspace groups the following read-only market context:
+
+- **Daily taker BUY/SELL BTC:** UTC calendar-day and rolling-24h totals show captured classified BUY and SELL taker prints, contracts, BTC-equivalent quantity, notional, net delta, observed trade minutes and process-window status. If the process starts mid-minute, the first UTC minute bucket is included because it contains trades actually received after startup; the in-memory map is process-local and does not backfill pre-start trades. These are captured process observations, not an exchange-complete historical tape; public trades have no per-trade sequence and are not backfilled.
+- **BTCUSD volume units:** daily-candle volume and ticker session volume are shown as separate raw API fields. Their exact quantity basis is not confirmed by the field definitions currently used by this app, so values are not normalized, added together or directly compared. The UI labels them "raw API units" rather than assuming contracts or BTC.
+- **Order blocks and supply/demand:** confirmed completed-candle price-action zones are labelled bullish demand / bearish supply. For each zone, the app separately reports observed executed BUY-taker and SELL-taker prints/contracts/notional in the zone, plus currently visible aligned and opposing L2 resting depth when the book is fresh and integrity-verified. These are algorithmic price-action zones, not exchange-labelled institutional orders.
+- **Best buyer and seller:** the best visible BID/ASK prices, top-level displayed sizes and a size-weighted microprice are shown only when the L2 book is sequence-synchronized, fresh, gap-free and CRC32-valid. Microprice is a reference statistic, not a guaranteed fill.
+- **Who is taking liquidity:** the live 1m/5m/15m taker panel identifies buyers lifting resting asks versus sellers hitting resting bids and displays prints, contracts, shares, dominance and approximate notional.
+- **Up/down breakout confirmation:** the existing multi-timeframe detector evaluates completed-candle range breaks and acceptance, source-reported candle volume, captured same-direction taker flow and retest state across 1m/5m/15m/1h/4h/1d. Missing or insufficient evidence does not receive a genuine breakout label.
+- **Spoofing-like quote pulls and iceberg-like replenishment:** recent top-25 L2 snapshots are sampled approximately every two seconds while the book is synchronized. A large unexplained displayed-size reduction after adjusting for same-price taker executions can be labelled a quote-pull candidate; repeated same-price displayed-size persistence during substantial matching taker executions can be labelled an iceberg-like refill candidate. The panel requires a fresh, valid book and shows candidate evidence, not accusations.
+
+**Critical limits:** Delta public L2 is aggregated by price and does not expose individual order IDs or participant identities. Quote-pull patterns do not prove spoofing or intent, and repeated displayed-size replenishment does not prove a hidden iceberg order or hidden quantity. The detectors can miss events between samples and are not execution signals. The snapshot history resets with the dashboard process. The app remains read-only; no orders are placed.
+
 ## Market structure and liquidity intelligence
 
 The read-only **Order flow & liquidity** area distinguishes measured market data from price-action inference:
@@ -140,10 +204,35 @@ The read-only **Order flow & liquidity** area distinguishes measured market data
 - **Buy/sell exhaustion:** labels require a completed one-minute candle to break a prior local extreme, reject it with a qualifying wick, and meet the existing same-candle aggressor-flow rule. The panel shows buy/sell contracts, dominant-side ratio, wick ratio, close location and classified print count.
 - **OI + order-flow + volume exhaustion confirmation:** a separate, stricter confirmation layer cross-checks each completed 1m local-extreme rejection against (1) same-direction captured taker contracts and classified print count, (2) Delta candle volume >=1.50x the prior 20 completed 1m candle average, and (3) a complete 1m OI series. OI significance is measured against the prior 20 absolute OI percentage changes using max(0.01%, 75th percentile) as the event threshold. The table exposes raw OI contract change and percentage change, state (BUILDING / REDUCING / FLAT), volume multiple, buy/sell taker contracts, print count, capture status and a 0–4 evidence count. The previous basic wick/tape labels remain intact; a multi-factor label is not an entry signal.
 - **OI source / units / interpretation:** intraday OI uses Delta's public historical-candles endpoint with symbol `OI:BTCUSD`, resolution `1m`, up to 2,000 returned candles. OI is aggregate outstanding contracts, not long-side OI or short-side OI; each open contract has both a long and short counterparty. OI increase does not identify which side opened, and OI decrease does not prove liquidation or stop execution. Missing, stale or gapped OI is shown as unavailable rather than inferred.
+- **Current OI USD notional:** the dashboard independently calculates outstanding contracts × the BTCUSD product contract value (0.001 BTC per contract) × the live mark price. Delta's raw `oi_value_usd` ticker field is retained for audit comparison only; if it materially disagrees with the contract-based calculation, the dashboard displays the contract-based value and a discrepancy warning. If the contract count or mark price is unavailable, OI USD notional is withheld rather than trusting an unverified raw value.
 
 All levels and labels are monitoring context, not trade guarantees. These UI additions do not modify the signal engine, its thresholds, signal precedence, evaluator or release criteria.
 
 Delta API references: [WebSocket public channels](https://docs.delta.exchange/) and [private order updates](https://docs.delta.exchange/).
+
+
+## Open interest side visibility and premium/discount dealing range
+
+The order-flow dashboard distinguishes **aggregate open interest** from **executed taker BUY/SELL flow**.
+
+- Delta's public ticker provides one aggregate `oi` contract count and OI value fields. It does not provide separate long-side and short-side open-interest totals. The dashboard therefore shows **Long-side OI: NOT PUBLISHED** and **Short-side OI: NOT PUBLISHED** instead of fabricating a split.
+- The dashboard shows aggregate current OI, its available 24-hour change/baseline and USD value. It separately shows captured BUY-taker and SELL-taker prints, contracts, BTC-equivalent quantity, notional and share. Taker BUY/SELL are executed aggressor-side trades, not long/short position OI.
+- OI increasing means aggregate outstanding contracts increased; OI decreasing means aggregate outstanding contracts decreased. Neither change identifies which counterparty opened or closed.
+
+### Premium / discount map
+
+The **Premium / discount — confirmed swing dealing range** panel uses the most recent valid opposite-kind pair of already-confirmed swing pivots from completed candles, with the configured maximum pivot separation. It plots the 50% midpoint as equilibrium:
+
+- **Premium:** upper half, from equilibrium to confirmed swing high.
+- **Discount:** lower half, from confirmed swing low to equilibrium.
+- **Equilibrium:** the 50% midpoint.
+- **Above range / Below range:** shown explicitly when current price is outside the selected dealing range; the display does not force an outside price into premium/discount.
+
+Each displayed order-block candidate also shows whether its midpoint is in the Premium, Discount, Equilibrium, Above range or Below range area when a confirmed dealing range is available. This is a price-location classification, not evidence of resting orders or a trading signal.
+
+### Order-block execution and book quantities
+
+For each price-action-derived order-block candidate, the dashboard reports actual captured executed BUY and SELL taker prints, contracts, BTC equivalent and approximate USD notional within the zone, plus current visible BID and ASK depth when the Delta L2 book is fresh, sequence-synchronized, gap-free and CRC32-valid. The public L2 book is aggregated by price and has no individual order or participant IDs, so these are observed executed trades and visible price-level depth—not verified institutional parent orders.
 
 ## Exchange wallet flow and perpetual BUY/SELL values
 

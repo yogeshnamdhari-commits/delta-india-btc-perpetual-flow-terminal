@@ -24,14 +24,35 @@ def _epoch_seconds(value: Any) -> int | None:
     return int(number)
 
 
-def parse_ticker_payload(payload: Any, symbol: str = "BTCUSD") -> dict[str, Any]:
-    """Normalize the public REST ticker response without inventing missing fields."""
+def parse_ticker_payload(
+    payload: Any,
+    symbol: str = "BTCUSD",
+    *,
+    contract_value_btc: float = 0.001,
+) -> dict[str, Any]:
+    """Normalize ticker fields and independently derive BTCUSD OI USD notional.
+
+    Delta documents OI as the outstanding contract count. For BTCUSD,
+    contract_value_btc is the BTC amount per contract, so the defensible USD
+    notional is contracts × BTC per contract × mark price.
+
+    The exchange-reported oi_value_usd is retained for diagnostics only.
+    It is not used as the displayed value because it can disagree with the
+    product contract multiplier by orders of magnitude.
+    """
+    contract_btc = _number(contract_value_btc)
+    if contract_btc is None or contract_btc <= 0:
+        raise ValueError("contract_value_btc must be finite and positive")
+
     empty = {
         "symbol": symbol,
         "volume": None,
         "turnover_usd": None,
         "open_interest_contracts": None,
         "open_interest_value_usd": None,
+        "reported_open_interest_value_usd": None,
+        "open_interest_mark_price": None,
+        "open_interest_value_usd_discrepancy_pct": None,
         "timestamp": None,
     }
     if not isinstance(payload, Mapping):
@@ -51,20 +72,55 @@ def parse_ticker_payload(payload: Any, symbol: str = "BTCUSD") -> dict[str, Any]
     if turnover_usd is None and str(row.get("turnover_symbol", "")).upper() == "USD":
         turnover_usd = _number(row.get("turnover"))
     oi = _number(row.get("oi"))
-    oi_value_usd = _number(row.get("oi_value_usd"))
+    oi_contracts = _number(row.get("oi_contracts"))
+    reported_oi_value_usd = _number(row.get("oi_value_usd"))
+    mark_price = _number(row.get("mark_price"))
+    if mark_price is None or mark_price <= 0:
+        mark_price = None
     timestamp = _epoch_seconds(row.get("timestamp"))
+
+    # REST oi field is reported in thousands of contracts; oi_contracts is
+    # the raw contract count and matches the WebSocket oi_contracts field.
+    # Use oi_contracts as authoritative; fall back to oi x 1000 only when
+    # oi_contracts is absent but oi is present.
+    valid_oi_contracts = (
+        oi_contracts
+        if oi_contracts is not None and oi_contracts >= 0
+        else (oi * 1000.0 if oi is not None and oi >= 0 else None)
+    )
+    valid_reported_oi_value = (
+        reported_oi_value_usd
+        if reported_oi_value_usd is not None and reported_oi_value_usd >= 0
+        else None
+    )
+    calculated_oi_value_usd = (
+        valid_oi_contracts * contract_btc * mark_price
+        if valid_oi_contracts is not None and mark_price is not None
+        else None
+    )
+    discrepancy_pct = (
+        (valid_reported_oi_value / calculated_oi_value_usd - 1.0) * 100.0
+        if (
+            valid_reported_oi_value is not None
+            and calculated_oi_value_usd is not None
+            and calculated_oi_value_usd > 0
+        )
+        else None
+    )
 
     return {
         "symbol": symbol,
         "volume": volume if volume is not None and volume >= 0 else None,
         "turnover_usd": turnover_usd if turnover_usd is not None and turnover_usd >= 0 else None,
-        "open_interest_contracts": oi if oi is not None and oi >= 0 else None,
-        "open_interest_value_usd": (
-            oi_value_usd if oi_value_usd is not None and oi_value_usd >= 0 else None
-        ),
+        "open_interest_contracts": valid_oi_contracts,
+        "oi_field_contracts": oi if oi is not None and oi >= 0 else None,
+        "oi_contracts_field": oi_contracts if oi_contracts is not None and oi_contracts >= 0 else None,
+        "open_interest_value_usd": calculated_oi_value_usd,
+        "reported_open_interest_value_usd": valid_reported_oi_value,
+        "open_interest_mark_price": mark_price,
+        "open_interest_value_usd_discrepancy_pct": discrepancy_pct,
         "timestamp": timestamp,
     }
-
 
 def parse_daily_volume_candles(payload: Any) -> list[dict[str, int | float]]:
     """Normalize BTCUSD 1d candles; volume follows the exchange candle window."""
@@ -167,6 +223,293 @@ def summarize_aggressor_flow(
         "first_bucket": first_bucket,
         "last_bucket": last_bucket,
         "window_seconds": window_seconds,
+    }
+
+
+
+
+def validate_and_normalize_open_interest_history(
+    history_rows: Sequence[Mapping[str, Any]] | None,
+    current_oi_contracts: Any,
+    *,
+    rest_oi: Any,
+    rest_oi_contracts: Any,
+    websocket_oi_contracts: Any,
+    now_ts: float,
+    max_history_age_seconds: int = 7_200,
+    max_rest_field_diff_pct: float = 1.0,
+    max_rest_ws_diff_pct: float = 2.0,
+    max_history_alignment_diff_pct: float = 5.0,
+) -> dict[str, Any]:
+    """Validate REST/WS OI cross-sources and normalize OI candle closes to contracts.
+
+    Delta REST ``oi`` may be expressed in thousands while ``oi_contracts`` and
+    the ticker WebSocket ``oi[0]`` are raw contracts. Historical ``OI:SYMBOL``
+    candle documentation does not specify that unit, so this function does not
+    assume a multiplier: it chooses 1 or 1000 only when the newest candle aligns
+    with the independently reconciled live contract count. Otherwise it fails
+    closed and returns no normalized history for directional calculations.
+    """
+    now = _number(now_ts)
+    if now is None or now <= 0:
+        raise ValueError("now_ts must be finite and positive")
+    limits = (
+        _number(max_history_age_seconds),
+        _number(max_rest_field_diff_pct),
+        _number(max_rest_ws_diff_pct),
+        _number(max_history_alignment_diff_pct),
+    )
+    if any(value is None or value < 0 for value in limits) or limits[0] <= 0:
+        raise ValueError("OI validation limits must be finite and positive (age) or non-negative (tolerances)")
+
+    rest_oi_value = _number(rest_oi)
+    rest_contract_value = _number(rest_oi_contracts)
+    websocket_value = _number(websocket_oi_contracts)
+    current_value = _number(current_oi_contracts)
+    if rest_oi_value is not None and rest_oi_value < 0:
+        rest_oi_value = None
+    if rest_contract_value is not None and rest_contract_value < 0:
+        rest_contract_value = None
+    if websocket_value is not None and websocket_value < 0:
+        websocket_value = None
+    if current_value is not None and current_value < 0:
+        current_value = None
+
+    def _diff_pct(left: float | None, right: float | None) -> float | None:
+        if left is None or right is None or max(abs(left), abs(right)) <= 0:
+            return None
+        return abs(left - right) / max(abs(left), abs(right)) * 100.0
+
+    rest_pair_diff_pct = None
+    rest_ws_diff_pct = None
+    rest_count = rest_contract_value
+    source_errors: list[str] = []
+    if rest_oi_value is not None and rest_contract_value is not None:
+        rest_pair_diff_pct = _diff_pct(rest_oi_value * 1000.0, rest_contract_value)
+        if rest_pair_diff_pct is None or rest_pair_diff_pct > float(max_rest_field_diff_pct):
+            source_errors.append("REST oi × 1000 does not reconcile with REST oi_contracts")
+    if rest_count is None and rest_oi_value is not None:
+        rest_count = rest_oi_value * 1000.0
+    if rest_count is None:
+        source_errors.append("REST OI contract count is unavailable")
+    if websocket_value is None:
+        source_errors.append("WebSocket oi[0] contract count is unavailable or stale")
+    elif rest_count is not None:
+        rest_ws_diff_pct = _diff_pct(rest_count, websocket_value)
+        if rest_ws_diff_pct is None or rest_ws_diff_pct > float(max_rest_ws_diff_pct):
+            source_errors.append("REST OI contract count does not reconcile with WebSocket oi[0]")
+    if current_value is not None and rest_count is not None:
+        current_rest_diff = _diff_pct(current_value, rest_count)
+        if current_rest_diff is None or current_rest_diff > float(max_rest_ws_diff_pct):
+            source_errors.append("selected current OI does not reconcile with REST OI contracts")
+    if current_value is None:
+        current_value = rest_count
+    if current_value is None or current_value <= 0:
+        source_errors.append("positive current OI contract count is unavailable")
+
+    normalized_rows: list[dict[str, Any]] = []
+    clean_rows: list[tuple[int, float]] = []
+    for row in history_rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        timestamp = _epoch_seconds(row.get("time"))
+        close = _number(row.get("close"))
+        if timestamp is not None and close is not None and close > 0:
+            clean_rows.append((timestamp, close))
+    clean_rows.sort(key=lambda item: item[0])
+    latest_timestamp = clean_rows[-1][0] if clean_rows else None
+    latest_raw_close = clean_rows[-1][1] if clean_rows else None
+    latest_age = now - latest_timestamp if latest_timestamp is not None else None
+    history_errors: list[str] = []
+    scale_factor = None
+    alignment_diff_pct = None
+    if not clean_rows:
+        history_errors.append("OI historical candles are unavailable")
+    elif latest_age is None or latest_age < -60 or latest_age > float(max_history_age_seconds):
+        history_errors.append("latest OI historical candle is stale or has a future timestamp")
+    elif current_value is not None and current_value > 0 and latest_raw_close is not None:
+        candidates = []
+        for factor in (1.0, 1000.0):
+            diff = _diff_pct(latest_raw_close * factor, current_value)
+            if diff is not None:
+                candidates.append((diff, factor))
+        candidates.sort(key=lambda item: item[0])
+        if not candidates or candidates[0][0] > float(max_history_alignment_diff_pct):
+            history_errors.append("latest OI candle does not align with reconciled live contract count at ×1 or ×1000")
+        else:
+            alignment_diff_pct, scale_factor = candidates[0]
+
+    source_valid = not source_errors
+    history_valid = not history_errors and scale_factor is not None
+    valid = source_valid and history_valid
+    if valid:
+        normalized_rows = [
+            {"time": timestamp, "close": close * scale_factor, "raw_close": close}
+            for timestamp, close in clean_rows
+        ]
+        reason = "REST oi/oi_contracts, WebSocket oi[0], and latest OI candle reconcile"
+    else:
+        reason = "; ".join(source_errors + history_errors) or "OI scale validation failed"
+
+    return {
+        "valid": valid,
+        "source_values_valid": source_valid,
+        "history_scale_valid": history_valid,
+        "reason": reason,
+        "history_scale_factor": scale_factor if valid else None,
+        "normalized_history": normalized_rows if valid else [],
+        "raw_latest_close": latest_raw_close,
+        "normalized_latest_close": latest_raw_close * scale_factor if valid and latest_raw_close is not None else None,
+        "latest_timestamp": latest_timestamp,
+        "latest_age_seconds": latest_age,
+        "history_alignment_diff_pct": alignment_diff_pct,
+        "rest_field_diff_pct": rest_pair_diff_pct,
+        "rest_ws_diff_pct": rest_ws_diff_pct,
+        "current_oi_contracts": current_value,
+        "rest_oi_raw": rest_oi_value,
+        "rest_oi_contracts_raw": rest_contract_value,
+        "websocket_oi_contracts": websocket_value,
+    }
+
+
+def summarize_oi_funding_bias(
+    price_change_pct: Any,
+    oi_change_pct: Any,
+    funding_rate: Any,
+    funding_interval_seconds: Any = None,
+    *,
+    neutral_threshold_pct: float = 0.05,
+    oi_validation_passed: bool = False,
+) -> dict[str, Any]:
+    """Describe price/OI context and funding payer side without making a signal."""
+    price_pct = _number(price_change_pct)
+    oi_pct = _number(oi_change_pct)
+    funding = _number(funding_rate)
+    interval = _number(funding_interval_seconds)
+    threshold = _number(neutral_threshold_pct)
+    if threshold is None or threshold < 0:
+        raise ValueError("neutral_threshold_pct must be finite and non-negative")
+
+    if not oi_validation_passed:
+        context_bias = "UNAVAILABLE — OI SCALE / BASELINE NOT VALIDATED"
+        price_oi_regime = "WAIT — historical OI unit or 24h baseline validation failed"
+        context_explanation = (
+            "BUY/SELL bias is suppressed until REST OI, WebSocket OI and normalized "
+            "historical OI candles reconcile and a valid 24h baseline is available."
+        )
+    elif price_pct is None or oi_pct is None:
+        context_bias = "UNAVAILABLE — PRICE/OI DATA MISSING"
+        price_oi_regime = "WAIT — insufficient price or OI history"
+        context_explanation = (
+            "A directional context cannot be calculated without both 24h mark-price "
+            "change and validated 24h aggregate OI change."
+        )
+    elif abs(price_pct) <= threshold or abs(oi_pct) <= threshold:
+        context_bias = "MIXED / WAIT"
+        price_oi_regime = f"NEUTRAL — price or OI change is inside the ±{threshold:.2f}% noise band"
+        context_explanation = "Price and aggregate OI are not both expanding beyond the configured neutral band."
+    elif price_pct > 0 and oi_pct > 0:
+        context_bias = "BUY BIAS CANDIDATE"
+        price_oi_regime = "PRICE UP + OI UP — participation expanding with the advance"
+        context_explanation = "A conventional bullish price/OI combination; it does not prove that new long positions dominate."
+    elif price_pct < 0 and oi_pct > 0:
+        context_bias = "SELL BIAS CANDIDATE"
+        price_oi_regime = "PRICE DOWN + OI UP — participation expanding with the decline"
+        context_explanation = "A conventional bearish price/OI combination; it does not prove that new short positions dominate."
+    elif price_pct > 0 and oi_pct < 0:
+        context_bias = "MIXED / WAIT"
+        price_oi_regime = "PRICE UP + OI DOWN — possible short covering / deleveraging"
+        context_explanation = "The advance occurs while aggregate positions contract; treat it as possible short covering, not confirmed fresh-long buildup."
+    else:
+        context_bias = "MIXED / WAIT"
+        price_oi_regime = "PRICE DOWN + OI DOWN — possible long deleveraging"
+        context_explanation = "The decline occurs while aggregate positions contract; treat it as possible long deleveraging, not confirmed fresh-short buildup."
+
+    if funding is None:
+        funding_payer = "UNAVAILABLE"
+        funding_context = "Funding data is unavailable; no funding-side interpretation is made."
+    elif funding > 0:
+        funding_payer = "LONGS PAY SHORTS"
+        funding_context = "Positive funding means long positions pay shorts; this is a long carry cost, not an automatic SELL signal."
+    elif funding < 0:
+        funding_payer = "SHORTS PAY LONGS"
+        funding_context = "Negative funding means short positions pay longs; this is a short carry cost, not an automatic BUY signal."
+    else:
+        funding_payer = "NEAR ZERO"
+        funding_context = "Funding is zero; there is no payer-side tilt from the sign."
+
+    interval_hours = interval / 3600.0 if interval is not None and interval > 0 else None
+    return {
+        "context_bias": context_bias,
+        "price_oi_regime": price_oi_regime,
+        "context_explanation": context_explanation,
+        "price_change_pct": price_pct,
+        "oi_change_pct": oi_pct,
+        "funding_rate_pct": funding * 100.0 if funding is not None else None,
+        "funding_payer": funding_payer,
+        "funding_context": funding_context,
+        "funding_interval_hours": interval_hours,
+        "oi_validation_passed": bool(oi_validation_passed),
+        "is_directional_candidate": context_bias in {"BUY BIAS CANDIDATE", "SELL BIAS CANDIDATE"},
+    }
+
+
+def summarize_funding_cap(
+    funding_rate: Any,
+    funding_cap_pct: Any,
+    funding_interval_seconds: Any = None,
+    *,
+    warning_utilization_pct: float = 80.0,
+    high_utilization_pct: float = 90.0,
+) -> dict[str, Any]:
+    """Classify proximity of the absolute funding rate to the product cap.
+
+    funding_rate is the raw fractional rate (0.009 = 0.9%); funding_cap_pct
+    is displayed percentage points (1.0 = ±1.0%). This is a warning, not a forecast.
+    """
+    rate = _number(funding_rate)
+    cap_pct = _number(funding_cap_pct)
+    interval = _number(funding_interval_seconds)
+    warning = _number(warning_utilization_pct)
+    high = _number(high_utilization_pct)
+    if cap_pct is None or cap_pct <= 0:
+        raise ValueError("funding_cap_pct must be finite and positive")
+    if warning is None or high is None or warning < 0 or high <= warning or high > 100:
+        raise ValueError("funding utilization thresholds must satisfy 0 <= warning < high <= 100")
+
+    interval_hours = interval / 3600.0 if interval is not None and interval > 0 else None
+    if rate is None or not math.isfinite(rate):
+        return {
+            "status": "UNAVAILABLE",
+            "funding_rate_pct": None,
+            "funding_cap_pct": cap_pct,
+            "cap_utilization_pct": None,
+            "funding_interval_hours": interval_hours,
+            "message": "Funding rate is unavailable; cap utilization cannot be evaluated.",
+        }
+
+    rate_pct = rate * 100.0
+    utilization = abs(rate_pct) / cap_pct * 100.0
+    if utilization >= 100.0:
+        status = "AT OR ABOVE CAP"
+        message = "The observed funding rate is at or above the published product cap; verify the live contract specification."
+    elif utilization >= high:
+        status = "NEAR CAP"
+        message = "Funding is near the product cap; carry cost is elevated and the rate can change before settlement."
+    elif utilization >= warning:
+        status = "APPROACHING CAP"
+        message = "Funding is approaching the product cap; monitor the rate and settlement interval."
+    else:
+        status = "NORMAL"
+        message = "Funding is below the configured approach-to-cap warning threshold."
+
+    return {
+        "status": status,
+        "funding_rate_pct": rate_pct,
+        "funding_cap_pct": cap_pct,
+        "cap_utilization_pct": utilization,
+        "funding_interval_hours": interval_hours,
+        "message": message,
     }
 
 

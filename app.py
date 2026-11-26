@@ -27,11 +27,17 @@ from okx_history_panel import render_okx_history_panel
 from binance_panel import render_binance_cross_venue_panel
 from trade_activity import summarize_trade_prints
 from zone_strength import measure_zone_strength
-from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h
+from daily_metrics import parse_daily_volume_candles, parse_ticker_payload, summarize_aggressor_flow, summarize_open_interest_24h, summarize_oi_funding_bias, validate_and_normalize_open_interest_history, summarize_funding_cap
 from liquidity_effectiveness import build_liquidity_effectiveness
 from liquidity_taker_signal import calculate_liquidity_taker_signal
 from multi_timeframe_orderflow import summarize_aligned_taker_flow
 from breakout_confirmation import detect_multi_timeframe_breakouts
+from market_microstructure import (
+    analyze_orderbook_events,
+    best_visible_quote_levels,
+    summarize_daily_utc_flow,
+)
+from premium_discount import build_premium_discount_map, classify_price_in_dealing_range
 from exchange_flow_panel import render_exchange_flow_panel
 from exhaustion_confirmation import analyze_exhaustion_and_sweeps
 
@@ -221,6 +227,7 @@ CHANNEL_STALE_SECONDS = {
 }
 BOOK_TICK = 0.5                # BTCUSD tick size (Delta product metadata, verified 2026-10-12)
 CONTRACT_VALUE_BTC = 0.001     # 1 contract = 0.001 BTC (Delta product metadata, verified 2026-10-12)
+BTCUSD_FUNDING_CAP_PCT = 1.00   # Delta India BTCUSD published funding cap: +/-1.00%; recheck contract specs when changed
 LIQ_BAND_DISTANCE = 2          # tick multiples around a cluster when flagging nearby resting liquidity
 
 st.set_page_config(
@@ -311,7 +318,9 @@ def load_daily_ticker_metrics() -> dict[str, Any]:
             timeout=6,
         )
         response.raise_for_status()
-        return parse_ticker_payload(response.json(), SYMBOL)
+        return parse_ticker_payload(
+            response.json(), SYMBOL, contract_value_btc=CONTRACT_VALUE_BTC
+        )
     except (requests.RequestException, ValueError, TypeError):
         _logger.warning("Daily ticker REST snapshot unavailable", exc_info=True)
         return parse_ticker_payload({}, SYMBOL)
@@ -549,6 +558,7 @@ class DeltaFeed:
             "trade_clusters": deque(maxlen=100),  # finalized aggressive clusters (+ price response)
             "open_clusters": {},                  # side -> cluster still accepting trades
             "depth_samples": deque(maxlen=6000),  # (ts, side, price, size) significant bands
+            "book_snapshots": deque(maxlen=300),  # top-25 L2 snapshots sampled every ~2s for candidate diagnostics
             "level_stats": {},   # (side, price) -> first/last seen, max size (bounded, pruned)
             "book_liq_threshold": None,           # adaptive book-significance threshold (contracts)
             "large_trade_threshold": None,        # adaptive large-trade threshold (contracts)
@@ -599,6 +609,10 @@ class DeltaFeed:
             copy["trade_clusters"] = [dict(c) for c in self.data["trade_clusters"]]
             copy["open_clusters"] = [dict(c) for c in self.data["open_clusters"].values()]
             copy["depth_samples"] = list(self.data["depth_samples"])[-1200:]
+            copy["book_snapshots"] = [
+                {"ts": float(item["ts"]), "bids": dict(item["bids"]), "asks": dict(item["asks"])}
+                for item in self.data["book_snapshots"]
+            ]
             copy["level_stats"] = {k: dict(v) for k, v in self.data["level_stats"].items()}
             copy["book_liq_threshold"] = self.data["book_liq_threshold"]
             copy["large_trade_threshold"] = self.data["large_trade_threshold"]
@@ -711,6 +725,33 @@ class DeltaFeed:
             "Feed health: connection=%s book_synced=%s gaps=%s crc_fail=%s per_channel_age=[%s]",
             conn, book_synced, gaps, crc_fail, ", ".join(parts) if parts else "none",
         )
+        health_path = os.environ.get("DELTA_FEED_HEALTH_FILE")
+        if health_path:
+            with self.lock:
+                heartbeat = {
+                    "ts_epoch": now,
+                    "pid": os.getpid(),
+                    "connection": self.data.get("connection"),
+                    "last_market_message_at": self.data.get("last_market_message_at"),
+                    "channel_last_seen": dict(self.data.get("channel_last_seen", {})),
+                    "book_synced": self.data.get("book_synced") is True,
+                    "sequence_gap_unresolved": self.data.get("sequence_gap_unresolved", True) is not False,
+                    "checksum_ok": self.data.get("checksum_ok"),
+                    "websocket_worker_alive": bool(self.thread and self.thread.is_alive()),
+                    "sampler_worker_alive": bool(self._sthread and self._sthread.is_alive()),
+                }
+            try:
+                health_dir = os.path.dirname(os.path.abspath(health_path))
+                os.makedirs(health_dir, exist_ok=True)
+                temp_path = f"{health_path}.{os.getpid()}.tmp"
+                with open(temp_path, "w", encoding="utf-8") as handle:
+                    json.dump(heartbeat, handle, allow_nan=False, separators=(",", ":"))
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, health_path)
+            except (OSError, TypeError, ValueError) as exc:
+                _logger.exception("Failed to publish feed-health heartbeat: %s", exc)
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
         self._set_status("connected", "")
@@ -975,6 +1016,11 @@ class DeltaFeed:
             else:
                 asks = {float(k): _f(v, 0.0) or 0.0 for k, v in self.data["asks"].items()}
                 bids = {float(k): _f(v, 0.0) or 0.0 for k, v in self.data["bids"].items()}
+                self.data["book_snapshots"].append({
+                    "ts": now,
+                    "bids": dict(sorted(bids.items(), key=lambda item: item[0], reverse=True)[:25]),
+                    "asks": dict(sorted(asks.items(), key=lambda item: item[0])[:25]),
+                })
         mid = None
         if asks and bids:
             mid = (min(asks) + max(bids)) / 2.0
@@ -2143,7 +2189,7 @@ with st.sidebar:
         value=True,
         help="Marks potential exhaustion only when a completed candle rejects a new local extreme and same-candle aggressor flow confirms the pressure. Context labels, not entry signals.",
     )
-    show_flow_panel = st.checkbox("Order-flow & liquidity panel", value=True)
+    st.caption("Core trading panels (open interest, best BID/ASK, premium/discount and order blocks) are always shown below the price chart.")
     show_depth_heat = st.checkbox("Depth heatmap (captured only)", value=False)
     ob_lookback = st.slider("Order-block lookback (candles)", 30, 400, 150, 10)
     ob_displacement = st.slider("Displacement threshold (× ATR)", 0.3, 3.0, 1.0, 0.1)
@@ -2592,9 +2638,445 @@ def render_book_panel(compact: bool = False) -> None:
 
 
 @st.fragment(run_every=2.0)
+def render_open_interest_panel() -> None:
+    """Always-visible aggregate OI and executed taker BUY/SELL summary."""
+    d = feed.snapshot()
+
+    st.subheader("1. OPEN INTEREST + EXECUTED BUY/SELL FLOW")
+    st.divider()
+    st.subheader("Aggregate OI, directional taker flow and 24-hour volume")
+    now_ts = time.time()
+    ticker_metrics = load_daily_ticker_metrics()
+    daily_volume_history = load_daily_volume_history()
+    oi_history = load_open_interest_history()
+    flow_24h = summarize_aggressor_flow(
+        d.get("trade_flow_minutes", {}),
+        now_ts=now_ts,
+        feed_started_at=d.get("started_at"),
+        contract_value_btc=CONTRACT_VALUE_BTC,
+        window_seconds=86_400,
+    )
+    channel_seen = d.get("channel_last_seen") or {}
+    ws_ticker_seen = _f(channel_seen.get("ticker"))
+    ws_ticker_age = max(0.0, now_ts - ws_ticker_seen) if ws_ticker_seen is not None else None
+    ws_ticker_fresh = (
+        str(d.get("connection", "")).lower() == "connected"
+        and ws_ticker_age is not None
+        and ws_ticker_age <= float(CHANNEL_STALE_SECONDS.get("ticker") or 8)
+    )
+    rest_oi_timestamp = _f(ticker_metrics.get("timestamp"))
+    rest_oi_age = (now_ts - rest_oi_timestamp) if rest_oi_timestamp is not None else None
+    rest_ticker_fresh = rest_oi_age is not None and -60.0 <= rest_oi_age <= 60.0
+    rest_oi_raw = ticker_metrics.get("oi_field_contracts") if rest_ticker_fresh else None
+    rest_oi_contracts_raw = ticker_metrics.get("oi_contracts_field") if rest_ticker_fresh else None
+    websocket_oi_contracts = (
+        _f(d.get("open_interest_contracts")) if ws_ticker_fresh else None
+    )
+    current_oi = ticker_metrics.get("open_interest_contracts") if rest_ticker_fresh else None
+    if current_oi is None and ws_ticker_fresh:
+        current_oi = websocket_oi_contracts
+
+    oi_history_validation = validate_and_normalize_open_interest_history(
+        oi_history,
+        current_oi,
+        rest_oi=rest_oi_raw,
+        rest_oi_contracts=rest_oi_contracts_raw,
+        websocket_oi_contracts=websocket_oi_contracts,
+        now_ts=now_ts,
+        max_history_age_seconds=7_200,
+        max_rest_field_diff_pct=1.0,
+        max_rest_ws_diff_pct=2.0,
+        max_history_alignment_diff_pct=5.0,
+    )
+    normalized_oi_history = (
+        oi_history_validation["normalized_history"]
+        if oi_history_validation["valid"] else []
+    )
+    current_oi = (
+        oi_history_validation["current_oi_contracts"]
+        if oi_history_validation["source_values_valid"] else None
+    )
+    oi_24h = summarize_open_interest_24h(
+        normalized_oi_history, current_oi, now_ts=now_ts, window_seconds=86_400
+    )
+    oi_baseline_valid = (
+        bool(oi_history_validation["valid"])
+        and oi_24h.get("baseline_contracts") is not None
+        and float(oi_24h.get("baseline_contracts") or 0) > 0
+        and oi_24h.get("change_pct") is not None
+        and oi_24h.get("baseline_timestamp") is not None
+    )
+    ws_turnover_usd = (d.get("ticker_24h") or {}).get("turnover_usd")
+    volume = ticker_metrics.get("volume")
+    turnover_usd = ticker_metrics.get("turnover_usd")
+    if turnover_usd is None:
+        turnover_usd = ws_turnover_usd
+    oi_value_usd = ticker_metrics.get("open_interest_value_usd") if oi_history_validation["source_values_valid"] and rest_ticker_fresh else None
+    oi_change_text = "UNAVAILABLE — OI VALIDATION FAILED"
+    if oi_baseline_valid and oi_24h.get("change_contracts") is not None:
+        change = float(oi_24h["change_contracts"])
+        pct = oi_24h.get("change_pct")
+        oi_change_text = f"{change:+,.0f} contracts"
+        if pct is not None:
+            oi_change_text += f" ({float(pct):+.1f}%)"
+
+    latest_daily_volume = daily_volume_history[-1] if daily_volume_history else None
+    latest_daily_volume_time = (
+        pd.to_datetime(latest_daily_volume["time"], unit="s", utc=True).strftime("%Y-%m-%d UTC")
+        if latest_daily_volume else "—"
+    )
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric(
+        "Latest daily candle volume",
+        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} raw API units",
+        help="BTCUSD 1d candle volume exactly as returned by Delta's public history API. The quantity basis is not confirmed here and no BTC/contract normalization is applied. The newest candle may still be forming. Do not assume it shares a unit with ticker session volume.",
+    )
+    m2.metric(
+        "Ticker session volume",
+        "—" if volume is None else f"{float(volume):,.0f} raw API units",
+        help="Live ticker session volume exactly as returned by Delta's public ticker API. Its quantity basis is not confirmed here; treat it as a separate raw field from daily-candle volume.",
+    )
+    m3.metric(
+        "Ticker turnover (USD)",
+        "—" if turnover_usd is None else f"${float(turnover_usd):,.0f}",
+    )
+    m4.metric(
+        "Aggregate open interest",
+        "—" if current_oi is None else f"{float(current_oi):,.4f} contracts",
+    )
+    m5.metric(
+        "Aggregate OI change (24h)",
+        oi_change_text,
+    )
+    m6.metric(
+        "OI value (USD)",
+        "—" if oi_value_usd is None else f"${float(oi_value_usd):,.2f}",
+        help="Independently calculated as outstanding contracts × 0.001 BTC per contract × current Delta mark price.",
+    )
+
+    # A transparent positioning-context heuristic: 24h mark-price direction +
+    # 24h aggregate-OI change. Funding is shown separately as the payer side,
+    # never used alone to manufacture a BUY/SELL direction.
+    ticker_24h = d.get("ticker_24h") or {}
+    price_change_pct = _f(ticker_24h.get("mark_change_pct")) if ws_ticker_fresh else None
+    oi_change_pct_for_bias = oi_24h.get("change_pct") if oi_baseline_valid and ws_ticker_fresh else None
+    funding_seen = _f(channel_seen.get("funding_rate"))
+    funding_age = max(0.0, now_ts - funding_seen) if funding_seen is not None else None
+    funding_available = (
+        str(d.get("connection", "")).lower() == "connected"
+        and funding_age is not None
+        and funding_age <= 180.0
+        and d.get("funding_rate") is not None
+    )
+    funding_rate_raw = _f(d.get("funding_rate")) if funding_available else None
+    funding_interval_seconds = _f(d.get("funding_interval_seconds")) if funding_available else None
+    positioning = summarize_oi_funding_bias(
+        price_change_pct,
+        oi_change_pct_for_bias,
+        funding_rate_raw,
+        funding_interval_seconds,
+        neutral_threshold_pct=0.05,
+        oi_validation_passed=oi_baseline_valid,
+    )
+    funding_cap = summarize_funding_cap(
+        funding_rate_raw,
+        BTCUSD_FUNDING_CAP_PCT,
+        funding_interval_seconds,
+        warning_utilization_pct=80.0,
+        high_utilization_pct=90.0,
+    )
+    st.markdown("**Open-interest + funding positioning context (24h heuristic)**")
+    bias_col, funding_col, components_col = st.columns(3)
+    bias_col.metric(
+        "Price + OI context bias",
+        positioning["context_bias"],
+        help=(
+            "BUY BIAS CANDIDATE = 24h mark price rising and aggregate OI rising. "
+            "SELL BIAS CANDIDATE = 24h mark price falling and aggregate OI rising. "
+            "If OI falls, the result is MIXED / WAIT because the move may be position closing. "
+            "This is context only, not an entry signal."
+        ),
+    )
+    funding_value_text = (
+        "—" if positioning["funding_rate_pct"] is None
+        else f"{positioning['funding_rate_pct']:+.5f}%"
+    )
+    funding_interval_text = (
+        "interval unavailable" if positioning["funding_interval_hours"] is None
+        else f"per {positioning['funding_interval_hours']:g}h interval"
+    )
+    funding_col.metric(
+        "Funding payer",
+        positioning["funding_payer"],
+        delta=f"{funding_value_text} · {funding_interval_text}" if positioning["funding_rate_pct"] is not None else None,
+        help=(
+            "Positive funding: LONGS PAY SHORTS. Negative funding: SHORTS PAY LONGS. "
+            "The rate is a carry transfer, not a standalone BUY or SELL signal."
+        ),
+    )
+    price_text = "—" if positioning["price_change_pct"] is None else f"{positioning['price_change_pct']:+.2f}%"
+    oi_text = "—" if positioning["oi_change_pct"] is None else f"{positioning['oi_change_pct']:+.2f}%"
+    components_col.metric(
+        "24h price / OI change",
+        f"{price_text} / {oi_text}",
+        help="Price uses Delta ticker 24h mark-price change. OI uses current aggregate contracts versus the nearest hourly OI close at the 24h cutoff.",
+    )
+    funding_age_text = (
+        "Funding channel not yet observed"
+        if funding_seen is None
+        else (
+            f"Funding channel last updated {funding_age:.0f}s ago"
+            if funding_available
+            else f"Funding channel stale ({funding_age:.0f}s); rate withheld"
+        )
+    )
+    if oi_history_validation["valid"]:
+        rest_pair_diff_text = (
+            "not supplied" if oi_history_validation["rest_field_diff_pct"] is None
+            else f"{oi_history_validation['rest_field_diff_pct']:.3f}%"
+        )
+        st.caption(
+            f"OI history scale VERIFIED — candle scale ×{oi_history_validation['history_scale_factor']:g} "
+            f"to raw contracts; REST oi × 1000 vs oi_contracts difference {rest_pair_diff_text}; "
+            f"REST vs WebSocket OI difference {oi_history_validation['rest_ws_diff_pct']:.3f}%; "
+            f"historical/live alignment difference {oi_history_validation['history_alignment_diff_pct']:.3f}%."
+        )
+        if oi_baseline_valid:
+            st.caption("24h OI baseline validation: PASS.")
+        else:
+            st.warning(
+                "Historical OI units are verified, but a valid 24h baseline is unavailable. "
+                "The normalized OI chart may be shown; the 24h percentage and BUY/SELL bias candidates are suppressed."
+            )
+    else:
+        st.warning(
+            "OI scale validation failed. Historical OI chart and 24h OI percentage are withheld; "
+            f"BUY/SELL bias candidates are suppressed. Reason: {oi_history_validation['reason']}"
+        )
+    if funding_cap["status"] == "AT OR ABOVE CAP":
+        st.error(
+            f"FUNDING AT/ABOVE BTCUSD CAP: {funding_cap['funding_rate_pct']:+.5f}% of ±"
+            f"{funding_cap['funding_cap_pct']:.2f}% cap "
+            f"({funding_cap['cap_utilization_pct']:.1f}% utilization). {funding_cap['message']}"
+        )
+    elif funding_cap["status"] == "NEAR CAP":
+        st.error(
+            f"FUNDING NEAR BTCUSD CAP: {funding_cap['funding_rate_pct']:+.5f}% of ±"
+            f"{funding_cap['funding_cap_pct']:.2f}% cap "
+            f"({funding_cap['cap_utilization_pct']:.1f}% utilization). {funding_cap['message']}"
+        )
+    elif funding_cap["status"] == "APPROACHING CAP":
+        st.warning(
+            f"FUNDING APPROACHING BTCUSD CAP: {funding_cap['funding_rate_pct']:+.5f}% of ±"
+            f"{funding_cap['funding_cap_pct']:.2f}% cap "
+            f"({funding_cap['cap_utilization_pct']:.1f}% utilization). {funding_cap['message']}"
+        )
+    st.caption(
+        f"{positioning['price_oi_regime']}. {positioning['context_explanation']} "
+        f"{positioning['funding_context']} {funding_age_text}. "
+        "Aggregate OI is not split into long/short positions; price/OI combinations are candidates only, "
+        "and funding does not flip the price/OI context or create an entry signal. "
+        f"BTCUSD cap reference: ±{BTCUSD_FUNDING_CAP_PCT:.2f}% per product interval; "
+        "recheck Delta contract specifications for changes."
+    )
+
+    reported_oi_value_usd = ticker_metrics.get("reported_open_interest_value_usd")
+    oi_mark_price = ticker_metrics.get("open_interest_mark_price")
+    oi_discrepancy_pct = ticker_metrics.get("open_interest_value_usd_discrepancy_pct")
+    if oi_value_usd is not None and current_oi is not None and oi_mark_price is not None:
+        st.caption(
+            f"OI USD notional calculation: {float(current_oi):,.4f} contracts × "
+            f"{CONTRACT_VALUE_BTC:g} BTC/contract × ${float(oi_mark_price):,.2f} mark price."
+        )
+        if reported_oi_value_usd is not None and oi_discrepancy_pct is not None and abs(float(oi_discrepancy_pct)) >= 5.0:
+            reported_ratio = float(reported_oi_value_usd) / float(oi_value_usd) if oi_value_usd > 0 else None
+            ratio_text = f" ({reported_ratio:,.1f}× the calculated value)" if reported_ratio is not None else ""
+            st.warning(
+                "Delta's reported oi_value_usd does not reconcile with the BTCUSD contract multiplier. "
+                f"Reported API field: ${float(reported_oi_value_usd):,.0f}; "
+                f"contract-based notional: ${float(oi_value_usd):,.0f}{ratio_text}. "
+                "The metric above uses the contract-based calculation; the raw API field is retained only for diagnostics."
+            )
+    elif reported_oi_value_usd is not None:
+        st.caption(
+            "OI USD notional is withheld because a valid contract count and mark price are not both available; "
+            "the unverified exchange-reported OI USD field is not displayed."
+        )
+
+    st.markdown("**Open interest side availability**")
+    oi_long_col, oi_short_col = st.columns(2)
+    oi_long_col.metric(
+        "Long-side open interest",
+        "NOT PUBLISHED",
+        help="Delta's public ticker supplies aggregate outstanding contracts, not a long-position OI split.",
+    )
+    oi_short_col.metric(
+        "Short-side open interest",
+        "NOT PUBLISHED",
+        help="Delta's public ticker supplies aggregate outstanding contracts, not a short-position OI split.",
+    )
+    st.caption(
+        "Open interest is one aggregate contract count. Every open contract has one long and one short counterparty, "
+        "so the public aggregate cannot be split into independent BUY-side and SELL-side OI totals. "
+        "The buyer/seller table below is executed taker flow, not position-side open interest."
+    )
+
+    if daily_volume_history:
+        daily_volume_df = pd.DataFrame(daily_volume_history[-7:]).sort_values("time", ascending=False)
+        daily_volume_df["Daily candle (UTC)"] = pd.to_datetime(
+            daily_volume_df["time"], unit="s", utc=True
+        ).dt.strftime("%Y-%m-%d")
+        daily_volume_df = daily_volume_df.rename(columns={"volume": "BTCUSD volume (raw API units)"})
+        st.dataframe(
+            daily_volume_df[["Daily candle (UTC)", "BTCUSD volume (raw API units)"]].style.format(
+                {"BTCUSD volume (raw API units)": "{:,.0f}"}
+            ),
+            hide_index=True,
+            use_container_width=True,
+            height=190,
+        )
+        st.caption(
+            "Daily-candle volume is shown as raw API units (quantity basis unverified). "
+            "Ticker session volume is a separate raw API field; the two values are not assumed "
+            "to share a unit and are not normalized or compared directly."
+        )
+    else:
+        st.info("BTCUSD daily-candle volume history is unavailable; the live ticker session volume is shown separately.")
+
+    direction_rows = [
+        {
+            "Aggressor": "BUY taker",
+            "Prints": flow_24h["buy_count"],
+            "Contracts": flow_24h["buy_contracts"],
+            "BTC equivalent": flow_24h["buy_btc"],
+            "Approx USD notional": flow_24h["buy_usd"],
+            "Captured volume share": flow_24h["buy_share_pct"],
+        },
+        {
+            "Aggressor": "SELL taker",
+            "Prints": flow_24h["sell_count"],
+            "Contracts": flow_24h["sell_contracts"],
+            "BTC equivalent": flow_24h["sell_btc"],
+            "Approx USD notional": flow_24h["sell_usd"],
+            "Captured volume share": flow_24h["sell_share_pct"],
+        },
+    ]
+    st.markdown("**Executed taker BUY / SELL flow — separate from open interest positions**")
+    direction_df = pd.DataFrame(direction_rows)
+    st.dataframe(
+        direction_df.style.format({
+            "Prints": "{:,.0f}",
+            "Contracts": "{:,.0f}",
+            "BTC equivalent": "{:,.4f}",
+            "Approx USD notional": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
+            "Captured volume share": "{:.2f}%",
+        }),
+        hide_index=True,
+        use_container_width=True,
+    )
+    capture_text = (
+        "not available" if flow_24h.get("capture_hours") is None
+        else f"{flow_24h['capture_hours']:.1f} hours since this process started (maximum 24 hours)"
+    )
+    st.caption(
+        "Latest daily volume is the newest BTCUSD 1d candle (which may still be forming); ticker session volume/turnover are separate live ticker fields. "
+        f"BUY/SELL distribution is calculated from captured public aggressor-side trades; capture span: {capture_text}. "
+        "It is not backfilled before this process starts and any feed outage creates missing observations. "
+        "Shares are percentages of captured, classified BUY+SELL contract volume, not percentages of the exchange's full 24h total. "
+        "Approximate USD notional = contracts × 0.001 BTC × execution price."
+    )
+
+    daily_flow = summarize_daily_utc_flow(
+        d.get("trade_flow_minutes", {}),
+        now_ts=now_ts,
+        feed_started_at=d.get("started_at"),
+        trade_last_seen=(d.get("channel_last_seen", {}) or {}).get("trades"),
+        connection_status=str(d.get("connection", "unknown")),
+        contract_value_btc=CONTRACT_VALUE_BTC,
+        days=7,
+        trade_stale_seconds=float(CHANNEL_STALE_SECONDS.get("trades") or 20),
+    )
+    st.markdown("**UTC calendar-day BUY / SELL executed volume**")
+    daily_rows = []
+    for item in daily_flow["days"]:
+        daily_rows.append({
+            "UTC date": datetime.fromtimestamp(item["utc_date"], timezone.utc).strftime("%Y-%m-%d"),
+            "BUY prints": item["buy_prints"],
+            "SELL prints": item["sell_prints"],
+            "BUY contracts": item["buy_contracts"],
+            "SELL contracts": item["sell_contracts"],
+            "BUY BTC": item["buy_btc"],
+            "SELL BTC": item["sell_btc"],
+            "Net delta (contracts)": item["net_delta_contracts"],
+            "Minutes with trades": item["minutes_with_trades"],
+            "App window coverage": item["app_window_coverage_pct"],
+            "Capture status": item["capture_status"],
+        })
+    # Newest UTC date first so the current day is immediately visible.
+    daily_rows.reverse()
+    st.dataframe(
+        pd.DataFrame(daily_rows).style.format({
+            "BUY prints": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "SELL prints": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "BUY contracts": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "SELL contracts": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "BUY BTC": lambda value: "—" if pd.isna(value) else f"{value:,.4f}",
+            "SELL BTC": lambda value: "—" if pd.isna(value) else f"{value:,.4f}",
+            "Net delta (contracts)": lambda value: "—" if pd.isna(value) else f"{value:+,.0f}",
+            "Minutes with trades": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+            "App window coverage": lambda value: "—" if pd.isna(value) else f"{value:.1f}%",
+        }, na_rep="—"),
+        hide_index=True, use_container_width=True, height=280,
+    )
+    st.caption(
+        "The table shows the latest seven UTC calendar dates, computed from classified Delta public taker prints captured by this app process. "
+        "BUY takers lift resting asks; SELL takers hit resting bids. BTC equivalent = contracts × 0.001 BTC/contract. "
+        "Partial days are explicitly labelled. App-window coverage measures process uptime within the day only; it does "
+        "not prove uninterrupted message delivery. Delta's public tape has no per-trade sequence number or historical "
+        "backfill, so these figures are observed totals, not guaranteed exchange-complete daily volume."
+    )
+
+    oi_chart_rows = oi_24h.get("history") or []
+    if oi_history_validation["valid"] and len(oi_chart_rows) >= 2:
+        oi_chart_df = pd.DataFrame(oi_chart_rows)
+        oi_chart_df["Time (IST)"] = pd.to_datetime(
+            oi_chart_df["time"], unit="s", utc=True
+        ).dt.tz_convert("Asia/Kolkata")
+        oi_fig = go.Figure()
+        oi_fig.add_trace(go.Scatter(
+            x=oi_chart_df["Time (IST)"],
+            y=oi_chart_df["open_interest_contracts"],
+            mode="lines",
+            name="Open interest",
+        ))
+        oi_fig.update_layout(
+            height=250,
+            margin=dict(l=8, r=8, t=12, b=8),
+            template="plotly_dark",
+            xaxis_title="Time (IST)",
+            yaxis_title="Open interest (normalized raw contracts)",
+            showlegend=False,
+        )
+        oi_fig.update_xaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
+        oi_fig.update_yaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
+        st.plotly_chart(oi_fig, use_container_width=True, key="btcusd_oi_24h_chart")
+    else:
+        st.info(
+            "Open-interest history chart is withheld because its unit scale or live-source reconciliation "
+            "has not been verified. Current OI is shown only when the REST/WebSocket source check passes."
+        )
+    st.caption(
+        "Open interest is aggregate outstanding contracts. It is not split into BUY-side and SELL-side OI: "
+        "every open contract has both a long and a short counterparty. The directional table above is taker-aggressor traded volume, not long/short positioning. "
+        "The exchange WebSocket also reports a separate 6-hour OI-value change in the contract settlement currency: "
+        + ("—" if d.get("open_interest_change_6h_settlement") is None else f"{float(d['open_interest_change_6h_settlement']):+,.0f} settlement units")
+    )
+
+@st.fragment(run_every=2.0)
 def render_tape_cvd_panel() -> None:
     """Executed-trade tape and session CVD proxy."""
     d = feed.snapshot()
+    st.subheader("Executed trades and session CVD")
     tape_col, cvd_col = st.columns([1, 1], gap="large")
     with tape_col:
         st.subheader("Executed BUY / SELL activity")
@@ -2659,164 +3141,6 @@ def render_tape_cvd_panel() -> None:
         c3.metric("Net session delta", _fmt(d["cvd_value"], 0))
         st.caption("CVD is a client-side proxy collected since this dashboard started. It resets on restart and should not be treated as a verified exchange-calculated metric.")
 
-    st.divider()
-    st.subheader("24-hour volume distribution and open interest")
-    now_ts = time.time()
-    ticker_metrics = load_daily_ticker_metrics()
-    daily_volume_history = load_daily_volume_history()
-    oi_history = load_open_interest_history()
-    flow_24h = summarize_aggressor_flow(
-        d.get("trade_flow_minutes", {}),
-        now_ts=now_ts,
-        feed_started_at=d.get("started_at"),
-        contract_value_btc=CONTRACT_VALUE_BTC,
-        window_seconds=86_400,
-    )
-    current_oi = ticker_metrics.get("open_interest_contracts")
-    if current_oi is None:
-        current_oi = d.get("open_interest_contracts")
-    oi_24h = summarize_open_interest_24h(
-        oi_history, current_oi, now_ts=now_ts, window_seconds=86_400
-    )
-    ws_turnover_usd = (d.get("ticker_24h") or {}).get("turnover_usd")
-    volume = ticker_metrics.get("volume")
-    turnover_usd = ticker_metrics.get("turnover_usd")
-    if turnover_usd is None:
-        turnover_usd = ws_turnover_usd
-    oi_value_usd = ticker_metrics.get("open_interest_value_usd")
-    oi_change_text = "Unavailable"
-    if oi_24h.get("change_contracts") is not None:
-        change = float(oi_24h["change_contracts"])
-        pct = oi_24h.get("change_pct")
-        oi_change_text = f"{change:+,.0f} contracts"
-        if pct is not None:
-            oi_change_text += f" ({float(pct):+.2f}%)"
-
-    latest_daily_volume = daily_volume_history[-1] if daily_volume_history else None
-    latest_daily_volume_time = (
-        pd.to_datetime(latest_daily_volume["time"], unit="s", utc=True).strftime("%Y-%m-%d UTC")
-        if latest_daily_volume else "—"
-    )
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric(
-        "Latest daily candle volume",
-        "—" if latest_daily_volume is None else f"{float(latest_daily_volume['volume']):,.0f} API units",
-        help=f"BTCUSD 1d candle timestamp: {latest_daily_volume_time}. The newest candle may still be forming.",
-    )
-    m2.metric(
-        "Ticker session volume",
-        "—" if volume is None else f"{float(volume):,.0f} API units",
-    )
-    m3.metric(
-        "Ticker turnover (USD)",
-        "—" if turnover_usd is None else f"${float(turnover_usd):,.0f}",
-    )
-    m4.metric(
-        "Current open interest",
-        "—" if current_oi is None else f"{float(current_oi):,.0f} contracts",
-    )
-    m5.metric(
-        "OI change (24h)",
-        oi_change_text,
-    )
-    m6.metric(
-        "OI value (USD)",
-        "—" if oi_value_usd is None else f"${float(oi_value_usd):,.0f}",
-    )
-
-    if daily_volume_history:
-        daily_volume_df = pd.DataFrame(daily_volume_history[-7:]).sort_values("time", ascending=False)
-        daily_volume_df["Daily candle (UTC)"] = pd.to_datetime(
-            daily_volume_df["time"], unit="s", utc=True
-        ).dt.strftime("%Y-%m-%d")
-        daily_volume_df = daily_volume_df.rename(columns={"volume": "BTCUSD volume (API units)"})
-        st.dataframe(
-            daily_volume_df[["Daily candle (UTC)", "BTCUSD volume (API units)"]].style.format(
-                {"BTCUSD volume (API units)": "{:,.0f}"}
-            ),
-            hide_index=True,
-            use_container_width=True,
-            height=190,
-        )
-    else:
-        st.info("BTCUSD daily-candle volume history is unavailable; the live ticker session volume is shown separately.")
-
-    direction_rows = [
-        {
-            "Aggressor": "BUY taker",
-            "Prints": flow_24h["buy_count"],
-            "Contracts": flow_24h["buy_contracts"],
-            "BTC equivalent": flow_24h["buy_btc"],
-            "Approx USD notional": flow_24h["buy_usd"],
-            "Captured volume share": flow_24h["buy_share_pct"],
-        },
-        {
-            "Aggressor": "SELL taker",
-            "Prints": flow_24h["sell_count"],
-            "Contracts": flow_24h["sell_contracts"],
-            "BTC equivalent": flow_24h["sell_btc"],
-            "Approx USD notional": flow_24h["sell_usd"],
-            "Captured volume share": flow_24h["sell_share_pct"],
-        },
-    ]
-    direction_df = pd.DataFrame(direction_rows)
-    st.dataframe(
-        direction_df.style.format({
-            "Prints": "{:,.0f}",
-            "Contracts": "{:,.0f}",
-            "BTC equivalent": "{:,.4f}",
-            "Approx USD notional": lambda value: "—" if pd.isna(value) else "$" + f"{value:,.2f}",
-            "Captured volume share": "{:.2f}%",
-        }),
-        hide_index=True,
-        use_container_width=True,
-    )
-    capture_text = (
-        "not available" if flow_24h.get("capture_hours") is None
-        else f"{flow_24h['capture_hours']:.1f} hours since this process started (maximum 24 hours)"
-    )
-    st.caption(
-        "Latest daily volume is the newest BTCUSD 1d candle (which may still be forming); ticker session volume/turnover are separate live ticker fields. "
-        f"BUY/SELL distribution is calculated from captured public aggressor-side trades; capture span: {capture_text}. "
-        "It is not backfilled before this process starts and any feed outage creates missing observations. "
-        "Shares are percentages of captured, classified BUY+SELL contract volume, not percentages of the exchange's full 24h total. "
-        "Approximate USD notional = contracts × 0.001 BTC × execution price."
-    )
-
-    oi_chart_rows = oi_24h.get("history") or []
-    if len(oi_chart_rows) >= 2:
-        oi_chart_df = pd.DataFrame(oi_chart_rows)
-        oi_chart_df["Time (IST)"] = pd.to_datetime(
-            oi_chart_df["time"], unit="s", utc=True
-        ).dt.tz_convert("Asia/Kolkata")
-        oi_fig = go.Figure()
-        oi_fig.add_trace(go.Scatter(
-            x=oi_chart_df["Time (IST)"],
-            y=oi_chart_df["open_interest_contracts"],
-            mode="lines",
-            name="Open interest",
-        ))
-        oi_fig.update_layout(
-            height=250,
-            margin=dict(l=8, r=8, t=12, b=8),
-            template="plotly_dark",
-            xaxis_title="Time (IST)",
-            yaxis_title="Open interest (contracts)",
-            showlegend=False,
-        )
-        oi_fig.update_xaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
-        oi_fig.update_yaxes(showgrid=True, gridcolor="rgba(130,130,130,.15)")
-        st.plotly_chart(oi_fig, use_container_width=True, key="btcusd_oi_24h_chart")
-    else:
-        st.info("24-hour OI history is unavailable from Delta at the moment; current OI is shown when the ticker is available.")
-    st.caption(
-        "Open interest is aggregate outstanding contracts. It is not split into BUY-side and SELL-side OI: "
-        "every open contract has both a long and a short counterparty. The directional table above is taker-aggressor traded volume, not long/short positioning. "
-        "The exchange WebSocket also reports a separate 6-hour OI-value change in the contract settlement currency: "
-        + ("—" if d.get("open_interest_change_6h_settlement") is None else f"{float(d['open_interest_change_6h_settlement']):+,.0f} settlement units")
-    )
-
-
 
 @st.fragment(run_every=2.0)
 def render_flow_panel() -> None:
@@ -2848,6 +3172,207 @@ def render_flow_panel() -> None:
                                      ob_zone_basis, eq_tolerance)
     liq = _book_liquidity(d, float(liq_percentile), 2) if book_ready else None
 
+    st.subheader("2. BEST BUY / SELL PRICE LEVELS — LIVE TOP OF BOOK")
+    if zone_book_valid:
+        quote_levels = best_visible_quote_levels(d.get("bids"), d.get("asks"))
+        best_bid = quote_levels["best_bid"]
+        best_ask = quote_levels["best_ask"]
+        if best_bid is None or best_ask is None:
+            st.info("A usable best BUY and best SELL price level is not available in the current synchronized L2 snapshot.")
+        else:
+            best_bid_price = best_bid["price"]
+            best_ask_price = best_ask["price"]
+            best_bid_size = best_bid["size_contracts"]
+            best_ask_size = best_ask["size_contracts"]
+            depth_sum = best_bid_size + best_ask_size
+            microprice = (
+                (best_ask_price * best_bid_size + best_bid_price * best_ask_size) / depth_sum
+                if depth_sum > 0 else None
+            )
+            spread = best_ask_price - best_bid_price
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric(
+                "Best BUY price level (highest BID)",
+                f"{best_bid_price:,.1f}",
+                delta=f"{best_bid_size:,.0f} contracts resting at this level",
+                delta_color="off",
+            )
+            q2.metric(
+                "Best SELL price level (lowest ASK)",
+                f"{best_ask_price:,.1f}",
+                delta=f"{best_ask_size:,.0f} contracts resting at this level",
+                delta_color="off",
+            )
+            q3.metric("Displayed ASK − BID spread", f"{spread:,.1f} points")
+            q4.metric("Size-weighted microprice", "—" if microprice is None else f"{microprice:,.2f}")
+            st.caption(
+                "Best BUY is the highest visible BID; Best SELL is the lowest visible ASK. "
+                "Each contract count is the resting size at that exact price level, not depth summed across levels or executed trade volume. "
+                "Quotes are shown only from a fresh, sequence-synced, gap-free and CRC32-valid aggregated L2 book. "
+                "Displayed liquidity can be changed or cancelled; microprice is an order-book reference, not an executable fill price."
+            )
+    else:
+        st.info("Best BUY/SELL price levels are withheld until the live L2 book is fresh, sequence-synced, gap-free and CRC32-valid.")
+
+    premium_discount = (
+        build_premium_discount_map(
+            (pa or {}).get("swings", []),
+            _f(d.get("last_price")),
+            max_pair_bars=max(1, int(ob_lookback)),
+        )
+        if _f(d.get("last_price")) is not None
+        else {"status": "UNAVAILABLE — CURRENT PRICE MISSING", "location": "UNAVAILABLE"}
+    )
+    with st.expander("3. PREMIUM / DISCOUNT — CONFIRMED SWING DEALING RANGE", expanded=True):
+        if premium_discount.get("status") != "AVAILABLE":
+            st.info(premium_discount.get("status", "Premium/discount range unavailable."))
+        else:
+            pd1, pd2, pd3, pd4 = st.columns(4)
+            pd1.metric("Confirmed range high", f'{premium_discount["range_high"]:,.1f}')
+            pd2.metric("Equilibrium (50%)", f'{premium_discount["equilibrium"]:,.1f}')
+            pd3.metric("Confirmed range low", f'{premium_discount["range_low"]:,.1f}')
+            pd4.metric(
+                "Current location",
+                premium_discount["location"],
+                help=f'Current price position: {premium_discount["position_pct"]:.1f}% of the dealing range.',
+            )
+            pd_rows = [
+                {
+                    "Dealing-range area": "PREMIUM",
+                    "Lower boundary": premium_discount["premium_low"],
+                    "Upper boundary": premium_discount["premium_high"],
+                    "Interpretation": "Upper half: equilibrium to confirmed swing high",
+                },
+                {
+                    "Dealing-range area": "DISCOUNT",
+                    "Lower boundary": premium_discount["discount_low"],
+                    "Upper boundary": premium_discount["discount_high"],
+                    "Interpretation": "Lower half: confirmed swing low to equilibrium",
+                },
+            ]
+            st.dataframe(
+                pd.DataFrame(pd_rows).style.format({
+                    "Lower boundary": "{:,.1f}",
+                    "Upper boundary": "{:,.1f}",
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "Range source: the most recent valid pair of opposite-kind, confirmed swing pivots from completed "
+                f"candles (maximum pivot separation {int(ob_lookback)} bars). Equilibrium is the 50% midpoint. "
+                "A price outside the selected range is labelled ABOVE RANGE or BELOW RANGE, not forced into "
+                "premium/discount. These are price-location zones, not resting-order counts or entry signals."
+            )
+
+    with st.expander("4. ORDER BLOCKS — EXECUTED BUY/SELL + VISIBLE BID/ASK DEPTH", expanded=True):
+        zones = (pa or {}).get("zones", [])
+        last_price = _f(d.get("last_price"))
+        zone_rows = []
+        for z in zones:
+            top = _f(z.get("top"))
+            bottom = _f(z.get("bottom"))
+            if top is None or bottom is None or top < bottom:
+                continue
+            midpoint = (top + bottom) / 2.0
+            distance = (midpoint - last_price) if last_price is not None else None
+            displacement = _f(z.get("displacement_x_atr"))
+            strength = measure_zone_strength(
+                z,
+                closed,
+                d.get("trade_log", []),
+                d.get("bids", {}),
+                d.get("asks", {}),
+                book_valid=zone_book_valid,
+                contract_value_btc=CONTRACT_VALUE_BTC,
+            )
+
+            def execution_strength_text(flow: dict[str, Any]) -> str:
+                contracts = float(flow["contracts"])
+                return (
+                    f'{int(flow["prints"]):,} prints · '
+                    f'{contracts:,.0f} contracts · '
+                    f'{contracts * CONTRACT_VALUE_BTC:,.4f} BTC eq. · '
+                    f'${float(flow["usd"]):,.0f}'
+                )
+
+            def resting_strength_text(
+                side_name: str,
+                flow: dict[str, Any] | None,
+                levels: int | None,
+            ) -> str:
+                if flow is None or levels is None:
+                    return "UNAVAILABLE — book not fresh/verified"
+                return (
+                    f'{side_name}: {levels:,} levels · '
+                    f'{float(flow["contracts"]):,.0f} contracts · '
+                    f'${float(flow["usd"]):,.0f}'
+                )
+
+            aligned = strength["aligned"]
+            opposing = strength["opposing"]
+            ratio = strength["aligned_opposing_usd_ratio"]
+            aligned_text = resting_strength_text(
+                strength["aligned_side"], aligned, strength["aligned_levels"]
+            )
+            opposing_side = "ASK" if strength["aligned_side"] == "BID" else "BID"
+            opposing_text = resting_strength_text(
+                opposing_side, opposing, strength["opposing_levels"]
+            )
+            bid_depth_text = aligned_text if strength["aligned_side"] == "BID" else opposing_text
+            ask_depth_text = aligned_text if strength["aligned_side"] == "ASK" else opposing_text
+            zone_rows.append({
+                "Order block": "BULLISH DEMAND" if z.get("direction") == "bullish" else "BEARISH SUPPLY",
+                "Lower": bottom,
+                "Upper": top,
+                "Midpoint": midpoint,
+                "Width (pts)": top - bottom,
+                "Zone location": classify_price_in_dealing_range(midpoint, premium_discount),
+                "Formation candle volume": strength["formation_volume"],
+                "Executed BUY in zone": execution_strength_text(strength["buy"]),
+                "Executed SELL in zone": execution_strength_text(strength["sell"]),
+                "Visible BID depth": bid_depth_text,
+                "Visible ASK depth": ask_depth_text,
+                "Aligned / opposing USD depth": ratio,
+                "Displacement (x ATR)": displacement,
+                "Distance to mid (pts)": distance,
+                "Status": str(z.get("status", "unknown")).upper(),
+                "Confirmed (IST)": _ist_str(z.get("confirmed_time")),
+            })
+        zone_rows.sort(key=lambda r: (
+            r["Status"] == "INVALIDATED",
+            abs(r["Distance to mid (pts)"]) if r["Distance to mid (pts)"] is not None else float("inf"),
+            -(r["Displacement (x ATR)"] or 0.0),
+        ))
+        if zone_rows:
+            st.dataframe(
+                pd.DataFrame(zone_rows[:12]).style.format({
+                    "Lower": "{:,.1f}",
+                    "Upper": "{:,.1f}",
+                    "Midpoint": "{:,.1f}",
+                    "Width (pts)": "{:,.1f}",
+                    "Formation candle volume": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
+                    "Aligned / opposing USD depth": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
+                    "Displacement (x ATR)": "{:.2f}",
+                    "Distance to mid (pts)": "{:+,.1f}",
+                }, na_rep="—"),
+                hide_index=True, use_container_width=True, height=360,
+            )
+        else:
+            st.caption("No confirmed supply/demand zones in the current completed-candle lookback.")
+        st.caption(
+            "The zone is a confirmed price-action-derived order-block candidate, not an exchange-labelled institutional order. "
+            "Formation volume is the exchange candle's reported volume field for the origin candle. "
+            "Executed BUY/SELL figures count retained classified public trade prints and contracts inside the zone "
+            "(up to 20,000 captured prints; process restart resets this in-memory window). "
+            "Resting depth is the current synchronized L2 snapshot inside the zone: each count is a visible price level, "
+            "not an individual order because the public book aggregates size by price. "
+            "USD notional = contracts × 0.001 BTC/contract × observed execution or resting price. "
+            "Aligned depth means BID liquidity for DEMAND and ASK liquidity for SUPPLY; the ratio compares its USD notional "
+            "with the opposing side. The book columns are withheld when the L2 feed is stale, unsynchronized, gap-affected "
+            "or CRC-invalid. Resting orders can be cancelled or moved; none of these measures is a probability or guarantee."
+        )
+
     with st.expander("Authentic market-wide liquidation levels", expanded=True):
         st.warning(
             "UNAVAILABLE — this dashboard subscribes to Delta's public market-data channels, "
@@ -2861,6 +3386,93 @@ def render_flow_panel() -> None:
             "liquidation map. To add authentic levels later, a verified market-wide data source and "
             "instrument-specific schema are required."
         )
+
+    microstructure = analyze_orderbook_events(
+        d.get("book_snapshots", []),
+        d.get("trade_log", []),
+        now_ts=now,
+        book_valid=zone_book_valid,
+        tick_size=BOOK_TICK,
+        min_large_contracts=50.0,
+        min_refill_execution_contracts=25.0,
+        max_snapshot_gap_seconds=6.0,
+        max_snapshot_age_seconds=6.0,
+        lookback_seconds=600.0,
+        min_refill_events=2,
+    )
+    with st.expander("Spoofing-like quote pulls and iceberg-like replenishment candidates", expanded=True):
+        st.caption(
+            "CANDIDATE ANALYSIS ONLY — sampled public L2 data is aggregated by price and has no individual order IDs "
+            "or participant identity. A quote-pull candidate is a large displayed-size reduction with little matching "
+            "taker execution. An iceberg-like candidate is repeated same-price size persistence while matching aggressive "
+            "volume trades. Neither proves manipulation, hidden quantity, or a particular trader."
+        )
+        if microstructure["status"].startswith("UNAVAILABLE"):
+            st.warning(microstructure["status"])
+            st.caption(
+                f"Valid-book sample count: {microstructure.get('snapshot_count', 0)} · "
+                f"latest snapshot age: {_fmt(microstructure.get('last_snapshot_age_seconds'), 1)}s. "
+                "The sampler retains only recent snapshots captured since this process started."
+            )
+        else:
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Recent L2 samples", f'{microstructure["snapshot_count"]:,}')
+            s2.metric(
+                "Large visible level threshold",
+                f'{microstructure["adaptive_large_level_threshold_contracts"]:,.0f} contracts',
+            )
+            s3.metric(
+                "Latest sample age",
+                f'{microstructure["last_snapshot_age_seconds"]:.1f}s',
+            )
+            quote_rows = [{
+                "Time (IST)": _ist_str(item["time"], with_date=True),
+                "Side": item["side"],
+                "Price": item["price"],
+                "Displayed before": item["displayed_before_contracts"],
+                "Displayed after": item["displayed_after_contracts"],
+                "Drop (%)": item["displayed_drop_pct"],
+                "Matched taker execution": item["matched_taker_execution_contracts"],
+                "Unexplained reduction": item["unexplained_reduction_contracts"],
+                "Classification": item["classification"],
+            } for item in microstructure["quote_pull_candidates"]]
+            st.markdown("**Quote-pull / spoofing-like candidates**")
+            if quote_rows:
+                st.dataframe(
+                    pd.DataFrame(quote_rows).style.format({
+                        "Price": "{:,.1f}",
+                        "Displayed before": "{:,.0f}",
+                        "Displayed after": "{:,.0f}",
+                        "Drop (%)": "{:.1f}%",
+                        "Matched taker execution": "{:,.0f}",
+                        "Unexplained reduction": "{:,.0f}",
+                    }, na_rep="—"),
+                    hide_index=True, use_container_width=True, height=230,
+                )
+            else:
+                st.caption("No quote-pull candidates met the current sample and execution-adjustment rules.")
+            iceberg_rows = [{
+                "Side": item["side"],
+                "Price": item["price"],
+                "Repeated refill intervals": item["refill_intervals"],
+                "Matched taker execution": item["matched_taker_execution_contracts"],
+                "Typical displayed size": item["typical_visible_size_contracts"],
+                "Latest event (IST)": _ist_str(item["latest_time"], with_date=True),
+                "Classification": item["classification"],
+            } for item in microstructure["iceberg_refill_candidates"]]
+            st.markdown("**Repeated refill / iceberg-like candidates**")
+            if iceberg_rows:
+                st.dataframe(
+                    pd.DataFrame(iceberg_rows).style.format({
+                        "Price": "{:,.1f}",
+                        "Matched taker execution": "{:,.0f}",
+                        "Typical displayed size": "{:,.0f}",
+                    }, na_rep="—"),
+                    hide_index=True, use_container_width=True, height=210,
+                )
+            else:
+                st.caption("No repeated-refill candidates met the minimum evidence threshold.")
+            st.caption(microstructure.get("limitations", ""))
 
     flow_l, flow_r = st.columns([1, 1], gap="large")
     with flow_l:
@@ -3303,108 +3915,6 @@ def render_flow_panel() -> None:
                 "A confirmed price sweep is a stop-hunt candidate, not proof that stop orders actually existed or were triggered. "
                 "Overshoot and reclaim timing are measured from completed candles."
             )
-    with st.expander("Supply / demand zones — measured volume and resting liquidity", expanded=True):
-        zones = (pa or {}).get("zones", [])
-        last_price = _f(d.get("last_price"))
-        zone_rows = []
-        for z in zones:
-            top = _f(z.get("top"))
-            bottom = _f(z.get("bottom"))
-            if top is None or bottom is None or top < bottom:
-                continue
-            midpoint = (top + bottom) / 2.0
-            distance = (midpoint - last_price) if last_price is not None else None
-            displacement = _f(z.get("displacement_x_atr"))
-            strength = measure_zone_strength(
-                z,
-                closed,
-                d.get("trade_log", []),
-                d.get("bids", {}),
-                d.get("asks", {}),
-                book_valid=zone_book_valid,
-                contract_value_btc=CONTRACT_VALUE_BTC,
-            )
-
-            def execution_strength_text(flow: dict[str, Any]) -> str:
-                return (
-                    f'{int(flow["prints"]):,} prints · '
-                    f'{float(flow["contracts"]):,.0f} contracts · '
-                    f'${float(flow["usd"]):,.0f}'
-                )
-
-            def resting_strength_text(
-                side_name: str,
-                flow: dict[str, Any] | None,
-                levels: int | None,
-            ) -> str:
-                if flow is None or levels is None:
-                    return "UNAVAILABLE — book not fresh/verified"
-                return (
-                    f'{side_name}: {levels:,} levels · '
-                    f'{float(flow["contracts"]):,.0f} contracts · '
-                    f'${float(flow["usd"]):,.0f}'
-                )
-
-            aligned = strength["aligned"]
-            opposing = strength["opposing"]
-            ratio = strength["aligned_opposing_usd_ratio"]
-            aligned_text = resting_strength_text(
-                strength["aligned_side"], aligned, strength["aligned_levels"]
-            )
-            opposing_side = "ASK" if strength["aligned_side"] == "BID" else "BID"
-            opposing_text = resting_strength_text(
-                opposing_side, opposing, strength["opposing_levels"]
-            )
-            zone_rows.append({
-                "Zone": "DEMAND" if z.get("direction") == "bullish" else "SUPPLY",
-                "Lower": bottom,
-                "Upper": top,
-                "Midpoint": midpoint,
-                "Width (pts)": top - bottom,
-                "Formation candle volume": strength["formation_volume"],
-                "Executed BUY in zone": execution_strength_text(strength["buy"]),
-                "Executed SELL in zone": execution_strength_text(strength["sell"]),
-                "Aligned resting depth": aligned_text,
-                "Opposing resting depth": opposing_text,
-                "Aligned / opposing USD depth": ratio,
-                "Displacement (x ATR)": displacement,
-                "Distance to mid (pts)": distance,
-                "Status": str(z.get("status", "unknown")).upper(),
-                "Confirmed (IST)": _ist_str(z.get("confirmed_time")),
-            })
-        zone_rows.sort(key=lambda r: (
-            r["Status"] == "INVALIDATED",
-            abs(r["Distance to mid (pts)"]) if r["Distance to mid (pts)"] is not None else float("inf"),
-            -(r["Displacement (x ATR)"] or 0.0),
-        ))
-        if zone_rows:
-            st.dataframe(
-                pd.DataFrame(zone_rows[:12]).style.format({
-                    "Lower": "{:,.1f}",
-                    "Upper": "{:,.1f}",
-                    "Midpoint": "{:,.1f}",
-                    "Width (pts)": "{:,.1f}",
-                    "Formation candle volume": lambda value: "—" if pd.isna(value) else f"{value:,.0f}",
-                    "Aligned / opposing USD depth": lambda value: "—" if pd.isna(value) else f"{value:.2f}x",
-                    "Displacement (x ATR)": "{:.2f}",
-                    "Distance to mid (pts)": "{:+,.1f}",
-                }, na_rep="—"),
-                hide_index=True, use_container_width=True, height=360,
-            )
-        else:
-            st.caption("No confirmed supply/demand zones in the current completed-candle lookback.")
-        st.caption(
-            "Formation volume is the exchange candle's reported volume field for the origin candle. "
-            "Executed BUY/SELL figures count retained classified public trade prints and contracts inside the zone "
-            "(up to 20,000 captured prints; process restart resets this in-memory window). "
-            "Resting depth is the current synchronized L2 snapshot inside the zone: each count is a visible price level, "
-            "not an individual order because the public book aggregates size by price. "
-            "USD notional = contracts × 0.001 BTC/contract × observed execution or resting price. "
-            "Aligned depth means BID liquidity for DEMAND and ASK liquidity for SUPPLY; the ratio compares its USD notional "
-            "with the opposing side. The book columns are withheld when the L2 feed is stale, unsynchronized, gap-affected "
-            "or CRC-invalid. Resting orders can be cancelled or moved; none of these measures is a probability or guarantee."
-        )
-
     with st.expander("Buy / sell exhaustion (1-minute candle + observed tape)", expanded=True):
         exhaustion = orderflow.detect_exhaustion_labels(
             closed,
@@ -3637,18 +4147,22 @@ else:
         render_book_panel(compact=True)
 
 st.markdown("---")
-render_tape_cvd_panel()
+render_open_interest_panel()
 
-if show_flow_panel:
-    st.markdown("---")
-    st.subheader("Order flow & liquidity")
-    st.caption(
-        "Observed resting liquidity comes from the live sequence- and CRC32-synchronized order book; "
-        "resting orders can be cancelled, moved or replenished at any time and may not execute. "
-        "Order blocks, equal highs/lows and sweeps are price-action-derived from completed candles - not verified "
-        "institutional activity. A large executed trade indicates size only, not measured market impact or institutional identity.")
-    render_flow_panel()
-    render_exchange_flow_panel()
+st.markdown("---")
+st.subheader("TRADING PANELS — ORDER FLOW, LIQUIDITY & DEALING RANGE")
+st.caption(
+    "Core trading panels are always displayed in this order: aggregate OI and executed taker flow; "
+    "best visible BID/ASK; confirmed-swing premium/discount; then completed-candle order blocks with "
+    "captured executed BUY/SELL activity and verified visible BID/ASK depth. "
+    "The public feed does not publish independent long-side and short-side OI totals. "
+    "Order blocks are price-action candidates, not exchange-identified institutional orders."
+)
+render_flow_panel()
+render_exchange_flow_panel()
+
+st.markdown("---")
+render_tape_cvd_panel()
 
 
 from datetime import datetime, timezone
