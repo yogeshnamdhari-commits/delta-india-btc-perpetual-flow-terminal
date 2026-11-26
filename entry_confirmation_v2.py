@@ -128,6 +128,10 @@ def _retest(snapshot: Any, result: Any, direction: str) -> dict[str, Any]:
 def _liquidity_behavior(events: list[Any], trades: list[Any], now: datetime,
                         tick_size: float = 0.5, window_seconds: float = 30.0) -> dict[str, Any]:
     """Flag same-price depth replenishment/withdrawal candidates, not hidden orders."""
+    if not math.isfinite(tick_size) or tick_size <= 0:
+        raise ValueError("tick_size must be positive and finite")
+    if not math.isfinite(window_seconds) or window_seconds <= 0:
+        raise ValueError("window_seconds must be positive and finite")
     cutoff = now - timedelta(seconds=window_seconds)
     grouped: dict[tuple[str, float], list[dict[str, Any]]] = {}
     for event in events or []:
@@ -213,7 +217,11 @@ def evaluate_entry_confirmation(snapshot: Any, result: Any, *, feed_data: dict[s
 
     queue, ofi = getattr(snapshot, "queue_imbalance", None), getattr(snapshot, "order_flow_imbalance_ratio", None)
     qmin, omin = float(cfg.get("min_queue_imbalance", 0.05)), float(cfg.get("min_ofi_ratio", 0.02))
-    book_ok = (queue is not None and ofi is not None and
+    ofi_count = int(getattr(snapshot, "order_flow_imbalance_event_count", 0) or 0)
+    ofi_span = float(getattr(snapshot, "order_flow_imbalance_span_seconds", 0.0) or 0.0)
+    ofi_sample_ok = (ofi_count >= int(cfg.get("min_ofi_events", 20))
+                     and ofi_span >= float(cfg.get("min_ofi_span_seconds", 60.0)))
+    book_ok = (queue is not None and ofi is not None and ofi_sample_ok and
                ((queue >= qmin and ofi >= omin) if signal == "BUY" else (queue <= -qmin and ofi <= -omin)))
     if book_ok: passed.append("L1 queue imbalance and event-level OFI aligned")
     else: reasons.append("WAIT_ORDERBOOK_FLOW_NOT_CONFIRMED")
@@ -277,10 +285,9 @@ def evaluate_entry_confirmation(snapshot: Any, result: Any, *, feed_data: dict[s
         "timeframe_context": {"1h": trend1h, "15m": trend15m}, "trade_flow": flow,
         "orderbook": {"queue_imbalance": queue,
                       "microprice_edge_bps": getattr(snapshot, "microprice_edge_bps", None),
-                      "event_ofi_ratio": ofi,
-                      "ofi_event_count": getattr(snapshot, "order_flow_imbalance_event_count", 0),
-                      "ofi_observed_span_seconds": getattr(snapshot, "order_flow_imbalance_span_seconds", None),
-                      "aligned": bool(book_ok)},
+                      "event_ofi_ratio": ofi, "ofi_event_count": ofi_count,
+                      "ofi_observed_span_seconds": ofi_span,
+                      "ofi_sample_gate_passed": ofi_sample_ok, "aligned": bool(book_ok)},
         "liquidity_behavior": liquidity_behavior,
         "retest": retest,
         "execution_costs": {"spread_bps": spread, "fee_bps_per_side": fee,

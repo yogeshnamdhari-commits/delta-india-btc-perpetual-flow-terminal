@@ -78,3 +78,27 @@ def test_price_level_replenishment_is_reported_only_as_a_candidate():
     assert result["replenishment_candidates"]
     assert result["replenishment_candidates"][0]["side"] == "ASK"
     assert "not proof" in result["limitations"]
+
+
+
+def test_ofi_ratio_without_minimum_event_count_and_span_does_not_pass_book_gate():
+    now=datetime(2026,11,1,tzinfo=UTC)
+    snapshot,result=_objects(now)
+    snapshot.queue_imbalance=0.20
+    snapshot.order_flow_imbalance_ratio=0.10
+    snapshot.order_flow_imbalance_event_count=5
+    snapshot.order_flow_imbalance_span_seconds=10.0
+    out=evaluate_entry_confirmation(snapshot,result,feed_data={},
+        config={"fee_bps_per_side":1.0,"slippage_bps_per_side":0.5,
+                "max_holding_minutes":20,"zero_funding_required":False})
+    assert out["orderbook"]["ofi_sample_gate_passed"] is False
+    assert out["orderbook"]["aligned"] is False
+    assert "WAIT_ORDERBOOK_FLOW_NOT_CONFIRMED" in out["reason_codes"]
+
+
+def test_liquidity_behavior_rejects_invalid_tick_or_window():
+    now=datetime(2026,11,1,tzinfo=UTC)
+    with pytest.raises(ValueError):
+        _liquidity_behavior([],[],now,tick_size=0)
+    with pytest.raises(ValueError):
+        _liquidity_behavior([],[],now,window_seconds=0)

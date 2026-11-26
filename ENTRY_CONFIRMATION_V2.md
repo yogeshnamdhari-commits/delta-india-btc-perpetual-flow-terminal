@@ -8,7 +8,9 @@ This patch adds an independent evidence layer beside the frozen baseline. It doe
 - Supply confirmed 5m swings and CRC-verified L2 bid/ask levels to target selection, fixing the previously empty target inputs.
 - Aggregate only complete contiguous 1m bars into 5m, 15m and 1h bars.
 - Treat Delta ob_updates as change-driven, not a heartbeat. Quiet periods do not stale a valid book; connection/ticker/trade freshness, sequence continuity, book synchronization and CRC remain separate gates.
-- Capture sequence/checksum-qualified L1 OFI events and archive raw L2 update price levels for future event replay.
+- Capture sequence/checksum-qualified L1 OFI events and archive raw L2 update price levels for future event replay. Clear rolling book-flow buffers on a full snapshot/resync or integrity failure so observations from different sequence epochs are not mixed.
+- Require a minimum 20-event, 60-second OFI observation sample at both the adapter and V2 decision layer.
+- Report same-price replenishment and unexplained depth-withdrawal candidates from raw observed level changes matched against public trades; these are not proof of hidden orders, spoofing or intent.
 
 ## V2 confirmation gates
 

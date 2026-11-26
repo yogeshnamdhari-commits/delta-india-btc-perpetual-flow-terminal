@@ -899,6 +899,10 @@ class DeltaFeed:
             prior_bid = max(prior_bids, key=lambda x: x[0]) if prior_bids else (None, None)
             prior_ask = min(prior_asks, key=lambda x: x[0]) if prior_asks else (None, None)
             if action == "snapshot":
+                # A full snapshot starts a new sequence epoch. Do not combine
+                # pre-resync OFI/depth events with deltas from this new book.
+                self.data["ofi_events"].clear()
+                self.data["depth_level_events"].clear()
                 self.data["asks"] = {}
                 self.data["bids"] = {}
                 self._apply_levels(self.data["asks"], msg.get("a", []))
@@ -947,6 +951,8 @@ class DeltaFeed:
                 return
 
             if do_resub:
+                self.data["ofi_events"].clear()
+                self.data["depth_level_events"].clear()
                 self._send_resubscribe(resync_reason)
             else:
                 expected = msg.get("cs")
@@ -961,6 +967,8 @@ class DeltaFeed:
                     self.data["book_synced"] = False
                     self.data["sequence_gap_unresolved"] = True
                     self.data["checksum_msg"] = f"CRC mismatch (expected {expected}, calculated {calculated}); reloading book"
+                    self.data["ofi_events"].clear()
+                    self.data["depth_level_events"].clear()
                     resync_reason = self.data["checksum_msg"]
                     do_resub = True
                     _logger.error("Order-book CRC32 mismatch: expected=%s calculated=%s; resubscribing", expected, calculated)
