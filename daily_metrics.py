@@ -379,17 +379,9 @@ def summarize_oi_funding_bias(
     funding_interval_seconds: Any = None,
     *,
     neutral_threshold_pct: float = 0.05,
+    oi_validation_passed: bool = True,
 ) -> dict[str, Any]:
-    """Describe 24h price/OI context and funding payer side without making a signal.
-
-    funding_rate is the raw fractional rate from Delta's funding WebSocket;
-    the returned percentage is rate × 100 for display. Positive funding means
-    longs pay shorts; negative funding means shorts pay longs.
-
-    Price/OI interpretations are heuristic context only. Aggregate OI cannot
-    identify which side opened or closed, and funding is a carry transfer, not
-    a directional entry signal.
-    """
+    """Describe price/OI context and funding payer side without making a signal."""
     price_pct = _number(price_change_pct)
     oi_pct = _number(oi_change_pct)
     funding = _number(funding_rate)
@@ -398,10 +390,20 @@ def summarize_oi_funding_bias(
     if threshold is None or threshold < 0:
         raise ValueError("neutral_threshold_pct must be finite and non-negative")
 
-    if price_pct is None or oi_pct is None:
+    if not oi_validation_passed:
+        context_bias = "UNAVAILABLE — OI SCALE / BASELINE NOT VALIDATED"
+        price_oi_regime = "WAIT — historical OI unit or 24h baseline validation failed"
+        context_explanation = (
+            "BUY/SELL bias is suppressed until REST OI, WebSocket OI and normalized "
+            "historical OI candles reconcile and a valid 24h baseline is available."
+        )
+    elif price_pct is None or oi_pct is None:
         context_bias = "UNAVAILABLE — PRICE/OI DATA MISSING"
         price_oi_regime = "WAIT — insufficient price or OI history"
-        context_explanation = "A directional context cannot be calculated without both 24h price change and 24h aggregate OI change."
+        context_explanation = (
+            "A directional context cannot be calculated without both 24h mark-price "
+            "change and validated 24h aggregate OI change."
+        )
     elif abs(price_pct) <= threshold or abs(oi_pct) <= threshold:
         context_bias = "MIXED / WAIT"
         price_oi_regime = f"NEUTRAL — price or OI change is inside the ±{threshold:.2f}% noise band"
@@ -447,8 +449,69 @@ def summarize_oi_funding_bias(
         "funding_payer": funding_payer,
         "funding_context": funding_context,
         "funding_interval_hours": interval_hours,
+        "oi_validation_passed": bool(oi_validation_passed),
         "is_directional_candidate": context_bias in {"BUY BIAS CANDIDATE", "SELL BIAS CANDIDATE"},
     }
+
+
+def summarize_funding_cap(
+    funding_rate: Any,
+    funding_cap_pct: Any,
+    funding_interval_seconds: Any = None,
+    *,
+    warning_utilization_pct: float = 80.0,
+    high_utilization_pct: float = 90.0,
+) -> dict[str, Any]:
+    """Classify proximity of the absolute funding rate to the product cap.
+
+    funding_rate is the raw fractional rate (0.009 = 0.9%); funding_cap_pct
+    is displayed percentage points (1.0 = ±1.0%). This is a warning, not a forecast.
+    """
+    rate = _number(funding_rate)
+    cap_pct = _number(funding_cap_pct)
+    interval = _number(funding_interval_seconds)
+    warning = _number(warning_utilization_pct)
+    high = _number(high_utilization_pct)
+    if cap_pct is None or cap_pct <= 0:
+        raise ValueError("funding_cap_pct must be finite and positive")
+    if warning is None or high is None or warning < 0 or high <= warning or high > 100:
+        raise ValueError("funding utilization thresholds must satisfy 0 <= warning < high <= 100")
+
+    interval_hours = interval / 3600.0 if interval is not None and interval > 0 else None
+    if rate is None or not math.isfinite(rate):
+        return {
+            "status": "UNAVAILABLE",
+            "funding_rate_pct": None,
+            "funding_cap_pct": cap_pct,
+            "cap_utilization_pct": None,
+            "funding_interval_hours": interval_hours,
+            "message": "Funding rate is unavailable; cap utilization cannot be evaluated.",
+        }
+
+    rate_pct = rate * 100.0
+    utilization = abs(rate_pct) / cap_pct * 100.0
+    if utilization >= 100.0:
+        status = "AT OR ABOVE CAP"
+        message = "The observed funding rate is at or above the published product cap; verify the live contract specification."
+    elif utilization >= high:
+        status = "NEAR CAP"
+        message = "Funding is near the product cap; carry cost is elevated and the rate can change before settlement."
+    elif utilization >= warning:
+        status = "APPROACHING CAP"
+        message = "Funding is approaching the product cap; monitor the rate and settlement interval."
+    else:
+        status = "NORMAL"
+        message = "Funding is below the configured approach-to-cap warning threshold."
+
+    return {
+        "status": status,
+        "funding_rate_pct": rate_pct,
+        "funding_cap_pct": cap_pct,
+        "cap_utilization_pct": utilization,
+        "funding_interval_hours": interval_hours,
+        "message": message,
+    }
+
 
 def summarize_open_interest_24h(
     history_rows: Sequence[Mapping[str, Any]] | None,
