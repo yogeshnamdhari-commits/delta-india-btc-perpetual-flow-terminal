@@ -382,7 +382,11 @@ def build_market_snapshot(
             continue
     ofi_depth = sum(_safe_float(event.get("depth_ref"), 0.0) for event in ofi_rows)
     ofi_value = sum(_safe_float(event.get("ofi"), 0.0) for event in ofi_rows)
-    ofi_ratio = ofi_value / ofi_depth if ofi_depth > 0 else None
+    ofi_times = [_to_utc(event.get("ts")) for event in ofi_rows if event.get("ts") is not None]
+    ofi_span = ((max(ofi_times) - min(ofi_times)).total_seconds() if len(ofi_times) >= 2 else 0.0)
+    # Do not promote a handful of burst updates into a five-minute OFI signal.
+    ofi_ratio = (ofi_value / ofi_depth if ofi_depth > 0 and len(ofi_rows) >= 20
+                 and ofi_span >= 60.0 else None)
     mark = _safe_float(feed_data.get("mark_price"), 0.0)
     index = _safe_float(feed_data.get("index_price"), 0.0)
     basis_bps = ((mark - index) / index * 10000.0) if mark > 0 and index > 0 else None
@@ -403,6 +407,8 @@ def build_market_snapshot(
         atr_5m=compute_atr(candles_5m, 14), atr_15m=compute_atr(candles_15m, 14),
         best_bid_size=bid_size, best_ask_size=ask_size, queue_imbalance=queue_imbalance,
         microprice_edge_bps=microprice_edge_bps, order_flow_imbalance_ratio=ofi_ratio,
+        order_flow_imbalance_event_count=len(ofi_rows),
+        order_flow_imbalance_span_seconds=ofi_span,
         open_interest_contracts=oi, funding_rate=funding, mark_index_basis_bps=basis_bps,
     )
 

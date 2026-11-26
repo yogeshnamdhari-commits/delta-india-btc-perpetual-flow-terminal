@@ -124,6 +124,59 @@ def _retest(snapshot: Any, result: Any, direction: str) -> dict[str, Any]:
     return {"state": "NOT_OBSERVED_OPTIONAL", "observed": False, "level": level}
 
 
+
+def _liquidity_behavior(events: list[Any], trades: list[Any], now: datetime,
+                        tick_size: float = 0.5, window_seconds: float = 30.0) -> dict[str, Any]:
+    """Flag same-price depth replenishment/withdrawal candidates, not hidden orders."""
+    cutoff = now - timedelta(seconds=window_seconds)
+    grouped: dict[tuple[str, float], list[dict[str, Any]]] = {}
+    for event in events or []:
+        try:
+            ts = _parse_ts(event.get("ts"))
+            side = str(event.get("side", "")).lower()
+            price = float(event.get("price"))
+            delta = float(event.get("delta"))
+            if ts is None or ts < cutoff or ts > now or side not in ("bid", "ask"):
+                continue
+            if not all(math.isfinite(x) for x in (price, delta)) or price <= 0:
+                continue
+            bucket_price = round(price / tick_size) * tick_size
+            grouped.setdefault((side, bucket_price), []).append(event)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+    replenishments, withdrawals = [], []
+    for (side, price), rows in grouped.items():
+        rows.sort(key=lambda row: _parse_ts(row.get("ts")) or cutoff)
+        matched_side = "BUY_TAKER" if side == "ask" else "SELL_TAKER"
+        matched = sum(float(t.size) for t in trades
+                      if getattr(t, "side_aggressor", None) == matched_side
+                      and abs(float(t.price) - price) <= tick_size / 2.0
+                      and cutoff <= t.ts_utc <= now)
+        additions = sum(max(0.0, float(row.get("delta", 0.0))) for row in rows)
+        reductions = sum(max(0.0, -float(row.get("delta", 0.0))) for row in rows)
+        final_size = float(rows[-1].get("new_size", 0.0) or 0.0)
+        baseline_size = float(rows[0].get("previous_size", 0.0) or 0.0)
+        if matched >= 5.0 and additions >= max(2.5, matched * 0.25):
+            replenishments.append({
+                "side": side.upper(), "price": price,
+                "matched_taker_contracts": matched, "visible_additions_contracts": additions,
+                "visible_reductions_contracts": reductions, "final_displayed_contracts": final_size,
+                "classification": "SAME_PRICE_REPLENISHMENT_CANDIDATE",
+            })
+        elif reductions >= 10.0 and matched < reductions * 0.5:
+            withdrawals.append({
+                "side": side.upper(), "price": price,
+                "visible_reductions_contracts": reductions, "matched_taker_contracts": matched,
+                "baseline_displayed_contracts": baseline_size, "final_displayed_contracts": final_size,
+                "classification": "UNEXPLAINED_VISIBLE_DEPTH_WITHDRAWAL_CANDIDATE",
+            })
+    return {
+        "window_seconds": window_seconds,
+        "replenishment_candidates": replenishments,
+        "withdrawal_candidates": withdrawals,
+        "limitations": "Aggregated L2 by price has no order IDs or participant identity; candidates are not proof of iceberg orders, spoofing, intent or absorption.",
+    }
+
 def evaluate_entry_confirmation(snapshot: Any, result: Any, *, feed_data: dict[str, Any] | None = None,
                                 config: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg, feed = dict(config or {}), feed_data or {}
@@ -167,6 +220,13 @@ def evaluate_entry_confirmation(snapshot: Any, result: Any, *, feed_data: dict[s
 
     retest = _retest(snapshot, result, signal)
     if retest["observed"]: passed.append("optional structure retest/hold observed")
+    liquidity_behavior = _liquidity_behavior(
+        list(data.get("depth_level_events", [])),
+        list(getattr(snapshot, "recent_trades", [])),
+        snapshot.ts_utc,
+        tick_size=float(cfg.get("tick_size", 0.5)),
+        window_seconds=float(cfg.get("liquidity_event_window_seconds", 30.0)),
+    )
 
     fee = cfg.get("fee_bps_per_side", _env_float("ENTRY_CONFIRMATION_FEE_BPS_PER_SIDE"))
     slip = cfg.get("slippage_bps_per_side", _env_float("ENTRY_CONFIRMATION_SLIPPAGE_BPS_PER_SIDE"))
@@ -217,7 +277,11 @@ def evaluate_entry_confirmation(snapshot: Any, result: Any, *, feed_data: dict[s
         "timeframe_context": {"1h": trend1h, "15m": trend15m}, "trade_flow": flow,
         "orderbook": {"queue_imbalance": queue,
                       "microprice_edge_bps": getattr(snapshot, "microprice_edge_bps", None),
-                      "event_ofi_ratio": ofi, "aligned": bool(book_ok)},
+                      "event_ofi_ratio": ofi,
+                      "ofi_event_count": getattr(snapshot, "order_flow_imbalance_event_count", 0),
+                      "ofi_observed_span_seconds": getattr(snapshot, "order_flow_imbalance_span_seconds", None),
+                      "aligned": bool(book_ok)},
+        "liquidity_behavior": liquidity_behavior,
         "retest": retest,
         "execution_costs": {"spread_bps": spread, "fee_bps_per_side": fee,
                             "slippage_bps_per_side": slip,

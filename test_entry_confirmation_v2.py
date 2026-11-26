@@ -1,7 +1,7 @@
 """Unit tests for independent V2 confirmation logic."""
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
-from entry_confirmation_v2 import evaluate_entry_confirmation
+from entry_confirmation_v2 import evaluate_entry_confirmation, _liquidity_behavior
 
 UTC = timezone.utc
 
@@ -61,3 +61,20 @@ def test_cost_and_funding_inputs_are_reported_without_enabling_orders():
     assert out["funding_guard"]["passed"] is True
     assert out["context_only"]["aggregate_open_interest_contracts"]==100.0
     assert out["live_orders_allowed"] is False
+
+
+
+def test_price_level_replenishment_is_reported_only_as_a_candidate():
+    now = datetime(2026, 11, 1, tzinfo=UTC)
+    events = [
+        {"ts": (now-timedelta(seconds=20)).timestamp(), "side": "ask", "price": 100.0,
+         "previous_size": 50.0, "new_size": 20.0, "delta": -30.0},
+        {"ts": (now-timedelta(seconds=10)).timestamp(), "side": "ask", "price": 100.0,
+         "previous_size": 20.0, "new_size": 45.0, "delta": 25.0},
+    ]
+    trades = [SimpleNamespace(ts_utc=now-timedelta(seconds=15), price=100.0,
+                              size=20.0, side_aggressor="BUY_TAKER")]
+    result = _liquidity_behavior(events, trades, now)
+    assert result["replenishment_candidates"]
+    assert result["replenishment_candidates"][0]["side"] == "ASK"
+    assert "not proof" in result["limitations"]

@@ -550,6 +550,7 @@ class DeltaFeed:
             "book_version": 0,            # bumped on every applied book message (render cache key)
             "trade_log": deque(maxlen=100000),    # exchange time (fractional seconds), price, contracts, side
             "ofi_events": deque(maxlen=20000),     # sequence/checksum-qualified L1 OFI events
+            "depth_level_events": deque(maxlen=50000),  # price-level changes for absorption/refill candidates
             # Per-minute aggressor aggregates retain timestamp-aligned flow after
             # individual prints roll out of trade_log. Bounded to 30 days in memory;
             # never persisted or backfilled.
@@ -604,6 +605,7 @@ class DeltaFeed:
             copy["channel_last_seen"] = dict(self.data["channel_last_seen"])
             copy["trade_log"] = list(self.data["trade_log"])
             copy["ofi_events"] = list(self.data["ofi_events"])
+            copy["depth_level_events"] = list(self.data["depth_level_events"])
             copy["book_last_update_at"] = self.data.get("book_last_update_at")
             copy["trade_flow_minutes"] = {
                 int(minute): dict(flow)
@@ -887,6 +889,8 @@ class DeltaFeed:
             return
 
         with self.lock:
+            prior_bid_book = dict(self.data["bids"])
+            prior_ask_book = dict(self.data["asks"])
             prior_bids = [(float(p), _f(q, 0.0) or 0.0) for p, q in self.data["bids"].items()
                           if (_f(q, 0.0) or 0.0) > 0]
             prior_asks = [(float(p), _f(q, 0.0) or 0.0) for p, q in self.data["asks"].items()
@@ -977,6 +981,27 @@ class DeltaFeed:
                     update_time = time.time()
                     self.data["book_last_update_at"] = update_time
                     if action == "update" and prior_bid[0] is not None and prior_ask[0] is not None:
+                        # Keep price-level deltas with sequence + local receive time.
+                        # L2 is aggregated by price; these observations are not order IDs.
+                        for side_name, raw_levels, before_book, after_book in (
+                            ("bid", msg.get("b", []), prior_bid_book, self.data["bids"]),
+                            ("ask", msg.get("a", []), prior_ask_book, self.data["asks"]),
+                        ):
+                            if not isinstance(raw_levels, list):
+                                continue
+                            for level in raw_levels:
+                                if not isinstance(level, (list, tuple)) or len(level) < 2:
+                                    continue
+                                price_key = str(level[0])
+                                old_size = _f(before_book.get(price_key), 0.0) or 0.0
+                                new_size = _f(after_book.get(price_key), 0.0) or 0.0
+                                delta_size = new_size - old_size
+                                if delta_size:
+                                    self.data["depth_level_events"].append({
+                                        "ts": update_time, "seq": incoming_seq, "side": side_name,
+                                        "price": _f(level[0], 0.0), "previous_size": old_size,
+                                        "new_size": new_size, "delta": delta_size,
+                                    })
                         bid_rows = [(float(p), _f(q, 0.0) or 0.0) for p, q in self.data["bids"].items()
                                     if (_f(q, 0.0) or 0.0) > 0]
                         ask_rows = [(float(p), _f(q, 0.0) or 0.0) for p, q in self.data["asks"].items()

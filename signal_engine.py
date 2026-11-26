@@ -192,6 +192,8 @@ class MarketSnapshot:
     queue_imbalance: Optional[float] = None
     microprice_edge_bps: Optional[float] = None
     order_flow_imbalance_ratio: Optional[float] = None
+    order_flow_imbalance_event_count: int = 0
+    order_flow_imbalance_span_seconds: Optional[float] = None
     open_interest_contracts: Optional[float] = None
     funding_rate: Optional[float] = None
     mark_index_basis_bps: Optional[float] = None
@@ -216,6 +218,12 @@ class MarketSnapshot:
                 raise ValueError(f"Invalid {name}")
         if self.queue_imbalance is not None and not -1.0 <= self.queue_imbalance <= 1.0:
             raise ValueError("queue_imbalance must be between -1 and 1")
+        if isinstance(self.order_flow_imbalance_event_count, bool) or self.order_flow_imbalance_event_count < 0:
+            raise ValueError("Invalid order_flow_imbalance_event_count")
+        if (self.order_flow_imbalance_span_seconds is not None
+                and (not math.isfinite(self.order_flow_imbalance_span_seconds)
+                     or self.order_flow_imbalance_span_seconds < 0)):
+            raise ValueError("Invalid order_flow_imbalance_span_seconds")
         trades = sorted(self.recent_trades, key=lambda t: t.ts_utc)
         object.__setattr__(self, "recent_trades", trades)
         for tr in trades:

@@ -117,7 +117,6 @@ class TestFeedToDecisionPipeline(unittest.TestCase):
         self.assertIn(r["decision"],("WAIT","BUY","SELL","BLOCKED"))
         self.assertTrue(r["metadata"]["engine_evaluated"] or r["decision"]=="BLOCKED")
 
-if __name__=="__main__": unittest.main()
 
 
 class TestBridgeMarketInputCompleteness(unittest.TestCase):
@@ -164,3 +163,40 @@ class TestBridgeMarketInputCompleteness(unittest.TestCase):
         self.assertTrue(health["checksum_verified"])
         self.assertTrue(health["channel_freshness"]["ticker"])
         self.assertTrue(health["channel_freshness"]["trades"])
+
+
+    def test_ofi_requires_minimum_event_count_and_observation_span(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["ofi_events"] = [
+            {"ts": now.timestamp() - 60 + i * 3, "ofi": 3.0, "depth_ref": 100.0}
+            for i in range(21)
+        ]
+        snap = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertEqual(snap.order_flow_imbalance_event_count, 21)
+        self.assertAlmostEqual(snap.order_flow_imbalance_span_seconds, 60.0)
+        self.assertAlmostEqual(snap.order_flow_imbalance_ratio, 0.03)
+        data["ofi_events"] = data["ofi_events"][:10]
+        snap_small = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertIsNone(snap_small.order_flow_imbalance_ratio)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+    def test_ofi_requires_minimum_event_count_and_observation_span(self):
+        now = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
+        data = healthy_feed(now)
+        data["ofi_events"] = [
+            {"ts": now.timestamp() - 60 + i * 3, "ofi": 3.0, "depth_ref": 100.0}
+            for i in range(21)
+        ]
+        snap = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertEqual(snap.order_flow_imbalance_event_count, 21)
+        self.assertAlmostEqual(snap.order_flow_imbalance_span_seconds, 60.0)
+        self.assertAlmostEqual(snap.order_flow_imbalance_ratio, 0.03)
+
+        data["ofi_events"] = data["ofi_events"][:10]
+        snap_small = build_market_snapshot(data, now=now, history_path="/missing")
+        self.assertIsNone(snap_small.order_flow_imbalance_ratio)
