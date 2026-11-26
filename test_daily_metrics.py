@@ -4,8 +4,10 @@ from daily_metrics import (
     parse_daily_volume_candles,
     parse_ticker_payload,
     summarize_aggressor_flow,
+    summarize_funding_cap,
     summarize_oi_funding_bias,
     summarize_open_interest_24h,
+    validate_and_normalize_open_interest_history,
 )
 
 
@@ -256,3 +258,160 @@ def test_summarize_oi_funding_bias_withholds_direction_when_inputs_missing_or_fl
 def test_summarize_oi_funding_bias_rejects_invalid_neutral_threshold():
     with pytest.raises(ValueError):
         summarize_oi_funding_bias(1.0, 1.0, 0.0, neutral_threshold_pct=-0.1)
+
+
+
+def test_normalize_oi_history_detects_thousand_contract_scale_from_live_cross_checks():
+    now = 1_800_000_000.0
+    rows = [
+        {"time": int(now - 86_400 - 600), "close": 678.2},
+        {"time": int(now - 1_800), "close": 656.107},
+    ]
+    result = validate_and_normalize_open_interest_history(
+        rows,
+        current_oi_contracts=656_107,
+        rest_oi=656.107,
+        rest_oi_contracts=656_107,
+        websocket_oi_contracts=656_090,
+        now_ts=now,
+    )
+
+    assert result["valid"] is True
+    assert result["source_values_valid"] is True
+    assert result["history_scale_valid"] is True
+    assert result["history_scale_factor"] == 1000.0
+    assert result["rest_field_diff_pct"] == pytest.approx(0)
+    assert result["rest_ws_diff_pct"] < 0.01
+    assert result["normalized_history"][-1]["close"] == pytest.approx(656_107)
+    assert result["normalized_history"][0]["close"] == pytest.approx(678_200)
+
+    summary = summarize_open_interest_24h(
+        result["normalized_history"], 656_107, now_ts=now
+    )
+    assert summary["baseline_contracts"] == pytest.approx(678_200)
+    assert summary["change_contracts"] == pytest.approx(-22_093)
+    assert summary["change_pct"] < 0
+    assert summary["change_pct"] == pytest.approx((656_107 / 678_200 - 1) * 100)
+
+
+def test_normalize_oi_history_accepts_already_raw_contract_candles():
+    now = 1_800_000_000.0
+    result = validate_and_normalize_open_interest_history(
+        [
+            {"time": int(now - 86_400 - 300), "close": 678_200},
+            {"time": int(now - 1_200), "close": 656_107},
+        ],
+        current_oi_contracts=656_107,
+        rest_oi=656.107,
+        rest_oi_contracts=656_107,
+        websocket_oi_contracts=656_100,
+        now_ts=now,
+    )
+    assert result["valid"] is True
+    assert result["history_scale_factor"] == 1.0
+    assert result["normalized_history"][-1]["close"] == pytest.approx(656_107)
+
+
+def test_normalize_oi_history_fails_closed_on_rest_contract_mismatch():
+    now = 1_800_000_000.0
+    result = validate_and_normalize_open_interest_history(
+        [{"time": int(now - 600), "close": 656.1}],
+        current_oi_contracts=656_107,
+        rest_oi=656.107,
+        rest_oi_contracts=600_000,
+        websocket_oi_contracts=656_107,
+        now_ts=now,
+    )
+    assert result["valid"] is False
+    assert result["normalized_history"] == []
+    assert "REST oi × 1000" in result["reason"]
+
+
+def test_normalize_oi_history_fails_closed_on_rest_websocket_mismatch():
+    now = 1_800_000_000.0
+    result = validate_and_normalize_open_interest_history(
+        [{"time": int(now - 600), "close": 656.1}],
+        current_oi_contracts=656_107,
+        rest_oi=656.107,
+        rest_oi_contracts=656_107,
+        websocket_oi_contracts=700_000,
+        now_ts=now,
+    )
+    assert result["valid"] is False
+    assert result["normalized_history"] == []
+    assert "WebSocket oi[0]" in result["reason"]
+
+
+def test_normalize_oi_history_fails_closed_when_latest_candle_is_stale():
+    now = 1_800_000_000.0
+    result = validate_and_normalize_open_interest_history(
+        [{"time": int(now - 7_201), "close": 656.1}],
+        current_oi_contracts=656_107,
+        rest_oi=656.107,
+        rest_oi_contracts=656_107,
+        websocket_oi_contracts=656_107,
+        now_ts=now,
+    )
+    assert result["valid"] is False
+    assert result["normalized_history"] == []
+    assert "stale" in result["reason"]
+
+
+def test_normalize_oi_history_fails_closed_when_no_candidate_scale_aligns():
+    now = 1_800_000_000.0
+    result = validate_and_normalize_open_interest_history(
+        [{"time": int(now - 600), "close": 400}],
+        current_oi_contracts=656_107,
+        rest_oi=656.107,
+        rest_oi_contracts=656_107,
+        websocket_oi_contracts=656_107,
+        now_ts=now,
+    )
+    assert result["valid"] is False
+    assert result["normalized_history"] == []
+    assert "does not align" in result["reason"]
+
+
+def test_oi_funding_bias_is_suppressed_when_scale_or_baseline_is_unverified():
+    result = summarize_oi_funding_bias(
+        price_change_pct=2.87,
+        oi_change_pct=96_642.98,
+        funding_rate=0.0090042,
+        funding_interval_seconds=28_800,
+        oi_validation_passed=False,
+    )
+    assert result["context_bias"] == "UNAVAILABLE — OI SCALE / BASELINE NOT VALIDATED"
+    assert result["is_directional_candidate"] is False
+    assert result["oi_validation_passed"] is False
+
+
+def test_funding_cap_warning_flags_ninety_percent_utilization():
+    result = summarize_funding_cap(
+        funding_rate=0.0090042,
+        funding_cap_pct=1.0,
+        funding_interval_seconds=28_800,
+    )
+    assert result["status"] == "NEAR CAP"
+    assert result["funding_rate_pct"] == pytest.approx(0.90042)
+    assert result["cap_utilization_pct"] == pytest.approx(90.042)
+    assert result["funding_interval_hours"] == pytest.approx(8)
+
+
+def test_funding_cap_warning_handles_approaching_normal_at_cap_and_negative_rates():
+    approaching = summarize_funding_cap(0.008, 1.0, 28_800)
+    normal = summarize_funding_cap(-0.001, 1.0, 28_800)
+    at_cap = summarize_funding_cap(-0.01, 1.0, 28_800)
+    unavailable = summarize_funding_cap(None, 1.0, 28_800)
+
+    assert approaching["status"] == "APPROACHING CAP"
+    assert normal["status"] == "NORMAL"
+    assert at_cap["status"] == "AT OR ABOVE CAP"
+    assert at_cap["cap_utilization_pct"] == pytest.approx(100.0)
+    assert unavailable["status"] == "UNAVAILABLE"
+
+
+def test_funding_cap_warning_rejects_invalid_product_cap_or_thresholds():
+    with pytest.raises(ValueError):
+        summarize_funding_cap(0.001, 0.0)
+    with pytest.raises(ValueError):
+        summarize_funding_cap(0.001, 1.0, warning_utilization_pct=95, high_utilization_pct=90)
