@@ -379,7 +379,7 @@ def summarize_oi_funding_bias(
     funding_interval_seconds: Any = None,
     *,
     neutral_threshold_pct: float = 0.05,
-    oi_validation_passed: bool = True,
+    oi_validation_passed: bool = False,
 ) -> dict[str, Any]:
     """Describe price/OI context and funding payer side without making a signal."""
     price_pct = _number(price_change_pct)
