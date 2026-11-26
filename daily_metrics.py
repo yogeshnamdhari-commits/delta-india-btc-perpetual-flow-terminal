@@ -227,6 +227,151 @@ def summarize_aggressor_flow(
 
 
 
+
+def validate_and_normalize_open_interest_history(
+    history_rows: Sequence[Mapping[str, Any]] | None,
+    current_oi_contracts: Any,
+    *,
+    rest_oi: Any,
+    rest_oi_contracts: Any,
+    websocket_oi_contracts: Any,
+    now_ts: float,
+    max_history_age_seconds: int = 7_200,
+    max_rest_field_diff_pct: float = 1.0,
+    max_rest_ws_diff_pct: float = 2.0,
+    max_history_alignment_diff_pct: float = 5.0,
+) -> dict[str, Any]:
+    """Validate REST/WS OI cross-sources and normalize OI candle closes to contracts.
+
+    Delta REST ``oi`` may be expressed in thousands while ``oi_contracts`` and
+    the ticker WebSocket ``oi[0]`` are raw contracts. Historical ``OI:SYMBOL``
+    candle documentation does not specify that unit, so this function does not
+    assume a multiplier: it chooses 1 or 1000 only when the newest candle aligns
+    with the independently reconciled live contract count. Otherwise it fails
+    closed and returns no normalized history for directional calculations.
+    """
+    now = _number(now_ts)
+    if now is None or now <= 0:
+        raise ValueError("now_ts must be finite and positive")
+    limits = (
+        _number(max_history_age_seconds),
+        _number(max_rest_field_diff_pct),
+        _number(max_rest_ws_diff_pct),
+        _number(max_history_alignment_diff_pct),
+    )
+    if any(value is None or value < 0 for value in limits) or limits[0] <= 0:
+        raise ValueError("OI validation limits must be finite and positive (age) or non-negative (tolerances)")
+
+    rest_oi_value = _number(rest_oi)
+    rest_contract_value = _number(rest_oi_contracts)
+    websocket_value = _number(websocket_oi_contracts)
+    current_value = _number(current_oi_contracts)
+    if rest_oi_value is not None and rest_oi_value < 0:
+        rest_oi_value = None
+    if rest_contract_value is not None and rest_contract_value < 0:
+        rest_contract_value = None
+    if websocket_value is not None and websocket_value < 0:
+        websocket_value = None
+    if current_value is not None and current_value < 0:
+        current_value = None
+
+    def _diff_pct(left: float | None, right: float | None) -> float | None:
+        if left is None or right is None or max(abs(left), abs(right)) <= 0:
+            return None
+        return abs(left - right) / max(abs(left), abs(right)) * 100.0
+
+    rest_pair_diff_pct = None
+    rest_ws_diff_pct = None
+    rest_count = rest_contract_value
+    source_errors: list[str] = []
+    if rest_oi_value is not None and rest_contract_value is not None:
+        rest_pair_diff_pct = _diff_pct(rest_oi_value * 1000.0, rest_contract_value)
+        if rest_pair_diff_pct is None or rest_pair_diff_pct > float(max_rest_field_diff_pct):
+            source_errors.append("REST oi × 1000 does not reconcile with REST oi_contracts")
+    if rest_count is None and rest_oi_value is not None:
+        rest_count = rest_oi_value * 1000.0
+    if rest_count is None:
+        source_errors.append("REST OI contract count is unavailable")
+    if websocket_value is None:
+        source_errors.append("WebSocket oi[0] contract count is unavailable or stale")
+    elif rest_count is not None:
+        rest_ws_diff_pct = _diff_pct(rest_count, websocket_value)
+        if rest_ws_diff_pct is None or rest_ws_diff_pct > float(max_rest_ws_diff_pct):
+            source_errors.append("REST OI contract count does not reconcile with WebSocket oi[0]")
+    if current_value is not None and rest_count is not None:
+        current_rest_diff = _diff_pct(current_value, rest_count)
+        if current_rest_diff is None or current_rest_diff > float(max_rest_ws_diff_pct):
+            source_errors.append("selected current OI does not reconcile with REST OI contracts")
+    if current_value is None:
+        current_value = rest_count
+    if current_value is None or current_value <= 0:
+        source_errors.append("positive current OI contract count is unavailable")
+
+    normalized_rows: list[dict[str, Any]] = []
+    clean_rows: list[tuple[int, float]] = []
+    for row in history_rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        timestamp = _epoch_seconds(row.get("time"))
+        close = _number(row.get("close"))
+        if timestamp is not None and close is not None and close > 0:
+            clean_rows.append((timestamp, close))
+    clean_rows.sort(key=lambda item: item[0])
+    latest_timestamp = clean_rows[-1][0] if clean_rows else None
+    latest_raw_close = clean_rows[-1][1] if clean_rows else None
+    latest_age = now - latest_timestamp if latest_timestamp is not None else None
+    history_errors: list[str] = []
+    scale_factor = None
+    alignment_diff_pct = None
+    if not clean_rows:
+        history_errors.append("OI historical candles are unavailable")
+    elif latest_age is None or latest_age < -60 or latest_age > float(max_history_age_seconds):
+        history_errors.append("latest OI historical candle is stale or has a future timestamp")
+    elif current_value is not None and current_value > 0 and latest_raw_close is not None:
+        candidates = []
+        for factor in (1.0, 1000.0):
+            diff = _diff_pct(latest_raw_close * factor, current_value)
+            if diff is not None:
+                candidates.append((diff, factor))
+        candidates.sort(key=lambda item: item[0])
+        if not candidates or candidates[0][0] > float(max_history_alignment_diff_pct):
+            history_errors.append("latest OI candle does not align with reconciled live contract count at ×1 or ×1000")
+        else:
+            alignment_diff_pct, scale_factor = candidates[0]
+
+    source_valid = not source_errors
+    history_valid = not history_errors and scale_factor is not None
+    valid = source_valid and history_valid
+    if valid:
+        normalized_rows = [
+            {"time": timestamp, "close": close * scale_factor, "raw_close": close}
+            for timestamp, close in clean_rows
+        ]
+        reason = "REST oi/oi_contracts, WebSocket oi[0], and latest OI candle reconcile"
+    else:
+        reason = "; ".join(source_errors + history_errors) or "OI scale validation failed"
+
+    return {
+        "valid": valid,
+        "source_values_valid": source_valid,
+        "history_scale_valid": history_valid,
+        "reason": reason,
+        "history_scale_factor": scale_factor if valid else None,
+        "normalized_history": normalized_rows if valid else [],
+        "raw_latest_close": latest_raw_close,
+        "normalized_latest_close": latest_raw_close * scale_factor if valid and latest_raw_close is not None else None,
+        "latest_timestamp": latest_timestamp,
+        "latest_age_seconds": latest_age,
+        "history_alignment_diff_pct": alignment_diff_pct,
+        "rest_field_diff_pct": rest_pair_diff_pct,
+        "rest_ws_diff_pct": rest_ws_diff_pct,
+        "current_oi_contracts": current_value,
+        "rest_oi_raw": rest_oi_value,
+        "rest_oi_contracts_raw": rest_contract_value,
+        "websocket_oi_contracts": websocket_value,
+    }
+
+
 def summarize_oi_funding_bias(
     price_change_pct: Any,
     oi_change_pct: Any,
