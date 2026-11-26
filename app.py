@@ -2665,8 +2665,8 @@ def render_open_interest_panel() -> None:
         and ws_ticker_age <= float(CHANNEL_STALE_SECONDS.get("ticker") or 8)
     )
     rest_oi_timestamp = _f(ticker_metrics.get("timestamp"))
-    rest_oi_age = max(0.0, now_ts - rest_oi_timestamp) if rest_oi_timestamp is not None else None
-    rest_ticker_fresh = rest_oi_age is not None and rest_oi_age <= 60.0
+    rest_oi_age = (now_ts - rest_oi_timestamp) if rest_oi_timestamp is not None else None
+    rest_ticker_fresh = rest_oi_age is not None and -60.0 <= rest_oi_age <= 60.0
     rest_oi_raw = ticker_metrics.get("oi_field_contracts") if rest_ticker_fresh else None
     rest_oi_contracts_raw = ticker_metrics.get("oi_contracts_field") if rest_ticker_fresh else None
     websocket_oi_contracts = (
@@ -2761,9 +2761,11 @@ def render_open_interest_panel() -> None:
     price_change_pct = _f(ticker_24h.get("mark_change_pct")) if ws_ticker_fresh else None
     oi_change_pct_for_bias = oi_24h.get("change_pct") if oi_baseline_valid and ws_ticker_fresh else None
     funding_seen = _f(channel_seen.get("funding_rate"))
+    funding_age = max(0.0, now_ts - funding_seen) if funding_seen is not None else None
     funding_available = (
         str(d.get("connection", "")).lower() == "connected"
-        and funding_seen is not None
+        and funding_age is not None
+        and funding_age <= 180.0
         and d.get("funding_rate") is not None
     )
     funding_rate_raw = _f(d.get("funding_rate")) if funding_available else None
@@ -2822,14 +2824,23 @@ def render_open_interest_panel() -> None:
     funding_age_text = (
         "Funding channel not yet observed"
         if funding_seen is None
-        else f"Funding channel last updated {max(0.0, now_ts - funding_seen):.0f}s ago"
+        else (
+            f"Funding channel last updated {funding_age:.0f}s ago"
+            if funding_available
+            else f"Funding channel stale ({funding_age:.0f}s); rate withheld"
+        )
     )
     if oi_baseline_valid:
+        rest_pair_diff_text = (
+            "not supplied" if oi_history_validation["rest_field_diff_pct"] is None
+            else f"{oi_history_validation['rest_field_diff_pct']:.3f}%"
+        )
         st.caption(
             f"OI scale validation: VERIFIED — historical candle scale ×{oi_history_validation['history_scale_factor']:g} "
-            f"to raw contracts; REST oi × 1000 vs oi_contracts difference "
-            f"{oi_history_validation['rest_field_diff_pct']:.3f}%; REST vs WebSocket OI difference "
-            f"{oi_history_validation['rest_ws_diff_pct']:.3f}%; 24h baseline is valid."
+            f"to raw contracts; REST oi × 1000 vs oi_contracts difference {rest_pair_diff_text}; "
+            f"REST vs WebSocket OI difference {oi_history_validation['rest_ws_diff_pct']:.3f}%; "
+            f"historical/live alignment difference {oi_history_validation['history_alignment_diff_pct']:.3f}%; "
+            "24h baseline is valid."
         )
     else:
         st.warning(
